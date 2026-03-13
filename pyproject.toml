@@ -32,3 +32,4 @@ rdpyqt6     = "rdpy.scripts.rdpyqt6:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
+include = ["rdpy*"]
