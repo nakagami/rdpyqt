@@ -696,14 +696,14 @@ class UInt24Be(SimpleType):
         @summary: special write for a special type
         @param s: Stream
         """
-        s.write(struct.pack(">I", self.value)[1:])
+        s.write(self.value.to_bytes(3, 'big'))
         
     def __read__(self, s):
         """
         @summary: special read for a special type
         @param s: Stream
         """
-        self.value = struct.unpack(self._structFormat, b'\x00' + s.read(self._typeSize))[0]
+        self.value = int.from_bytes(s.read(self._typeSize), 'big')
         
 class UInt24Le(SimpleType):
     """
@@ -726,15 +726,14 @@ class UInt24Le(SimpleType):
         @summary: special write for a special type
         @param s: Stream
         """
-        #don't write first byte
-        s.write(struct.pack("<I", self.value)[:3])
+        s.write(self.value.to_bytes(3, 'little'))
         
     def __read__(self, s):
         """
         @summary: special read for a special type
         @param s: Stream
         """
-        self.value = struct.unpack(self._structFormat, s.read(self._typeSize) + b'\x00')[0]
+        self.value = int.from_bytes(s.read(self._typeSize), 'little')
         
 class String(Type, CallableValue):
     """
@@ -817,9 +816,14 @@ class String(Type, CallableValue):
             if self._until is None:
                 self.value = s.getvalue()[s.pos:]
             else:
-                self.value = ""
-                while self.value[-len(self._until):] != self._until and s.dataLen() != 0:
-                    self.value += s.read(1)
+                parts = []
+                until_len = len(self._until)
+                while s.dataLen() != 0:
+                    chunk = s.read(1)
+                    parts.append(chunk)
+                    if len(parts) >= until_len and b"".join(parts[-until_len:]) == self._until:
+                        break
+                self.value = b"".join(parts)
         else:
             self.value = s.read(self._readLen.value)
 

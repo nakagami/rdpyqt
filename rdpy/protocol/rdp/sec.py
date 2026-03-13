@@ -445,10 +445,11 @@ class SecLayer(LayerAutomata, IStreamSender, tpkt.IFastPathListener, tpkt.IFastP
         s = Stream()
         s.writeType(data)
         
+        plaintext = s.getvalue()
         if saltedMacGeneration:
-            return (String(macSaltedData(self._macKey, s.getvalue(), self._nbEncryptedPacket - 1)[:8]), String(rc4.crypt(self._encryptRc4, s.getvalue())))
+            return (String(macSaltedData(self._macKey, plaintext, self._nbEncryptedPacket - 1)[:8]), String(rc4.crypt(self._encryptRc4, plaintext)))
         else:
-            return (String(macData(self._macKey, s.getvalue())[:8]), String(rc4.crypt(self._encryptRc4, s.getvalue())))
+            return (String(macData(self._macKey, plaintext)[:8]), String(rc4.crypt(self._encryptRc4, plaintext)))
     
     def recv(self, data):
         """

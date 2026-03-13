@@ -182,7 +182,7 @@ class RawLayer(protocol.Protocol, LayerAutomata, IStreamSender):
         #call parent automata
         LayerAutomata.__init__(self, presentation)
         #data buffer received from twisted network layer
-        self._buffer = b""
+        self._buffer = bytearray()
         #len of next packet pass to next state function
         self._expectedLen = 0
         self._factory = None
@@ -200,14 +200,14 @@ class RawLayer(protocol.Protocol, LayerAutomata, IStreamSender):
                     main event of received data
         @param data: string data receive from twisted
         """
-        #add in buffer
-        self._buffer += data
+        #add in buffer (bytearray.extend avoids full-buffer copy)
+        self._buffer.extend(data)
         #while buffer have expected size call local callback
         while self._expectedLen > 0 and len(self._buffer) >= self._expectedLen:
             #expected data is first expected bytes
-            expectedData = Stream(self._buffer[0:self._expectedLen])
-            #rest is for next event of automata
-            self._buffer = self._buffer[self._expectedLen:]
+            expectedData = Stream(bytes(self._buffer[:self._expectedLen]))
+            #remove consumed data in-place
+            del self._buffer[:self._expectedLen]
             #call recv function
             self.recv(expectedData)
             
