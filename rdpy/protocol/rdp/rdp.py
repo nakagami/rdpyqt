@@ -83,7 +83,7 @@ class RDPClientController(pdu.layer.PDUClientListener):
         """
         @summary: Set particular flag in RDP stack to avoid wall-paper, theme, menu animation etc...
         """
-        self._secLayer._info.extendedInfo.performanceFlags.value = sec.PerfFlag.PERF_DISABLE_WALLPAPER | sec.PerfFlag.PERF_DISABLE_MENUANIMATIONS | sec.PerfFlag.PERF_DISABLE_CURSOR_SHADOW | sec.PerfFlag.PERF_DISABLE_THEMING | sec.PerfFlag.PERF_DISABLE_FULLWINDOWDRAG | sec.PerfFlag.PERF_ENABLE_FONT_SMOOTHING
+        self._secLayer._info.extendedInfo.performanceFlags.value = sec.PerfFlag.PERF_DISABLE_WALLPAPER | sec.PerfFlag.PERF_DISABLE_MENUANIMATIONS | sec.PerfFlag.PERF_DISABLE_CURSOR_SHADOW | sec.PerfFlag.PERF_DISABLE_FULLWINDOWDRAG | sec.PerfFlag.PERF_ENABLE_FONT_SMOOTHING | sec.PerfFlag.PERF_ENABLE_DESKTOP_COMPOSITION
         
     def setScreen(self, width, height):
         """

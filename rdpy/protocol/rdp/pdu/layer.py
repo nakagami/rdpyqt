@@ -136,7 +136,8 @@ class PDULayer(LayerAutomata, tpkt.IFastPathListener):
             caps.CapsType.CAPSTYPE_OFFSCREENCACHE : caps.Capability(caps.OffscreenBitmapCacheCapability()),
             caps.CapsType.CAPSTYPE_VIRTUALCHANNEL : caps.Capability(caps.VirtualChannelCapability()),
             caps.CapsType.CAPSTYPE_SOUND : caps.Capability(caps.SoundCapability()),
-            caps.CapsType.CAPSETTYPE_MULTIFRAGMENTUPDATE : caps.Capability(caps.MultiFragmentUpdate())
+            caps.CapsType.CAPSETTYPE_MULTIFRAGMENTUPDATE : caps.Capability(caps.MultiFragmentUpdate()),
+            caps.CapsType.CAPSETTYPE_COMPDESK : caps.Capability(caps.DesktopCompositionCapability())
         }
         #share id between client and server
         self._shareId = 0x103EA
@@ -399,7 +400,7 @@ class Client(PDULayer):
         
         #init bitmap capability
         bitmapCapability = self._clientCapabilities[caps.CapsType.CAPSTYPE_BITMAP].capability
-        bitmapCapability.preferredBitsPerPixel = self._gccCore.highColorDepth
+        bitmapCapability.preferredBitsPerPixel.value = 32
         bitmapCapability.desktopWidth = self._gccCore.desktopWidth
         bitmapCapability.desktopHeight = self._gccCore.desktopHeight
          

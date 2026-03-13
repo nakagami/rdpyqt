@@ -235,7 +235,7 @@ class Capability(CompositeType):
             """
             Closure for capability factory
             """
-            for c in [GeneralCapability, BitmapCapability, OrderCapability, BitmapCacheCapability, PointerCapability, InputCapability, BrushCapability, GlyphCapability, OffscreenBitmapCacheCapability, VirtualChannelCapability, SoundCapability, ControlCapability, WindowActivationCapability, FontCapability, ColorCacheCapability, ShareCapability, MultiFragmentUpdate]:
+            for c in [GeneralCapability, BitmapCapability, OrderCapability, BitmapCacheCapability, PointerCapability, InputCapability, BrushCapability, GlyphCapability, OffscreenBitmapCacheCapability, VirtualChannelCapability, SoundCapability, ControlCapability, WindowActivationCapability, FontCapability, ColorCacheCapability, ShareCapability, DesktopCompositionCapability, MultiFragmentUpdate]:
                 if self.capabilitySetType.value == c._TYPE_ and (self.lengthCapability.value - 4) > 0:
                     return c(readLen = self.lengthCapability - 4)
             log.debug("unknown Capability type : %s"%hex(self.capabilitySetType.value))
@@ -528,6 +528,18 @@ class ShareCapability(CompositeType):
         self.nodeId = UInt16Le()
         self.pad2octets = UInt16Le()
         
+class DesktopCompositionCapability(CompositeType):
+    """
+    @summary: Desktop Composition capability
+    client -> server
+    @see: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/a4bcd523-1109-4fe3-ba30-4daa9e6ecdd9
+    """
+    _TYPE_ = CapsType.CAPSETTYPE_COMPDESK
+    
+    def __init__(self, readLen = None):
+        CompositeType.__init__(self, readLen = readLen)
+        self.compDeskSupportLevel = UInt16Le(0x0001)
+
 class MultiFragmentUpdate(CompositeType):
     """
     @summary: Use to advertise fast path max buffer to use

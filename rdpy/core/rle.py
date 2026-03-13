@@ -611,12 +611,20 @@ def bitmap_decompress4(input_data, width, height):
     output = bytearray(size)
 
     code, input_data = CVAL(input_data)
-    # code should be 0x10 for RDP 32bpp compressed bitmap
+    rle = (code & 0x10) != 0
+    no_alpha = (code & 0x20) != 0
+
+    if not rle:
+        return bytes(output)
 
     total = 1
 
-    process_ln, input_data = process_plane(input_data, width, height, output, 3)
-    total += process_ln
+    if no_alpha:
+        # No alpha plane in the stream; fill alpha channel with 0xFF.
+        output[3::4] = b'\xff' * (width * height)
+    else:
+        process_ln, input_data = process_plane(input_data, width, height, output, 3)
+        total += process_ln
 
     process_ln, input_data = process_plane(input_data, width, height, output, 2)
     total += process_ln
@@ -627,9 +635,7 @@ def bitmap_decompress4(input_data, width, height):
     process_ln, input_data = process_plane(input_data, width, height, output, 0)
     total += process_ln
 
-    # Force alpha channel (byte[3] of each pixel) to 0xFF for Qt Format_RGB32 compatibility.
-    # RDP 32bpp compressed bitmaps use the alpha plane for internal encoding,
-    # but Qt Format_RGB32 requires byte[3] = 0xFF for opaque pixels.
+    # Force alpha channel to 0xFF for Qt Format_RGB32 compatibility.
     output[3::4] = b'\xff' * (width * height)
 
     return bytes(output)
