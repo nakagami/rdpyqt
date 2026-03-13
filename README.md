@@ -68,6 +68,5 @@ rdpyqt6 [options] ip[:port]
 Example:
 
 ```sh
-rdpyqt6 -u user -p password -d domain -w 1920 -l 1080 192.168.1.1:3389
-rdpyqt6 -u user -p password -kt IBM_101_102_KEYS -kl FRENCH 192.168.1.1:3389
+rdpyqt6 -u user -p password -w 1920 -l 1080 rdp_server:3389
 ```
