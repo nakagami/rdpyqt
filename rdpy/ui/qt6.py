@@ -135,7 +135,7 @@ def RDPBitmapToQtImage(width, height, bitsPerPixel, isCompress, data):
             # expects [B, G, R, 0xFF]. Force the alpha byte to 0xFF.
             raw = bytearray(data)
             raw[3::4] = b'\xff' * (width * height)
-            image = QtGui.QImage(bytes(raw), width, height, width * 4, QtGui.QImage.Format.Format_RGB32)
+            image = QtGui.QImage(raw, width, height, width * 4, QtGui.QImage.Format.Format_RGB32)
             image = image.mirrored(False, True)
     else:
         log.error("Receive image in bad format")

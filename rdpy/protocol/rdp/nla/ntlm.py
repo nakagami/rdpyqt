@@ -26,9 +26,9 @@ import hashlib, hmac, struct, datetime
 import binascii
 from Crypto.Hash import MD4 as CryptoMD4
 from . import sspi
-import rdpy.security.pyDes as pyDes
 import rdpy.security.rc4 as rc4
 from rdpy.security.rsa_wrapper import random
+from Crypto.Cipher import DES as _CryptoDES
 from rdpy.core.type import CompositeType, CallableValue, String, UInt8, UInt16Le, UInt24Le, UInt32Le, sizeof, Stream
 from rdpy.core import filetimes, error, log
 
@@ -339,15 +339,17 @@ def expandDesKey(key):
     """
     @summary: Expand the key from a 7-byte password key into a 8-byte DES key
     """
-    s = chr(((ord(key[0]) >> 1) & 0x7f) << 1)
-    s = s + chr(((ord(key[0]) & 0x01) << 6 | ((ord(key[1]) >> 2) & 0x3f)) << 1)
-    s = s + chr(((ord(key[1]) & 0x03) << 5 | ((ord(key[2]) >> 3) & 0x1f)) << 1)
-    s = s + chr(((ord(key[2]) & 0x07) << 4 | ((ord(key[3]) >> 4) & 0x0f)) << 1)
-    s = s + chr(((ord(key[3]) & 0x0f) << 3 | ((ord(key[4]) >> 5) & 0x07)) << 1)
-    s = s + chr(((ord(key[4]) & 0x1f) << 2 | ((ord(key[5]) >> 6) & 0x03)) << 1)
-    s = s + chr(((ord(key[5]) & 0x3f) << 1 | ((ord(key[6]) >> 7) & 0x01)) << 1)
-    s = s + chr((ord(key[6]) & 0x7f) << 1)
-    return s
+    k = [b if isinstance(b, int) else ord(b) for b in key]
+    return bytes([
+        ((k[0] >> 1) & 0x7f) << 1,
+        ((k[0] & 0x01) << 6 | ((k[1] >> 2) & 0x3f)) << 1,
+        ((k[1] & 0x03) << 5 | ((k[2] >> 3) & 0x1f)) << 1,
+        ((k[2] & 0x07) << 4 | ((k[3] >> 4) & 0x0f)) << 1,
+        ((k[3] & 0x0f) << 3 | ((k[4] >> 5) & 0x07)) << 1,
+        ((k[4] & 0x1f) << 2 | ((k[5] >> 6) & 0x03)) << 1,
+        ((k[5] & 0x3f) << 1 | ((k[6] >> 7) & 0x01)) << 1,
+        (k[6] & 0x7f) << 1,
+    ])
 
 def CurrentFileTimes():
     """
@@ -359,10 +361,10 @@ def CurrentFileTimes():
 def DES(key, data):
     """
     @summary: DES use in microsoft specification
-    @param key: {str}    Des key on 56 bits or 7 bytes
-    @param data: {str}    data to encrypt
+    @param key: {bytes}  Des key on 56 bits (7 bytes)
+    @param data: {bytes} data to encrypt
     """
-    return pyDes.des(expandDesKey(key)).encrypt(data)
+    return _CryptoDES.new(expandDesKey(key), _CryptoDES.MODE_ECB).encrypt(data)
 
 def DESL(key, data):
     """

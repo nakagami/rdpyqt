@@ -4,6 +4,31 @@
 import array
 import sys
 
+# Cache for mix XOR translation tables (keyed by mix value).
+# _mix_table_cache: for 8bpp, maps uint8 mix -> 256-byte translate table
+# _uint16_xor_cache: for 16bpp, maps uint16 mix -> (lo_table, hi_table)
+_mix_table_cache: dict = {}
+_uint16_xor_cache: dict = {}
+
+
+def _get_mix_table(mix: int) -> bytes:
+    """Return a 256-byte translate table that XORs each byte with mix."""
+    if mix not in _mix_table_cache:
+        _mix_table_cache[mix] = bytes(i ^ mix for i in range(256))
+    return _mix_table_cache[mix]
+
+
+def _get_uint16_xor_tables(mix: int):
+    """Return (lo_table, hi_table) to XOR little-endian uint16 bytes with mix."""
+    if mix not in _uint16_xor_cache:
+        lo = mix & 0xff
+        hi = (mix >> 8) & 0xff
+        _uint16_xor_cache[mix] = (
+            bytes(i ^ lo for i in range(256)),
+            bytes(i ^ hi for i in range(256)),
+        )
+    return _uint16_xor_cache[mix]
+
 
 def CVAL(p):
     return p[0], p[1:]
@@ -68,7 +93,7 @@ def _decompress1(output, width, height, input_data):
     fom_mask = 0
     mask = 0
     mixmask = 0
-    mix_table = bytes(i ^ mix for i in range(256))
+    mix_table = _get_mix_table(mix)
 
     while pos < n:
         fom_mask = 0
@@ -85,7 +110,7 @@ def _decompress1(output, width, height, input_data):
             colour2 = inp[pos]; pos += 1
         elif opcode == 6 or opcode == 7:  # SetMix/Mix or SetMix/FillOrMix
             mix = inp[pos]; pos += 1
-            mix_table = bytes(i ^ mix for i in range(256))
+            mix_table = _get_mix_table(mix)
             opcode -= 5
         elif opcode == 9:  # FillOrMix_1
             mask = 0x03
@@ -280,7 +305,14 @@ def _decompress2(output, width, height, input_data):
                     pixels[line + x : line + x + n_pix] = array.array('H', [mix]) * n_pix
                 else:
                     src = pixels[prevline + x : prevline + x + n_pix]
-                    pixels[line + x : line + x + n_pix] = array.array('H', (v ^ mix for v in src))
+                    tbl_lo, tbl_hi = _get_uint16_xor_tables(mix)
+                    raw = src.tobytes()
+                    xored = bytearray(len(raw))
+                    xored[0::2] = raw[0::2].translate(tbl_lo)
+                    xored[1::2] = raw[1::2].translate(tbl_hi)
+                    result = array.array('H')
+                    result.frombytes(xored)
+                    pixels[line + x : line + x + n_pix] = result
                 count -= n_pix
                 x += n_pix
 
