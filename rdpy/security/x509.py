@@ -20,6 +20,7 @@
 """
 @see: https://github.com/filippog/pyasn1/blob/master/examples/x509.py
 """
+import binascii
 
 from pyasn1.type import tag, namedtype, namedval, univ, constraint, char, useful
 from pyasn1.codec.ber import decoder
@@ -147,10 +148,9 @@ def extractRSAKey(certificate):
     @return: (modulus, public exponent)
     """
     #http://www.alvestrand.no/objectid/1.2.840.113549.1.1.1.html
-    
     binaryTuple = certificate.getComponentByName('tbsCertificate').getComponentByName('subjectPublicKeyInfo').getComponentByName('subjectPublicKey')        
     l = int("".join([str(i) for i in binaryTuple]), 2)
-    return extractRSAKeyFromASN1(hex(l)[2:-1].decode('hex'))
+    return extractRSAKeyFromASN1(binascii.unhexlify(hex(l)[2:]))
     
 def extractRSAKeyFromASN1(subjectPublicKey):
     rsaKey = decoder.decode(subjectPublicKey, asn1Spec=RSAPublicKey())[0]

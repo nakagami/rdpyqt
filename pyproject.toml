@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rdpyqt"
+version = "2.0.0"
+description = "Remote Desktop Protocol client"
+readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
+authors = [
+    { name = "Sylvain Peyrefitte", email = "citronneur@gmail.com" },
+]
+maintainers = [
+    { name = "Hajime Nakagami", email = "nakagami@gmail.com" },
+]
+urls = { homepage = "https://github.com/nakagami/rdpyqt" }
+dependencies = [
+    "twisted",
+    "pyopenssl",
+    "service_identity",
+    "rsa",
+    "pyasn1",
+    "pycryptodome",
+    "Pillow",
+    "PyQt6",
+    "qt-reactor",
+]
+
+[project.scripts]
+rdpyqt6     = "rdpy.scripts.rdpyqt6:main"
+
+[tool.setuptools.packages.find]
+where = ["."]

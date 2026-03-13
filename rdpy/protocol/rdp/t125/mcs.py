@@ -27,10 +27,10 @@ It exist channel for file system order, audio channel, clipboard etc...
 from rdpy.core.layer import LayerAutomata, IStreamSender, Layer
 from rdpy.core.type import sizeof, Stream, UInt8, UInt16Le, String
 from rdpy.core.error import InvalidExpectedDataException, InvalidValue, InvalidSize, CallPureVirtualFuntion
-from ber import writeLength
+from .ber import writeLength
 import rdpy.core.log as log
 
-import ber, gcc, per
+from . import ber, gcc, per
 import rdpy.security.rsa_wrapper as rsa
 
 class Message(object):
@@ -119,6 +119,7 @@ class MCSLayer(LayerAutomata):
             send function of MCS layer
             @param data: {type.Type | Tuple}
             """
+            log.debug(f"mcs.MCSLayer.MCSProxySender.send({data}) {self._channelId=}")
             self._mcs.send(self._channelId, data)
             
         def close(self):
@@ -182,7 +183,7 @@ class MCSLayer(LayerAutomata):
         @summary: Send disconnect provider ultimatum
         """
         self._transport.send((UInt8(self.writeMCSPDUHeader(DomainMCSPDU.DISCONNECT_PROVIDER_ULTIMATUM, 1)),
-                              per.writeEnumerates(0x80), String("\x00" * 6)))
+                              per.writeEnumerates(0x80), String(b"\x00" * 6)))
         self._transport.close()
         
     def allChannelConnected(self):
@@ -191,12 +192,14 @@ class MCSLayer(LayerAutomata):
         Send connect to upper channel
         And prepare MCS layer to receive data
         """
+        log.debug(f"mcs Server.allChannelConnected() start")
         #connection is done
         self.setNextState(self.recvData)
         #try connection on all requested channel
-        for (channelId, layer) in self._channels.iteritems():
+        for (channelId, layer) in self._channels.items():
             #use proxy for each channel
             MCSLayer.MCSProxySender(layer, self, channelId).connect()
+        log.debug(f"mcs Server.allChannelConnected()  end")
     
     def send(self, channelId, data):
         """
@@ -236,7 +239,7 @@ class MCSLayer(LayerAutomata):
         per.readLength(data)
         
         #channel id doesn't match a requested layer
-        if not self._channels.has_key(channelId):
+        if channelId not in self._channels:
             log.error("receive data for an unconnected layer")
             return
 
@@ -303,6 +306,7 @@ class Client(MCSLayer):
         @param presentation: {Layer} presentation layer
         @param virtualChannels: {Array(Layer)} list additional channels like rdpsnd... [tuple(mcs.ChannelDef, layer)]
         """
+        log.debug(f"mcs Client.__init__({presentation})")
         MCSLayer.__init__(self, presentation, DomainMCSPDU.SEND_DATA_INDICATION, DomainMCSPDU.SEND_DATA_REQUEST, virtualChannels)
         #use to know state of static channel
         self._isGlobalChannelRequested = False
@@ -316,9 +320,13 @@ class Client(MCSLayer):
         Send ConnectInitial
         Wait ConnectResponse
         """
+        self._clientSettings.CS_CORE.connectionType.value = 0
+        self._clientSettings.CS_CORE.pad1octet.value = 0
+
         self._clientSettings.CS_CORE.serverSelectedProtocol.value = self._transport._selectedProtocol
         #ask for virtual channel
         self._clientSettings.CS_NET.channelDefArray._array = [x for (x, _) in self._virtualChannels]
+        log.debug(f"mcs Client.connect() {self._clientSettings.CS_CORE.serverSelectedProtocol.value=} {self._clientSettings.CS_NET.channelDefArray._array=}")
         #send connect initial
         self.sendConnectInitial()
         #next wait response
@@ -330,15 +338,18 @@ class Client(MCSLayer):
         Send channel request or connect upper layer if all channels are connected
         Wait channel confirm
         """
+        log.debug("mcs Client.connectNextChannel()")
         self.setNextState(self.recvChannelJoinConfirm)
         #global channel
         if not self._isGlobalChannelRequested:
+            log.debug("global channel")
             self.sendChannelJoinRequest(Channel.MCS_GLOBAL_CHANNEL)
             self._isGlobalChannelRequested = True
             return
         
         #user channel
         if not self._isUserChannelRequested:
+            log.debug(f"user channel {self._userId}")
             self.sendChannelJoinRequest(self._userId)
             self._isUserChannelRequested = True
             return
@@ -346,6 +357,7 @@ class Client(MCSLayer):
         #static virtual channel
         if self._nbChannelRequested < self._serverSettings.getBlock(gcc.MessageType.SC_NET).channelCount.value:
             channelId = self._serverSettings.getBlock(gcc.MessageType.SC_NET).channelIdArray[self._nbChannelRequested]
+            log.debug(f"static virtual channel {channelId=}")
             self._nbChannelRequested += 1
             self.sendChannelJoinRequest(channelId)
             return
@@ -360,6 +372,8 @@ class Client(MCSLayer):
         Wait Attach User Confirm
         @param data: {Stream}
         """
+        # https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/d23f7725-876c-48d4-9e41-8288896a19d3
+        log.debug("Client.recvConnectResponse()")
         ber.readApplicationTag(data, UInt8(Message.MCS_TYPE_CONNECT_RESPONSE))
         ber.readEnumerated(data)
         ber.readInteger(data)
@@ -367,6 +381,7 @@ class Client(MCSLayer):
         if not ber.readUniversalTag(data, ber.Tag.BER_TAG_OCTET_STRING, False):
             raise InvalidExpectedDataException("invalid expected BER tag")
         gccRequestLength = ber.readLength(data)
+        log.debug(f"Client.recvConnectResponse() {gccRequestLength=}")
         if data.dataLen() != gccRequestLength:
             raise InvalidSize("bad size of GCC request")
         self._serverSettings = gcc.readConferenceCreateResponse(data)
@@ -384,6 +399,7 @@ class Client(MCSLayer):
         Send Connect Channel
         @param data: {Stream}
         """
+        log.debug(f"Client.recvAttachUserConfirm() {data=}")
         opcode = UInt8()
         data.readType(opcode)
         
@@ -403,6 +419,7 @@ class Client(MCSLayer):
         client automata function
         @param data: {Stream}
         """
+        log.debug(f"Client.recvChannelJoinConfirm() {data=}")
         opcode = UInt8()
         data.readType(opcode)
         
@@ -433,21 +450,28 @@ class Client(MCSLayer):
         @summary: Send connect initial packet
         client automata function
         """
+        # https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/2610fcc7-3df4-4166-85bb-2c7ae21f6151
         ccReq = gcc.writeConferenceCreateRequest(self._clientSettings)
+        log.debug("Client.sendConnectInitial()")
         ccReqStream = Stream()
         ccReqStream.writeType(ccReq)
-        
-        tmp = (ber.writeOctetstring("\x01"), ber.writeOctetstring("\x01"), ber.writeBoolean(True),
+        import binascii
+        data = ccReqStream.getvalue()
+        log.debug(f"ccReq {binascii.hexlify(data).decode('utf-8')} {len(data)}")
+
+        tmp = (ber.writeOctetstring(b"\x01"), ber.writeOctetstring(b"\x01"), ber.writeBoolean(True),
                self.writeDomainParams(34, 2, 0, 0xffff),
                self.writeDomainParams(1, 1, 1, 0x420),
                self.writeDomainParams(0xffff, 0xfc17, 0xffff, 0xffff),
                ber.writeOctetstring(ccReqStream.getvalue()))
+        log.debug(f"{sizeof(tmp)=}")
         self._transport.send((ber.writeApplicationTag(Message.MCS_TYPE_CONNECT_INITIAL, sizeof(tmp)), tmp))
         
     def sendErectDomainRequest(self):
         """
         @summary: Send a formated erect domain request for RDP connection
         """
+        log.debug("Client.sendErectDomainRequest()")
         self._transport.send((self.writeMCSPDUHeader(UInt8(DomainMCSPDU.ERECT_DOMAIN_REQUEST)), 
                               per.writeInteger(0), 
                               per.writeInteger(0)))
@@ -456,6 +480,7 @@ class Client(MCSLayer):
         """
         @summary: Send a formated attach user request for RDP connection
         """
+        log.debug("Client.sendAttachUserRequest()")
         self._transport.send(self.writeMCSPDUHeader(UInt8(DomainMCSPDU.ATTACH_USER_REQUEST)))
         
     def sendChannelJoinRequest(self, channelId):
@@ -464,6 +489,7 @@ class Client(MCSLayer):
         client automata function
         @param channelId: {integer} id of channel requested
         """
+        log.debug(f"Client.sendChannelJoinRequest() {channelId=}")
         self._transport.send((self.writeMCSPDUHeader(UInt8(DomainMCSPDU.CHANNEL_JOIN_REQUEST)), 
                               per.writeInteger16(self._userId, Channel.MCS_USERCHANNEL_BASE), 
                               per.writeInteger16(channelId)))
@@ -486,6 +512,7 @@ class Server(MCSLayer):
         @summary: Connect message for server automata
         Wait Connect Initial
         """
+        log.debug(f"Server.connect()")
         #basic rdp security layer
         if self._transport._selectedProtocol == 0:
             
@@ -504,6 +531,7 @@ class Server(MCSLayer):
         Wait Erect Domain Request
         @param data: {Stream}
         """
+        log.debug(f"Server.recvConnectInitial()")
         ber.readApplicationTag(data, UInt8(Message.MCS_TYPE_CONNECT_INITIAL))
         ber.readOctetString(data)
         ber.readOctetString(data)
@@ -523,6 +551,7 @@ class Server(MCSLayer):
                 #if channel can be handle by serve add it
                 for serverChannelDef, layer in self._virtualChannels:
                     if channelDef.name == serverChannelDef.name:
+                        log.debug(f"Server.recvConnectInitial() {channelDef.name=}")
                         self._channels[i + Channel.MCS_GLOBAL_CHANNEL] = layer
                 i += 1
         
@@ -535,6 +564,7 @@ class Server(MCSLayer):
         Wait Attach User Request
         @param data: {Stream}
         """
+        log.debug(f"Server.recvErectDomainRequest()")
         opcode = UInt8()
         data.readType(opcode)
         
@@ -553,6 +583,7 @@ class Server(MCSLayer):
         Wait Channel Join Request
         @param data: {Stream}
         """
+        log.debug(f"Server.recvAttachUserRequest()")
         opcode = UInt8()
         data.readType(opcode)
         
@@ -569,6 +600,7 @@ class Server(MCSLayer):
         @param data: {Stream}
         
         """
+        log.debug(f"Server.recvChannelJoinRequest()")
         opcode = UInt8()
         data.readType(opcode)
         
@@ -591,6 +623,7 @@ class Server(MCSLayer):
         """
         @summary: Send connect response
         """
+        log.debug(f"Server.sendConnectResponse()")
         ccReq = gcc.writeConferenceCreateResponse(self._serverSettings)
         ccReqStream = Stream()
         ccReqStream.writeType(ccReq)
@@ -603,6 +636,7 @@ class Server(MCSLayer):
         """
         @summary: Send attach user confirm
         """
+        log.debug(f"Server.sendAttachUserConfirm()")
         self._transport.send((self.writeMCSPDUHeader(UInt8(DomainMCSPDU.ATTACH_USER_CONFIRM), 2), 
                              per.writeEnumerates(0), 
                              per.writeInteger16(self._userId, Channel.MCS_USERCHANNEL_BASE)))
@@ -613,6 +647,7 @@ class Server(MCSLayer):
         @param channelId: {integer} id of channel
         @param confirm: {boolean} connection state 
         """
+        log.debug(f"Server.sendChannelJoinConfirm()")
         self._transport.send((self.writeMCSPDUHeader(UInt8(DomainMCSPDU.CHANNEL_JOIN_CONFIRM), 2), 
                               per.writeEnumerates(int(confirm)), 
                               per.writeInteger16(self._userId, Channel.MCS_USERCHANNEL_BASE), 

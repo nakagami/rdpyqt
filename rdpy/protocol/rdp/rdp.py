@@ -23,13 +23,11 @@ Use to manage RDP stack in twisted
 
 from rdpy.core import layer
 from rdpy.core.error import CallPureVirtualFuntion, InvalidValue
-import pdu.layer
-import pdu.data
-import pdu.caps
+from . import pdu
 import rdpy.core.log as log
-import tpkt, x224, sec
-from t125 import mcs, gcc
-from nla import cssp, ntlm
+from . import tpkt, x224, sec
+from .t125 import mcs, gcc
+from .nla import cssp, ntlm
 
 class SecurityLevel(object):
     """
@@ -85,7 +83,7 @@ class RDPClientController(pdu.layer.PDUClientListener):
         """
         @summary: Set particular flag in RDP stack to avoid wall-paper, theme, menu animation etc...
         """
-        self._secLayer._info.extendedInfo.performanceFlags.value = sec.PerfFlag.PERF_DISABLE_WALLPAPER | sec.PerfFlag.PERF_DISABLE_MENUANIMATIONS | sec.PerfFlag.PERF_DISABLE_CURSOR_SHADOW | sec.PerfFlag.PERF_DISABLE_THEMING | sec.PerfFlag.PERF_DISABLE_FULLWINDOWDRAG
+        self._secLayer._info.extendedInfo.performanceFlags.value = sec.PerfFlag.PERF_DISABLE_WALLPAPER | sec.PerfFlag.PERF_DISABLE_MENUANIMATIONS | sec.PerfFlag.PERF_DISABLE_CURSOR_SHADOW | sec.PerfFlag.PERF_DISABLE_THEMING | sec.PerfFlag.PERF_DISABLE_FULLWINDOWDRAG | sec.PerfFlag.PERF_ENABLE_FONT_SMOOTHING
         
     def setScreen(self, width, height):
         """
@@ -137,18 +135,30 @@ class RDPClientController(pdu.layer.PDUClientListener):
     def setKeyboardLayout(self, layout):
         """
         @summary: keyboard layout
-        @param layout: us | fr
+        @param layout: name of gcc.KeyboardLayout attribute (e.g. US, FRENCH)
         """
-        if layout == "fr":
-            self._mcsLayer._clientSettings.CS_CORE.kbdLayout.value = gcc.KeyboardLayout.FRENCH
-        elif layout == "us":
-            self._mcsLayer._clientSettings.CS_CORE.kbdLayout.value = gcc.KeyboardLayout.US
-    
+        value = getattr(gcc.KeyboardLayout, layout.upper(), None)
+        if value is None:
+            log.warning("Unknown keyboard layout: %s, falling back to US" % layout)
+            value = gcc.KeyboardLayout.US
+        self._mcsLayer._clientSettings.CS_CORE.kbdLayout.value = value
+
+    def setKeyboardType(self, keyboard_type):
+        """
+        @summary: keyboard type
+        @param keyboard_type: name of gcc.KeyboardType attribute (e.g. IBM_101_102_KEYS)
+        """
+        value = getattr(gcc.KeyboardType, keyboard_type.upper(), None)
+        if value is None:
+            log.warning("Unknown keyboard type: %s, falling back to IBM_101_102_KEYS" % keyboard_type)
+            value = gcc.KeyboardType.IBM_101_102_KEYS
+        self._mcsLayer._clientSettings.CS_CORE.keyboardType.value = value
+
     def setHostname(self, hostname):
         """
         @summary: set hostname of machine
         """
-        self._mcsLayer._clientSettings.CS_CORE.clientName.value = hostname[:15] + "\x00" * (15 - len(hostname))
+#        self._mcsLayer._clientSettings.CS_CORE.clientName.value = hostname[:15] + "\x00" * (15 - len(hostname))
         self._secLayer._licenceManager._hostname = hostname
         
     def setSecurityLevel(self, level):
@@ -189,7 +199,44 @@ class RDPClientController(pdu.layer.PDUClientListener):
             #for each rectangle in update PDU
             for rectangle in rectangles:
                 observer.onUpdate(rectangle.destLeft.value, rectangle.destTop.value, rectangle.destRight.value, rectangle.destBottom.value, rectangle.width.value, rectangle.height.value, rectangle.bitsPerPixel.value, rectangle.flags.value & pdu.data.BitmapFlag.BITMAP_COMPRESSION, rectangle.bitmapDataStream.value)
-                
+
+    def onPointerHide(self):
+        """
+        @summary: Call when server requests the pointer to be hidden
+        """
+        for observer in self._clientObserver:
+            observer.onPointerHide()
+
+    def onPointerDefault(self):
+        """
+        @summary: Call when server requests the default system pointer
+        """
+        for observer in self._clientObserver:
+            observer.onPointerDefault()
+
+    def onPointerCached(self, cacheIndex):
+        """
+        @summary: Call when server switches to a previously cached pointer
+        @param cacheIndex: index of cached pointer
+        """
+        for observer in self._clientObserver:
+            observer.onPointerCached(cacheIndex)
+
+    def onPointerUpdate(self, xorBpp, cacheIndex, hotSpotX, hotSpotY, width, height, andMask, xorMask):
+        """
+        @summary: Call when server sends a new pointer shape
+        @param xorBpp: bits per pixel of XOR mask
+        @param cacheIndex: cache index to store this pointer
+        @param hotSpotX: hotspot X coordinate
+        @param hotSpotY: hotspot Y coordinate
+        @param width: pointer width
+        @param height: pointer height
+        @param andMask: AND mask data
+        @param xorMask: XOR mask data
+        """
+        for observer in self._clientObserver:
+            observer.onPointerUpdate(xorBpp, cacheIndex, hotSpotX, hotSpotY, width, height, andMask, xorMask)
+
     def onReady(self):
         """
         @summary: Call when PDU layer is connected
@@ -262,14 +309,13 @@ class RDPClientController(pdu.layer.PDUClientListener):
         except InvalidValue:
             log.info("try send pointer event with incorrect position")
     
-    def sendWheelEvent(self, x, y, step, isNegative = False, isHorizontal = False):
+    def sendWheelEvent(self, x, y, scroll, isHorizontal=False):
         """
         @summary: Send a mouse wheel event
         @param x: x position of pointer
         @param y: y position of pointer
-        @param step: number of step rolled
+        @param scroll: signed scroll value (positive=up/right, negative=down/left)
         @param isHorizontal: horizontal wheel (default is vertical)
-        @param isNegative: is upper (default down)
         """
         if not self._isReady:
             return
@@ -280,19 +326,22 @@ class RDPClientController(pdu.layer.PDUClientListener):
                 event.pointerFlags.value |= pdu.data.PointerFlag.PTRFLAGS_HWHEEL
             else:
                 event.pointerFlags.value |= pdu.data.PointerFlag.PTRFLAGS_WHEEL
-                
-            if isNegative:
+
+            if scroll < 0:
                 event.pointerFlags.value |= pdu.data.PointerFlag.PTRFLAGS_WHEEL_NEGATIVE
-                
-            event.pointerFlags.value |= (step & pdu.data.PointerFlag.WheelRotationMask)
-            
+
+            # Match grdp: uint8 cast of signed value gives 256-complement for negatives
+            # e.g. scroll=-1 → ts=255 (0xFF), scroll=1 → ts=1
+            ts = scroll & 0xFF
+            event.pointerFlags.value |= (pdu.data.PointerFlag.WheelRotationMask & ts)
+
             #position
             event.xPos.value = x
             event.yPos.value = y
-            
+
             #send proper event
             self._pduLayer.sendInputEvents([event])
-            
+
         except InvalidValue:
             log.info("try send wheel event with incorrect position")
             
@@ -412,7 +461,7 @@ class RDPServerController(pdu.layer.PDUServerListener):
         """
         @return: name of client (information done by RDP)
         """
-        return self._mcsLayer._clientSettings.CS_CORE.clientName.value.strip('\x00')
+        return self._mcsLayer._clientSettings.CS_CORE.clientName.value.decode("utf-8").strip("\x00")
     
     def getUsername(self):
         """
@@ -671,6 +720,39 @@ class RDPClientObserver(object):
         @param data: bitmap data
         """
         raise CallPureVirtualFuntion("%s:%s defined by interface %s"%(self.__class__, "onUpdate", "RDPClientObserver"))
+
+    def onPointerHide(self):
+        """
+        @summary: Called when the server hides the pointer
+        """
+        pass
+
+    def onPointerDefault(self):
+        """
+        @summary: Called when the server requests the default system pointer
+        """
+        pass
+
+    def onPointerCached(self, cacheIndex):
+        """
+        @summary: Called when the server switches to a cached pointer
+        @param cacheIndex: index of cached pointer
+        """
+        pass
+
+    def onPointerUpdate(self, xorBpp, cacheIndex, hotSpotX, hotSpotY, width, height, andMask, xorMask):
+        """
+        @summary: Called when the server sends a new pointer shape
+        @param xorBpp: bits per pixel of XOR mask
+        @param cacheIndex: cache index to store this pointer
+        @param hotSpotX: hotspot X coordinate
+        @param hotSpotY: hotspot Y coordinate
+        @param width: pointer width
+        @param height: pointer height
+        @param andMask: AND mask data
+        @param xorMask: XOR mask data
+        """
+        pass
     
 class RDPServerObserver(object):
     """

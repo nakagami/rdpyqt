@@ -23,6 +23,7 @@ Implement transport PDU layer
 This layer have main goal to negociate SSL transport
 RDP basic security is supported only on client side
 """
+import binascii
 from rdpy.core import log
 
 from rdpy.core.layer import LayerAutomata, IStreamSender
@@ -79,7 +80,7 @@ class ClientConnectionRequestPDU(CompositeType):
         self.len = UInt8(lambda:sizeof(self) - 1)
         self.code = UInt8(MessageType.X224_TPDU_CONNECTION_REQUEST, constant = True)
         self.padding = (UInt16Be(), UInt16Be(), UInt8())
-        self.cookie = String(until = "\x0d\x0a", conditional = lambda:(self.len._is_readed and self.len.value > 14))
+        self.cookie = String(until = b"\x0d\x0a", conditional = lambda:(self.len._is_readed and self.len.value > 14))
         #read if there is enough data
         self.protocolNeg = Negotiation(optional = True)
 
@@ -131,6 +132,7 @@ class X224Layer(LayerAutomata, IStreamSender):
         """
         @param presentation: upper layer, MCS layer in RDP case
         """
+        log.debug(f"X224Layer.__init__({presentation})")
         LayerAutomata.__init__(self, presentation)
         #client requested selectedProtocol
         self._requestedProtocol = Protocols.PROTOCOL_SSL | Protocols.PROTOCOL_HYBRID
@@ -169,6 +171,7 @@ class Client(X224Layer):
         """
         @summary: Connection request for client send a connection request packet
         """
+        log.debug("x224 Client.connect()")
         self.sendConnectionRequest()
         
     def sendConnectionRequest(self):
@@ -180,6 +183,7 @@ class Client(X224Layer):
         message = ClientConnectionRequestPDU()
         message.protocolNeg.code.value = NegociationType.TYPE_RDP_NEG_REQ
         message.protocolNeg.selectedProtocol.value = self._requestedProtocol
+        log.debug(f"Client.sendConnectRequest() {message}")
         self._transport.send(message)
         self.setNextState(self.recvConnectionConfirm)
         
@@ -192,6 +196,7 @@ class Client(X224Layer):
         @see: response -> http://msdn.microsoft.com/en-us/library/cc240506.aspx
         @see: failure ->http://msdn.microsoft.com/en-us/library/cc240507.aspx
         """
+        log.debug("Client.recvConnectionConfirm()")
         message = ServerConnectionConfirm()
         data.readType(message)
         
@@ -200,6 +205,7 @@ class Client(X224Layer):
         
         #check presence of negotiation response
         if message.protocolNeg._is_readed:
+            log.debug(f"Client.recvConnectionConfirm() {hex(message.protocolNeg.flag.value)=}")
             self._selectedProtocol = message.protocolNeg.selectedProtocol.value
         else:
             self._selectedProtocol = Protocols.PROTOCOL_RDP
@@ -253,6 +259,7 @@ class Server(X224Layer):
         """
         @summary: Connection request for server wait connection request packet from client
         """
+        log.debug("Server.connect()")
         self.setNextState(self.recvConnectionRequest)
         
     def recvConnectionRequest(self, data):
@@ -262,6 +269,7 @@ class Server(X224Layer):
         @param data: {Stream}
         @see : http://msdn.microsoft.com/en-us/library/cc240470.aspx
         """
+        log.debug("Server.recvConnectionRequest()")
         message = ClientConnectionRequestPDU()
         data.readType(message)
         
@@ -296,6 +304,7 @@ class Server(X224Layer):
                     Next state is recvData
         @see : http://msdn.microsoft.com/en-us/library/cc240501.aspx
         """
+        log.debug("Server.sendConnectionConfirm()")
         message = ServerConnectionConfirm()
         message.protocolNeg.code.value = NegociationType.TYPE_RDP_NEG_RSP
         message.protocolNeg.selectedProtocol.value = self._selectedProtocol
@@ -318,7 +327,7 @@ class ClientTLSContext(ssl.ClientContextFactory):
     @summary: client context factory for open ssl
     """
     def getContext(self):
-        context = SSL.Context(SSL.TLSv1_METHOD)
+        context = SSL.Context(SSL.TLS_METHOD)
         context.set_options(SSL.OP_DONT_INSERT_EMPTY_FRAGMENTS)
         context.set_options(SSL.OP_TLS_BLOCK_PADDING_BUG)
         return context
@@ -336,5 +345,4 @@ class ServerTLSContext(ssl.DefaultOpenSSLContextFactory):
                 self.set_options(SSL.OP_DONT_INSERT_EMPTY_FRAGMENTS)
                 self.set_options(SSL.OP_TLS_BLOCK_PADDING_BUG)
 
-        ssl.DefaultOpenSSLContextFactory.__init__(self, privateKeyFileName, certificateFileName, SSL.SSLv23_METHOD, TPDUSSLContext)
-        
+        ssl.DefaultOpenSSLContextFactory.__init__(self, privateKeyFileName, certificateFileName, SSL.TLS_METHOD, TPDUSSLContext)

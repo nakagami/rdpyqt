@@ -32,27 +32,27 @@ def newkeys(size):
 
 def PublicKey(e, n):
     """
-    @param e: {long | str}public exponent
-    @param n: {long | str}modulus
+    @param e: {long | bytes}public exponent
+    @param n: {long | bytes}modulus
     """
-    if isinstance(e, str):
+    if isinstance(e, bytes):
         e = rsa.transform.bytes2int(e)
-    if isinstance(n, str):
+    if isinstance(n, bytes):
         n = rsa.transform.bytes2int(n)
     return { 'e' : e, 'n' : n }
 
 def PrivateKey(d, n):
     """
-    @param d: {long | str}private exponent
-    @param n: {long | str}modulus
+    @param d: {long | bytes}private exponent
+    @param n: {long | bytes}modulus
     """
-    if isinstance(d, str):
+    if isinstance(d, bytes):
         d = rsa.transform.bytes2int(d)
-    if isinstance(n, str):
+    if isinstance(n, bytes):
         n = rsa.transform.bytes2int(n)
     return { 'd' : d, 'n' : n }
 
-def int2bytes(i, fill_size=None):
+def int2bytes(i, fill_size=0):
     """
     @summary: wrapper of rsa.transform.int2bytes
     """

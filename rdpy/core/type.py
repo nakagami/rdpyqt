@@ -26,7 +26,7 @@ We are in python!
 
 import struct
 from copy import deepcopy
-from StringIO import StringIO
+from io import BytesIO
 from rdpy.core.error import InvalidExpectedDataException, InvalidSize, CallPureVirtualFuntion, InvalidValue
 import rdpy.core.log as log
 
@@ -101,7 +101,7 @@ class Type(object):
         old = deepcopy(self)
         self.__read__(s)
         #check constant value
-        if old != self:
+        if old.value != self.value:
             #rollback read value
             s.pos -= sizeof(self)
             raise InvalidExpectedDataException("%s const value expected %s != %s"%(self.__class__, old.value, self.value))
@@ -266,7 +266,7 @@ class SimpleType(Type, CallableValue):
                     Because in Python all numbers are Int long or float
                     Cache result in self._mask field
         """
-        if not self.__dict__.has_key("_mask"):
+        if not "_mask" in self.__dict__:
             mask = 0xff
             for _ in range(1, self._typeSize):
                 mask = mask << 8 | 0xff
@@ -703,7 +703,7 @@ class UInt24Be(SimpleType):
         @summary: special read for a special type
         @param s: Stream
         """
-        self.value = struct.unpack(self._structFormat, '\x00' + s.read(self._typeSize))[0]
+        self.value = struct.unpack(self._structFormat, b'\x00' + s.read(self._typeSize))[0]
         
 class UInt24Le(SimpleType):
     """
@@ -734,14 +734,14 @@ class UInt24Le(SimpleType):
         @summary: special read for a special type
         @param s: Stream
         """
-        self.value = struct.unpack(self._structFormat, s.read(self._typeSize) + '\x00')[0]
+        self.value = struct.unpack(self._structFormat, s.read(self._typeSize) + b'\x00')[0]
         
 class String(Type, CallableValue):
     """
     @summary:  String type
                 Leaf in Type tree
     """
-    def __init__(self, value = "", readLen = None, conditional = lambda:True, optional = False, constant = False, unicode = False, until = None):
+    def __init__(self, value = b"", readLen = None, conditional = lambda:True, optional = False, constant = False, unicode = False, until = None):
         """
         @param value: python string use for inner value
         @param readLen: length use to read in stream (SimpleType) if 0 read entire stream
@@ -780,8 +780,10 @@ class String(Type, CallableValue):
         @summary: call when str function is call
         @return: inner python string
         """
-        return self.value
-    
+        if self._unicode:
+            return self.value.decode("utf-16-le")
+        return self.value.decode('utf-8')
+
     def __write__(self, s):
         """
         @summary:  Write the inner value after evaluation
@@ -793,12 +795,17 @@ class String(Type, CallableValue):
         
         if not self._until is None:
             toWrite += self._until
-            
         if self._unicode:
-            s.write(encodeUnicode(self.value))
+            v = self.value
+            if isinstance(v, str):
+                v = self.value.encode("utf-16-le")
+            if self._readLen is not None:
+                ln = self._readLen.value
+                v = (v + b"\x00" * ln)[:ln]
         else:
-            s.write(self.value)
-    
+            v = self.value
+        s.write(v)
+
     def __read__(self, s):
         """
         @summary:  Read readLen bytes as string
@@ -815,15 +822,15 @@ class String(Type, CallableValue):
                     self.value += s.read(1)
         else:
             self.value = s.read(self._readLen.value)
-        
+
         if self._unicode:
             self.value = decodeUnicode(self.value)
         
     def __sizeof__(self):
         """
         @summary:  return length of string
-                    if string is unicode encode return 2*len(str) + 2
         @return: length of inner string
+                    if string is unicode encode return 2*len(str) + 2
         """
         if self._unicode:
             return 2 * len(self.value) + 2
@@ -836,7 +843,11 @@ def encodeUnicode(s):
     @param s: str python
     @return: unicode string
     """
-    return "".join([c + "\x00" for c in s]) + "\x00\x00"
+    # FIX ME
+    if s == b'':
+        return b"\x00\x00"
+
+    return s.encode("utf-16-le") + b"\x00\x00"
 
 def decodeUnicode(s):
     """
@@ -844,18 +855,27 @@ def decodeUnicode(s):
     @param s: unicode string
     @return: str python
     """
-    i = 0
-    r = ""
-    while i < len(s) - 2:
-        if i % 2 == 0:
-            r += s[i]
-        i += 1
-    return r
+    return s[:-2].decode("utf-16-le")
 
-class Stream(StringIO):
+class Stream(BytesIO):
     """
     @summary:  Stream use to read all types
     """
+    def __init__(self, *args):
+        if len(args):
+            self.len = len(args[0])
+        else:
+            self.len = 0
+        super().__init__(*args)
+
+    @property
+    def pos(self):
+        return self.tell()
+
+    @pos.setter
+    def pos(self, n):
+        self.seek(n)
+
     def dataLen(self):
         """
         @return: not yet read length
@@ -895,7 +915,7 @@ class Stream(StringIO):
             return
 
         value.read(self)
-        
+
     def readNextType(self, t):
         """
         @summary: read next type but didn't consume it
@@ -915,6 +935,7 @@ class Stream(StringIO):
             for element in value:
                 self.writeType(element)
             return
+        self.len += value.__sizeof__()
         value.write(self)
         
 class ArrayType(Type):

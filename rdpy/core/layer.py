@@ -1,4 +1,5 @@
 #
+
 # Copyright (c) 2014-2015 Sylvain Peyrefitte
 #
 # This file is part of rdpy.
@@ -24,6 +25,7 @@ RDPY use Layer Protocol design (like twisted)
 """
 
 from rdpy.core.error import CallPureVirtualFuntion
+from rdpy.core import log
 
 class IStreamListener(object):
     """
@@ -70,6 +72,7 @@ class Layer(object):
                     default is send connect event to presentation layer
         """
         if not self._presentation is None:
+            log.debug("Layer.connect()")
             self._presentation.connect()
     
     def close(self):
@@ -107,7 +110,7 @@ class LayerAutomata(Layer, IStreamListener):
 from twisted.internet import protocol
 from twisted.internet.abstract import FileDescriptor
 #first that handle stream     
-from type import Stream
+from .type import Stream
 
 class RawLayerClientFactory(protocol.ClientFactory):
     """
@@ -179,7 +182,7 @@ class RawLayer(protocol.Protocol, LayerAutomata, IStreamSender):
         #call parent automata
         LayerAutomata.__init__(self, presentation)
         #data buffer received from twisted network layer
-        self._buffer = ""
+        self._buffer = b""
         #len of next packet pass to next state function
         self._expectedLen = 0
         self._factory = None
@@ -213,6 +216,7 @@ class RawLayer(protocol.Protocol, LayerAutomata, IStreamSender):
         @summary: inherit from twisted protocol
         """
         #join two scheme
+        log.debug("RawLayer.connect()")
         self.connect()
         
     def connectionLost(self, reason):

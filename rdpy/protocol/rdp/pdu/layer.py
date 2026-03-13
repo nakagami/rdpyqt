@@ -28,7 +28,7 @@ from rdpy.core.error import CallPureVirtualFuntion
 from rdpy.core.type import ArrayType
 import rdpy.core.log as log
 import rdpy.protocol.rdp.tpkt as tpkt
-import data, caps
+from . import data, caps
 
 class PDUClientListener(object):
     """
@@ -54,6 +54,33 @@ class PDUClientListener(object):
         """
         raise CallPureVirtualFuntion("%s:%s defined by interface %s"%(self.__class__, "onUpdate", "PDUClientListener"))
     
+    def onPointerHide(self):
+        """
+        @summary: call when server requests the pointer to be hidden
+        """
+        pass
+
+    def onPointerCached(self, cacheIndex):
+        """
+        @summary: call when server switches to a previously cached pointer
+        @param cacheIndex: index of cached pointer
+        """
+        pass
+
+    def onPointerUpdate(self, xorBpp, cacheIndex, hotSpotX, hotSpotY, width, height, andMask, xorMask):
+        """
+        @summary: call when server sends a new pointer shape
+        @param xorBpp: bits per pixel of XOR mask
+        @param cacheIndex: cache index to store this pointer
+        @param hotSpotX: hotspot X coordinate
+        @param hotSpotY: hotspot Y coordinate
+        @param width: pointer width
+        @param height: pointer height
+        @param andMask: AND mask data
+        @param xorMask: XOR mask data
+        """
+        pass
+
     def recvDstBltOrder(self, order):
         """
         @param order: rectangle order
@@ -128,6 +155,7 @@ class PDULayer(LayerAutomata, tpkt.IFastPathListener):
         @summary: Send a PDU data to transport layer
         @param pduMessage: PDU message
         """
+        log.debug("PDULayer.sendPDU()")
         self._transport.send(data.PDU(self._transport.getUserId(), pduMessage))
         
     def sendDataPDU(self, pduData):
@@ -135,6 +163,7 @@ class PDULayer(LayerAutomata, tpkt.IFastPathListener):
         @summary: Send an PDUData to transport layer
         @param pduData: PDU data message
         """
+        log.debug("PDULayer.sendDataPDU()")
         self.sendPDU(data.DataPDU(pduData, self._shareId))
 
 class Client(PDULayer):
@@ -174,13 +203,14 @@ class Client(PDULayer):
         Wait Server Synchronize PDU
         @param s: Stream
         """
+        log.debug("PDULayer.recvDemandActivePDU()")
         pdu = data.PDU()
         s.readType(pdu)
         
         if pdu.shareControlHeader.pduType.value != data.PDUType.PDUTYPE_DEMANDACTIVEPDU:
             #not a blocking error because in deactive reactive sequence 
             #input can be send too but ignored
-            log.debug("Ignore message type %s during connection sequence"%hex(pdu.shareControlHeader.pduType.value))
+            log.debug("recvDemandActivePDU() Ignore message type %s during connection sequence"%hex(pdu.shareControlHeader.pduType.value))
             return
         
         self._shareId = pdu.pduMessage.shareId.value
@@ -202,12 +232,13 @@ class Client(PDULayer):
         Wait Control Cooperate PDU
         @param s: Stream from transport layer
         """
+        log.debug("PDULayer.recvServerSynchronizePDU()")
         pdu = data.PDU()
         s.readType(pdu)
         if pdu.shareControlHeader.pduType.value != data.PDUType.PDUTYPE_DATAPDU or pdu.pduMessage.shareDataHeader.pduType2.value != data.PDUType2.PDUTYPE2_SYNCHRONIZE:
             #not a blocking error because in deactive reactive sequence 
             #input can be send too but ignored
-            log.debug("Ignore message type %s during connection sequence"%hex(pdu.shareControlHeader.pduType.value))
+            log.debug("recvServerSynchronizePDU() Ignore message type %s during connection sequence"%hex(pdu.shareControlHeader.pduType.value))
             return
         
         self.setNextState(self.recvServerControlCooperatePDU)
@@ -218,12 +249,13 @@ class Client(PDULayer):
         Wait Control Granted PDU
         @param s: Stream from transport layer
         """
+        log.debug("PDULayer.recvServerControlCooperatePDU()")
         pdu = data.PDU()
         s.readType(pdu)
         if pdu.shareControlHeader.pduType.value != data.PDUType.PDUTYPE_DATAPDU or pdu.pduMessage.shareDataHeader.pduType2.value != data.PDUType2.PDUTYPE2_CONTROL or pdu.pduMessage.pduData.action.value != data.Action.CTRLACTION_COOPERATE:
             #not a blocking error because in deactive reactive sequence 
             #input can be send too but ignored
-            log.debug("Ignore message type %s during connection sequence"%hex(pdu.shareControlHeader.pduType.value))
+            log.debug("recvServerControlCooperatePDU() Ignore message type %s during connection sequence"%hex(pdu.shareControlHeader.pduType.value))
             return
         
         self.setNextState(self.recvServerControlGrantedPDU)
@@ -234,12 +266,13 @@ class Client(PDULayer):
         Wait Font map PDU
         @param s: Stream from transport layer
         """
+        log.debug("PDULayer.recvServerControlGrantedPDU()")
         pdu = data.PDU()
         s.readType(pdu)
         if pdu.shareControlHeader.pduType.value != data.PDUType.PDUTYPE_DATAPDU or pdu.pduMessage.shareDataHeader.pduType2.value != data.PDUType2.PDUTYPE2_CONTROL or pdu.pduMessage.pduData.action.value != data.Action.CTRLACTION_GRANTED_CONTROL:
             #not a blocking error because in deactive reactive sequence 
             #input can be send too but ignored
-            log.debug("Ignore message type %s during connection sequence"%hex(pdu.shareControlHeader.pduType.value))
+            log.debug("recvServerControlGrantedPDU() Ignore message type %s during connection sequence"%hex(pdu.shareControlHeader.pduType.value))
             return
         
         self.setNextState(self.recvServerFontMapPDU)
@@ -250,12 +283,13 @@ class Client(PDULayer):
         Wait any PDU
         @param s: Stream from transport layer
         """
+        log.debug("PDULayer.recvServerFontMapPDU()")
         pdu = data.PDU()
         s.readType(pdu)
         if pdu.shareControlHeader.pduType.value != data.PDUType.PDUTYPE_DATAPDU or pdu.pduMessage.shareDataHeader.pduType2.value != data.PDUType2.PDUTYPE2_FONTMAP:
             #not a blocking error because in deactive reactive sequence 
             #input can be send too but ignored
-            log.debug("Ignore message type %s during connection sequence"%hex(pdu.shareControlHeader.pduType.value))
+            log.debug("recvServerFontMapPDU() Ignore message type %s during connection sequence"%hex(pdu.shareControlHeader.pduType.value))
             return
         
         self.setNextState(self.recvPDU)
@@ -267,6 +301,7 @@ class Client(PDULayer):
         @summary: Main receive function after connection sequence
         @param s: Stream from transport layer
         """
+        log.debug("PDULayer.recvPDU()")
         pdus = ArrayType(data.PDU)
         s.readType(pdus)
         for pdu in pdus:
@@ -285,17 +320,42 @@ class Client(PDULayer):
         @param fastPathS: {Stream} that contain fast path data
         @param secFlag: {SecFlags}
         """
+        log.debug("PDULayer.recvFastPath()")
         updates = ArrayType(data.FastPathUpdatePDU)
         fastPathS.readType(updates)
         for update in updates:
-            if update.updateHeader.value == data.FastPathUpdateType.FASTPATH_UPDATETYPE_BITMAP:
+            updateType = update.updateHeader.value & 0xf
+            if updateType == data.FastPathUpdateType.FASTPATH_UPDATETYPE_BITMAP:
                 self._listener.onUpdate(update.updateData.rectangles._array)
+            elif updateType == data.FastPathUpdateType.FASTPATH_UPDATETYPE_PTR_NULL:
+                self._listener.onPointerHide()
+            elif updateType == data.FastPathUpdateType.FASTPATH_UPDATETYPE_PTR_DEFAULT:
+                self._listener.onPointerDefault()
+            elif updateType == data.FastPathUpdateType.FASTPATH_UPDATETYPE_COLOR:
+                ud = update.updateData
+                self._listener.onPointerUpdate(
+                    24, ud.cacheIndex.value,
+                    ud.hotSpotX.value, ud.hotSpotY.value,
+                    ud.width.value, ud.height.value,
+                    ud.andMaskData.value, ud.xorMaskData.value
+                )
+            elif updateType == data.FastPathUpdateType.FASTPATH_UPDATETYPE_CACHED:
+                self._listener.onPointerCached(update.updateData.cacheIndex.value)
+            elif updateType == data.FastPathUpdateType.FASTPATH_UPDATETYPE_POINTER:
+                ud = update.updateData
+                self._listener.onPointerUpdate(
+                    ud.xorBpp.value, ud.cacheIndex.value,
+                    ud.hotSpotX.value, ud.hotSpotY.value,
+                    ud.width.value, ud.height.value,
+                    ud.andMaskData.value, ud.xorMaskData.value
+                )
         
     def readDataPDU(self, dataPDU):
         """
         @summary: read a data PDU object
         @param dataPDU: DataPDU object
         """
+        log.debug("PDULayer.readDataPDU()")
         if dataPDU.shareDataHeader.pduType2.value == data.PDUType2.PDUTYPE2_SET_ERROR_INFO_PDU:
             #ignore 0 error code because is not an error code
             if dataPDU.pduData.errorInfo.value == 0:
@@ -320,6 +380,7 @@ class Client(PDULayer):
         dispatch update data
         @param: {UpdateDataPDU} object
         """
+        log.debug("PDULayer.readUpdateDataPDU()")
         if updateDataPDU.updateType.value == data.UpdateType.UPDATETYPE_BITMAP:
             self._listener.onUpdate(updateDataPDU.updateData.rectangles._array)
         
@@ -327,6 +388,7 @@ class Client(PDULayer):
         """
         @summary: Send all client capabilities
         """
+        log.debug("PDULayer.sendConfirmActivePDU()")
         #init general capability
         generalCapability = self._clientCapabilities[caps.CapsType.CAPSTYPE_GENERAL].capability
         generalCapability.osMajorType.value = caps.MajorType.OSMAJORTYPE_WINDOWS
@@ -357,13 +419,14 @@ class Client(PDULayer):
         #make active PDU packet
         confirmActivePDU = data.ConfirmActivePDU()
         confirmActivePDU.shareId.value = self._shareId
-        confirmActivePDU.capabilitySets._array = self._clientCapabilities.values()
+        confirmActivePDU.capabilitySets._array = list(self._clientCapabilities.values())
         self.sendPDU(confirmActivePDU)
         
     def sendClientFinalizeSynchronizePDU(self):
         """
         @summary: send a synchronize PDU from client to server
         """
+        log.debug("PDULayer.sendClientFinalizeSynchronizePDU()")
         synchronizePDU = data.SynchronizeDataPDU(self._transport.getChannelId())
         self.sendDataPDU(synchronizePDU)
         
@@ -386,6 +449,7 @@ class Client(PDULayer):
         @summary: send client input events
         @param pointerEvents: list of pointer events
         """
+        log.debug("PDULayer.sendInputEvents()")
         pdu = data.ClientInputEventPDU()
         pdu.slowPathInputEvents._array = [data.SlowPathInputEvent(x) for x in pointerEvents]
         self.sendDataPDU(pdu)
@@ -417,13 +481,14 @@ class Server(PDULayer):
         Wait Client Synchronize PDU
         @param s: Stream
         """
+        log.debug("PDULayer.recvConfirmActivePDU()")
         pdu = data.PDU()
         s.readType(pdu)
         
         if pdu.shareControlHeader.pduType.value != data.PDUType.PDUTYPE_CONFIRMACTIVEPDU:
             #not a blocking error because in deactive reactive sequence 
             #input can be send too but ignored
-            log.debug("Ignore message type %s during connection sequence"%hex(pdu.shareControlHeader.pduType.value))
+            log.debug("recvConfirmActivePDU() Ignore message type %s during connection sequence"%hex(pdu.shareControlHeader.pduType.value))
             return
         
         for cap in pdu.pduMessage.capabilitySets._array:
@@ -443,12 +508,13 @@ class Server(PDULayer):
         Wait Control Cooperate PDU
         @param s: Stream from transport layer
         """
+        log.debug("PDULayer.recvClientSynchronizePDU()")
         pdu = data.PDU()
         s.readType(pdu)
         if pdu.shareControlHeader.pduType.value != data.PDUType.PDUTYPE_DATAPDU or pdu.pduMessage.shareDataHeader.pduType2.value != data.PDUType2.PDUTYPE2_SYNCHRONIZE:
             #not a blocking error because in deactive reactive sequence 
             #input can be send too but ignored
-            log.debug("Ignore message type %s during connection sequence"%hex(pdu.shareControlHeader.pduType.value))
+            log.debug("recvClientSynchronizePDU() Ignore message type %s during connection sequence"%hex(pdu.shareControlHeader.pduType.value))
             return
         self.setNextState(self.recvClientControlCooperatePDU)
         
@@ -458,12 +524,13 @@ class Server(PDULayer):
         Wait Control Request PDU
         @param s: Stream from transport layer
         """
+        log.debug("PDULayer.recvClientControlCooperatePDU()")
         pdu = data.PDU()
         s.readType(pdu)
         if pdu.shareControlHeader.pduType.value != data.PDUType.PDUTYPE_DATAPDU or pdu.pduMessage.shareDataHeader.pduType2.value != data.PDUType2.PDUTYPE2_CONTROL or pdu.pduMessage.pduData.action.value != data.Action.CTRLACTION_COOPERATE:
             #not a blocking error because in deactive reactive sequence 
             #input can be send too but ignored
-            log.debug("Ignore message type %s during connection sequence"%hex(pdu.shareControlHeader.pduType.value))
+            log.debug("recvClientControlCooperatePDU() Ignore message type %s during connection sequence"%hex(pdu.shareControlHeader.pduType.value))
             return
         self.setNextState(self.recvClientControlRequestPDU)
         
@@ -473,12 +540,13 @@ class Server(PDULayer):
         Wait Font List PDU
         @param s: Stream from transport layer
         """
+        log.debug("PDULayer.recvClientControlRequestPDU()")
         pdu = data.PDU()
         s.readType(pdu)
         if pdu.shareControlHeader.pduType.value != data.PDUType.PDUTYPE_DATAPDU or pdu.pduMessage.shareDataHeader.pduType2.value != data.PDUType2.PDUTYPE2_CONTROL or pdu.pduMessage.pduData.action.value != data.Action.CTRLACTION_REQUEST_CONTROL:
             #not a blocking error because in deactive reactive sequence 
             #input can be send too but ignored
-            log.debug("Ignore message type %s during connection sequence"%hex(pdu.shareControlHeader.pduType.value))
+            log.debug("recvClientControlRequestPDU() Ignore message type %s during connection sequence"%hex(pdu.shareControlHeader.pduType.value))
             return
         self.setNextState(self.recvClientFontListPDU)
         
@@ -489,12 +557,13 @@ class Server(PDULayer):
         Wait any PDU
         @param s: Stream from transport layer
         """
+        log.debug("PDULayer.recvClientFontListPDU()")
         pdu = data.PDU()
         s.readType(pdu)
         if pdu.shareControlHeader.pduType.value != data.PDUType.PDUTYPE_DATAPDU or pdu.pduMessage.shareDataHeader.pduType2.value != data.PDUType2.PDUTYPE2_FONTLIST:
             #not a blocking error because in deactive reactive sequence 
             #input can be send but ignored
-            log.debug("Ignore message type %s during connection sequence"%hex(pdu.shareControlHeader.pduType.value))
+            log.debug("recvClientFontListPDU() Ignore message type %s during connection sequence"%hex(pdu.shareControlHeader.pduType.value))
             return
         
         #finalize server
@@ -508,6 +577,7 @@ class Server(PDULayer):
         @summary: Main receive function after connection sequence
         @param s: Stream from transport layer
         """
+        log.debug("PDULayer.recvPDU()")
         pdu = data.PDU()
         s.readType(pdu)
         if pdu.shareControlHeader.pduType.value == data.PDUType.PDUTYPE_DATAPDU:
@@ -518,6 +588,7 @@ class Server(PDULayer):
         @summary: read a data PDU object
         @param dataPDU: DataPDU object
         """
+        log.debug("PDULayer.readDataPDU()")
         if dataPDU.shareDataHeader.pduType2.value == data.PDUType2.PDUTYPE2_SET_ERROR_INFO_PDU:
             errorMessage = "Unknown code %s"%hex(dataPDU.pduData.errorInfo.value)
             if data.ErrorInfo._MESSAGES_.has_key(dataPDU.pduData.errorInfo):
@@ -537,12 +608,14 @@ class Server(PDULayer):
         Fast path is needed by RDP 8.0
         @param fastPathS: Stream that contain fast path data
         """
+        log.debug("PDULayer.readFlashPath()")
         pass
         
     def sendDemandActivePDU(self):
         """
         @summary: Send server capabilities server automata PDU
         """
+        log.debug("PDULayer.sendDemandActivePDU()")
         #init general capability
         generalCapability = self._serverCapabilities[caps.CapsType.CAPSTYPE_GENERAL].capability
         generalCapability.osMajorType.value = caps.MajorType.OSMAJORTYPE_WINDOWS
@@ -554,13 +627,14 @@ class Server(PDULayer):
         
         demandActivePDU = data.DemandActivePDU()
         demandActivePDU.shareId.value = self._shareId
-        demandActivePDU.capabilitySets._array = self._serverCapabilities.values()
+        demandActivePDU.capabilitySets._array = list(self._serverCapabilities.values())
         self.sendPDU(demandActivePDU)
         
     def sendServerFinalizeSynchronizePDU(self):
         """
         @summary: Send last synchronize packet from server to client
         """
+        log.debug("PDULayer.sendServerFinalizeSynchronizePDU()")
         synchronizePDU = data.SynchronizeDataPDU(self._transport.getChannelId())
         self.sendDataPDU(synchronizePDU)
         
@@ -583,6 +657,7 @@ class Server(PDULayer):
         @summary: Send a PDU data to transport layer
         @param pduMessage: PDU message
         """
+        log.debug("PDULayer.sendPDU()")
         PDULayer.sendPDU(self, pduMessage)
         #restart capabilities exchange in case of deactive reactive sequence
         if isinstance(pduMessage, data.DeactiveAllPDU):
@@ -594,6 +669,7 @@ class Server(PDULayer):
         @summary: Send bitmap update data
         @param bitmapDatas: List of data.BitmapData
         """
+        log.debug("PDULayer.sendBitmapUpdatePDU()")
         #check bitmap header for client that want it (very old client)
         if self._clientCapabilities[caps.CapsType.CAPSTYPE_GENERAL].capability.extraFlags.value & caps.GeneralExtraFlag.NO_BITMAP_COMPRESSION_HDR:
             for bitmapData in bitmapDatas:
