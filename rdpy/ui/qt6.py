@@ -25,7 +25,7 @@ QRemoteDesktop is a widget use for render in rdpy
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor, QCursor, QPixmap
+from PyQt6.QtGui import QCursor, QPixmap
 from rdpy.protocol.rdp.rdp import RDPClientObserver
 from rdpy.core.error import CallPureVirtualFuntion
 import sys
@@ -376,11 +376,7 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
         @param isCompress: {bool} use RLE compression
         @param data: {str} bitmap data
         """
-        log.debug(f"RDPClientQt.onUpdate() dest=({destLeft},{destTop},{destRight},{destBottom}) size={width}x{height} bpp={bitsPerPixel} compress={isCompress} datalen={len(data) if data else 0}")
         image = RDPBitmapToQtImage(width, height, bitsPerPixel, isCompress, data)
-        log.debug(f"RDPClientQt.onUpdate() image isNull={image.isNull() if image is not None else 'None'}")
-        #if image need to be cut
-        #For bit alignement server may send more than image pixel
         self._widget.notifyImage(destLeft, destTop, image, destRight - destLeft + 1, destBottom - destTop + 1)
 
     def onReady(self):
@@ -443,88 +439,73 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
 
         if xorBpp == 32:
             # XOR mask is BGRA, bottom-up scan lines
-            image = QtGui.QImage(width, height, QtGui.QImage.Format.Format_ARGB32)
-            image.fill(0)
             xor_stride = width * 4
-            # Many RDP servers send legacy 32bpp cursors where alpha is always 0;
-            # transparency is controlled solely by the AND mask in that case.
             # Detect whether the XOR data contains any real alpha values.
             has_alpha = any(xorMask[i] != 0 for i in range(3, len(xorMask), 4))
+            buf = bytearray(width * height * 4)
             for y in range(height):
                 src_y = height - 1 - y  # bottom-up to top-down
+                src_start = src_y * xor_stride
+                dst_start = y * width * 4
+                n = min(width * 4, len(xorMask) - src_start)
+                if n > 0:
+                    buf[dst_start:dst_start + n] = xorMask[src_start:src_start + n]
                 for x in range(width):
-                    offset = src_y * xor_stride + x * 4
-                    if offset + 3 < len(xorMask):
-                        b = xorMask[offset]
-                        g = xorMask[offset + 1]
-                        r = xorMask[offset + 2]
-                        a = xorMask[offset + 3]
-                    else:
-                        r, g, b, a = 0, 0, 0, 0
+                    px = dst_start + x * 4
+                    b, g, r, a = buf[px], buf[px+1], buf[px+2], buf[px+3]
                     and_byte_offset = src_y * and_stride + x // 8
-                    and_bit = 0
-                    if and_byte_offset < len(andMask):
-                        and_bit = (andMask[and_byte_offset] >> (7 - (x % 8))) & 1
+                    and_bit = (andMask[and_byte_offset] >> (7 - (x % 8))) & 1 if and_byte_offset < len(andMask) else 0
                     if and_bit == 1:
-                        # AND=1, XOR=black with no alpha => transparent; otherwise XOR inversion (render opaque)
-                        if r == 0 and g == 0 and b == 0 and a == 0:
-                            a = 0
-                        else:
-                            a = 255
+                        # AND=1, XOR=black/transparent => transparent; else opaque
+                        buf[px+3] = 0 if (r == 0 and g == 0 and b == 0 and a == 0) else 255
                     elif not has_alpha:
-                        # Legacy format: AND=0 means opaque but alpha byte is 0
-                        a = 255
-                    image.setPixelColor(x, y, QColor(r, g, b, a))
+                        # Legacy: AND=0 means opaque but alpha byte is 0
+                        buf[px+3] = 255
+            image = QtGui.QImage(bytes(buf), width, height, width * 4, QtGui.QImage.Format.Format_ARGB32)
 
         elif xorBpp == 24:
             # XOR mask is BGR, no alpha channel; use AND mask for transparency
-            image = QtGui.QImage(width, height, QtGui.QImage.Format.Format_ARGB32)
-            image.fill(0)
             xor_stride = width * 3
+            buf = bytearray(width * height * 4)
             for y in range(height):
                 src_y = height - 1 - y
                 for x in range(width):
                     offset = src_y * xor_stride + x * 3
                     if offset + 2 < len(xorMask):
-                        b = xorMask[offset]
-                        g = xorMask[offset + 1]
-                        r = xorMask[offset + 2]
+                        b, g, r = xorMask[offset], xorMask[offset+1], xorMask[offset+2]
                     else:
-                        r, g, b = 0, 0, 0
+                        b, g, r = 0, 0, 0
                     and_byte_offset = src_y * and_stride + x // 8
-                    and_bit = 0
-                    if and_byte_offset < len(andMask):
-                        and_bit = (andMask[and_byte_offset] >> (7 - (x % 8))) & 1
+                    and_bit = (andMask[and_byte_offset] >> (7 - (x % 8))) & 1 if and_byte_offset < len(andMask) else 0
                     a = 0 if (and_bit == 1 and r == 0 and g == 0 and b == 0) else 255
-                    image.setPixelColor(x, y, QColor(r, g, b, a))
+                    px = (y * width + x) * 4
+                    buf[px], buf[px+1], buf[px+2], buf[px+3] = b, g, r, a
+            image = QtGui.QImage(bytes(buf), width, height, width * 4, QtGui.QImage.Format.Format_ARGB32)
 
         elif xorBpp == 1:
             # Monochrome: 1bpp XOR mask + AND mask; rows padded to 2-byte boundary
             xor_stride = ((width + 15) // 16) * 2
-            image = QtGui.QImage(width, height, QtGui.QImage.Format.Format_ARGB32)
+            buf = bytearray(width * height * 4)
             for y in range(height):
                 src_y = height - 1 - y
                 for x in range(width):
                     xor_byte_offset = src_y * xor_stride + x // 8
-                    xor_bit = 0
-                    if xor_byte_offset < len(xorMask):
-                        xor_bit = (xorMask[xor_byte_offset] >> (7 - (x % 8))) & 1
+                    xor_bit = (xorMask[xor_byte_offset] >> (7 - (x % 8))) & 1 if xor_byte_offset < len(xorMask) else 0
                     and_byte_offset = src_y * and_stride + x // 8
-                    and_bit = 0
-                    if and_byte_offset < len(andMask):
-                        and_bit = (andMask[and_byte_offset] >> (7 - (x % 8))) & 1
-                    # Standard monochrome cursor rendering:
+                    and_bit = (andMask[and_byte_offset] >> (7 - (x % 8))) & 1 if and_byte_offset < len(andMask) else 0
+                    px = (y * width + x) * 4
                     # AND=0, XOR=0 => black opaque
                     # AND=0, XOR=1 => white opaque
                     # AND=1, XOR=0 => transparent
                     # AND=1, XOR=1 => inverted (approximate as black)
                     if and_bit == 0:
                         v = 255 if xor_bit else 0
-                        image.setPixelColor(x, y, QColor(v, v, v, 255))
+                        buf[px], buf[px+1], buf[px+2], buf[px+3] = v, v, v, 255
                     elif xor_bit == 0:
-                        image.setPixelColor(x, y, QColor(0, 0, 0, 0))
+                        buf[px], buf[px+1], buf[px+2], buf[px+3] = 0, 0, 0, 0
                     else:
-                        image.setPixelColor(x, y, QColor(0, 0, 0, 255))
+                        buf[px], buf[px+1], buf[px+2], buf[px+3] = 0, 0, 0, 255
+            image = QtGui.QImage(bytes(buf), width, height, width * 4, QtGui.QImage.Format.Format_ARGB32)
 
         else:
             log.debug("RDPClientQt.onPointerUpdate() unsupported bpp=%d" % xorBpp)
@@ -579,12 +560,11 @@ class QRemoteDesktop(QtWidgets.QWidget):
         @param width: width of the image region
         @param height: height of the image region
         """
-        log.debug(f"QRemoteDesktop._doNotifyImage() x={x} y={y} w={width} h={height} imageNull={qimage.isNull()}")
         #fill buffer image
         with QtGui.QPainter(self._buffer) as qp:
             qp.drawImage(x, y, qimage, 0, 0, width, height)
-        #force update
-        self.update()
+        #force update only the dirty region (avoids full-widget repaint)
+        self.update(x, y, width, height)
 
     def resize(self, width, height):
         """
@@ -600,9 +580,10 @@ class QRemoteDesktop(QtWidgets.QWidget):
         @summary: Call when Qt renderer engine estimate that is needed
         @param e: QEvent
         """
-        #draw in widget
+        #draw only the dirty rect to avoid blitting the full buffer every frame
+        rect = e.rect()
         with QtGui.QPainter(self) as qp:
-            qp.drawImage(0, 0, self._buffer)
+            qp.drawImage(rect, self._buffer, rect)
 
     def mouseMoveEvent(self, event):
         """
