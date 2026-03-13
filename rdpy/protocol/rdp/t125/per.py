@@ -188,19 +188,8 @@ def readObjectIdentifier(s, oid):
     size = readLength(s)
     if size != 5:
         raise InvalidValue("size of stream oid is wrong %d != 5"%size)
-    a_oid = [0, 0, 0, 0, 0, 0]
-    t12 = UInt8()
-    s.readType(t12)
-    a_oid[0] = t12.value >> 4
-    a_oid[1] = t12.value & 0x0f
-    s.readType(t12)
-    a_oid[2] = t12.value
-    s.readType(t12)
-    a_oid[3] = t12.value
-    s.readType(t12)
-    a_oid[4] = t12.value
-    s.readType(t12)
-    a_oid[5] = t12.value
+    data = s.read(5)
+    a_oid = [data[0] >> 4, data[0] & 0x0f, data[1], data[2], data[3], data[4]]
     
     if list(oid) != a_oid:
         raise InvalidExpectedDataException("invalid object identifier")
@@ -235,7 +224,7 @@ def writeNumericString(nStr, minValue):
     if length - minValue >= 0:
         mlength = length - minValue
     
-    result = []
+    result = bytearray()
     
     for i in range(0, length, 2):
         c1 = ord(nStr[i])
@@ -246,9 +235,9 @@ def writeNumericString(nStr, minValue):
         c1 = (c1 - 0x30) % 10
         c2 = (c2 - 0x30) % 10
         
-        result.append(UInt8((c1 << 4) | c2))
+        result.append((c1 << 4) | c2)
     
-    return (writeLength(mlength), tuple(result))
+    return (writeLength(mlength), String(bytes(result)))
 
 def readPadding(s, length):
     """
@@ -277,20 +266,16 @@ def readOctetStream(s, octetStream, minValue = 0):
     size = readLength(s) + minValue
     if size != len(octetStream):
         raise InvalidValue("incompatible size %d != %d" % (len(octetStream), size))
-    for i in range(0, size):
-        c = UInt8()
-        s.readType(c)
-        if octetStream[i] != c.value:
-            return False
-        
-    return True
+    data = s.read(size)
+    expected = octetStream if isinstance(octetStream, bytes) else bytes(octetStream)
+    return data == expected
 
 def writeOctetStream(oStr, minValue = 0):
     """
     @summary: write string as octet stream with per header
     @param oStr: octet stream to convert
     @param minValue: min length value
-    @return: per header follow by tuple of UInt8
+    @return: per header follow by String
     """
     length = len(oStr)
     mlength = minValue
@@ -298,8 +283,4 @@ def writeOctetStream(oStr, minValue = 0):
     if length - minValue >= 0:
         mlength = length - minValue
     
-    result = []
-    for i in range(0, length):
-        result.append(UInt8(oStr[i]))
-    
-    return (writeLength(mlength), tuple(result))
+    return (writeLength(mlength), String(bytes(oStr)))

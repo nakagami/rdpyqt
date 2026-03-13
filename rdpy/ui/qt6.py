@@ -115,14 +115,12 @@ def RDPBitmapToQtImage(width, height, bitsPerPixel, isCompress, data):
     elif bitsPerPixel == 24:
         if isCompress:
             buf = rle.bitmap_decompress(data, width, height, 3)
-            image = QtGui.QImage(buf, width, height, width * 3, QtGui.QImage.Format.Format_RGB888)
-            # RDP sends BGR order; swap R and B to match Qt's RGB888 expectation
-            image = image.rgbSwapped()
+            # RDP sends BGR order; use Format_BGR888 directly to avoid rgbSwapped() copy
+            image = QtGui.QImage(buf, width, height, width * 3, QtGui.QImage.Format.Format_BGR888)
             image = image.mirrored(False, True)
         else:
-            image = QtGui.QImage(data, width, height, width * 3, QtGui.QImage.Format.Format_RGB888)
-            # RDP sends BGR order; swap R and B to match Qt's RGB888 expectation
-            image = image.rgbSwapped()
+            # RDP sends BGR order; use Format_BGR888 directly to avoid rgbSwapped() copy
+            image = QtGui.QImage(data, width, height, width * 3, QtGui.QImage.Format.Format_BGR888)
             image = image.mirrored(False, True)
 
     elif bitsPerPixel == 32:
@@ -450,17 +448,23 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
                 n = min(width * 4, len(xorMask) - src_start)
                 if n > 0:
                     buf[dst_start:dst_start + n] = xorMask[src_start:src_start + n]
-                for x in range(width):
-                    px = dst_start + x * 4
-                    b, g, r, a = buf[px], buf[px+1], buf[px+2], buf[px+3]
-                    and_byte_offset = src_y * and_stride + x // 8
-                    and_bit = (andMask[and_byte_offset] >> (7 - (x % 8))) & 1 if and_byte_offset < len(andMask) else 0
-                    if and_bit == 1:
-                        # AND=1, XOR=black/transparent => transparent; else opaque
-                        buf[px+3] = 0 if (r == 0 and g == 0 and b == 0 and a == 0) else 255
-                    elif not has_alpha:
-                        # Legacy: AND=0 means opaque but alpha byte is 0
-                        buf[px+3] = 255
+                and_row_start = src_y * and_stride
+                if not has_alpha:
+                    # Batch set all alpha to 255 (opaque), then fix transparent
+                    buf[dst_start + 3 : dst_start + width * 4 : 4] = b'\xff' * width
+                    for x in range(width):
+                        byte_offset = and_row_start + x // 8
+                        if byte_offset < len(andMask) and (andMask[byte_offset] >> (7 - (x & 7))) & 1:
+                            px = dst_start + x * 4
+                            if buf[px] == 0 and buf[px+1] == 0 and buf[px+2] == 0:
+                                buf[px+3] = 0
+                else:
+                    for x in range(width):
+                        byte_offset = and_row_start + x // 8
+                        if byte_offset < len(andMask) and (andMask[byte_offset] >> (7 - (x & 7))) & 1:
+                            px = dst_start + x * 4
+                            if not (buf[px] == 0 and buf[px+1] == 0 and buf[px+2] == 0 and buf[px+3] == 0):
+                                buf[px+3] = 255
             image = QtGui.QImage(bytes(buf), width, height, width * 4, QtGui.QImage.Format.Format_ARGB32)
 
         elif xorBpp == 24:
@@ -469,17 +473,23 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
             buf = bytearray(width * height * 4)
             for y in range(height):
                 src_y = height - 1 - y
+                dst_row = y * width * 4
+                src_row = src_y * xor_stride
+                # Copy BGR data and set default alpha to 255
                 for x in range(width):
-                    offset = src_y * xor_stride + x * 3
-                    if offset + 2 < len(xorMask):
-                        b, g, r = xorMask[offset], xorMask[offset+1], xorMask[offset+2]
-                    else:
-                        b, g, r = 0, 0, 0
-                    and_byte_offset = src_y * and_stride + x // 8
-                    and_bit = (andMask[and_byte_offset] >> (7 - (x % 8))) & 1 if and_byte_offset < len(andMask) else 0
-                    a = 0 if (and_bit == 1 and r == 0 and g == 0 and b == 0) else 255
-                    px = (y * width + x) * 4
-                    buf[px], buf[px+1], buf[px+2], buf[px+3] = b, g, r, a
+                    src_off = src_row + x * 3
+                    dst_off = dst_row + x * 4
+                    if src_off + 2 < len(xorMask):
+                        buf[dst_off:dst_off + 3] = xorMask[src_off:src_off + 3]
+                    buf[dst_off + 3] = 255
+                # Fix transparent pixels based on AND mask
+                and_row_start = src_y * and_stride
+                for x in range(width):
+                    byte_offset = and_row_start + x // 8
+                    if byte_offset < len(andMask) and (andMask[byte_offset] >> (7 - (x & 7))) & 1:
+                        dst_off = dst_row + x * 4
+                        if buf[dst_off] == 0 and buf[dst_off+1] == 0 and buf[dst_off+2] == 0:
+                            buf[dst_off + 3] = 0
             image = QtGui.QImage(bytes(buf), width, height, width * 4, QtGui.QImage.Format.Format_ARGB32)
 
         elif xorBpp == 1:
@@ -490,21 +500,20 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
                 src_y = height - 1 - y
                 for x in range(width):
                     xor_byte_offset = src_y * xor_stride + x // 8
-                    xor_bit = (xorMask[xor_byte_offset] >> (7 - (x % 8))) & 1 if xor_byte_offset < len(xorMask) else 0
+                    xor_bit = (xorMask[xor_byte_offset] >> (7 - (x & 7))) & 1 if xor_byte_offset < len(xorMask) else 0
                     and_byte_offset = src_y * and_stride + x // 8
-                    and_bit = (andMask[and_byte_offset] >> (7 - (x % 8))) & 1 if and_byte_offset < len(andMask) else 0
+                    and_bit = (andMask[and_byte_offset] >> (7 - (x & 7))) & 1 if and_byte_offset < len(andMask) else 0
                     px = (y * width + x) * 4
                     # AND=0, XOR=0 => black opaque
                     # AND=0, XOR=1 => white opaque
                     # AND=1, XOR=0 => transparent
                     # AND=1, XOR=1 => inverted (approximate as black)
                     if and_bit == 0:
-                        v = 255 if xor_bit else 0
-                        buf[px], buf[px+1], buf[px+2], buf[px+3] = v, v, v, 255
+                        buf[px:px + 4] = b'\xff\xff\xff\xff' if xor_bit else b'\x00\x00\x00\xff'
                     elif xor_bit == 0:
-                        buf[px], buf[px+1], buf[px+2], buf[px+3] = 0, 0, 0, 0
+                        buf[px:px + 4] = b'\x00\x00\x00\x00'
                     else:
-                        buf[px], buf[px+1], buf[px+2], buf[px+3] = 0, 0, 0, 255
+                        buf[px:px + 4] = b'\x00\x00\x00\xff'
             image = QtGui.QImage(bytes(buf), width, height, width * 4, QtGui.QImage.Format.Format_ARGB32)
 
         else:

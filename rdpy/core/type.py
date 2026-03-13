@@ -97,14 +97,14 @@ class Type(object):
             self.__read__(s)
             return
         
-        #constant mode
-        old = deepcopy(self)
+        #constant mode - save value instead of deepcopy for performance
+        old_value = self.value
         self.__read__(s)
         #check constant value
-        if old.value != self.value:
+        if old_value != self.value:
             #rollback read value
             s.pos -= sizeof(self)
-            raise InvalidExpectedDataException("%s const value expected %s != %s"%(self.__class__, old.value, self.value))
+            raise InvalidExpectedDataException("%s const value expected %s != %s"%(self.__class__, old_value, self.value))
         
     def __read__(self, s):
         """
