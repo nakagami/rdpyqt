@@ -133,7 +133,7 @@ class TPKT(RawLayer, IFastPathSender):
         #header is on two bytes
         self.expect(2, self.readHeader)
         #no connection automata on this layer
-        if not self._presentation is None:
+        if self._presentation is not None:
             self._presentation.connect()
         
     def readHeader(self, data):

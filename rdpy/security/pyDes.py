@@ -237,8 +237,7 @@ class _baseDes(object):
                 try:
                     return data.encode('ascii')
                 except UnicodeEncodeError:
-                    pass
-                raise ValueError("pyDes can only work with encoded strings, not Unicode.")
+                    raise ValueError("pyDes can only work with encoded strings, not Unicode.")
         return data
 
 #############################################################################

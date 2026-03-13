@@ -253,7 +253,7 @@ class Server(X224Layer):
         #Server mode informations for TLS connection
         self._serverPrivateKeyFileName = privateKeyFileName
         self._serverCertificateFileName = certificateFileName
-        self._forceSSL = forceSSL and not self._serverPrivateKeyFileName is None and not self._serverCertificateFileName is None
+        self._forceSSL = forceSSL and self._serverPrivateKeyFileName is not None and self._serverCertificateFileName is not None
         
     def connect(self):
         """
@@ -279,7 +279,7 @@ class Server(X224Layer):
             self._requestedProtocol = message.protocolNeg.selectedProtocol.value
         
         #match best security layer available
-        if not self._serverPrivateKeyFileName is None and not self._serverCertificateFileName is None:
+        if self._serverPrivateKeyFileName is not None and self._serverCertificateFileName is not None:
             self._selectedProtocol = self._requestedProtocol & Protocols.PROTOCOL_SSL
         else:
             self._selectedProtocol = self._requestedProtocol & Protocols.PROTOCOL_RDP

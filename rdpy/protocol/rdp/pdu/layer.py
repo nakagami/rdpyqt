@@ -394,7 +394,7 @@ class Client(PDULayer):
         generalCapability.osMajorType.value = caps.MajorType.OSMAJORTYPE_WINDOWS
         generalCapability.osMinorType.value = caps.MinorType.OSMINORTYPE_WINDOWS_NT
         generalCapability.extraFlags.value = caps.GeneralExtraFlag.LONG_CREDENTIALS_SUPPORTED | caps.GeneralExtraFlag.NO_BITMAP_COMPRESSION_HDR | caps.GeneralExtraFlag.ENC_SALTED_CHECKSUM
-        if not self._fastPathSender is None:
+        if self._fastPathSender is not None:
             generalCapability.extraFlags.value |= caps.GeneralExtraFlag.FASTPATH_OUTPUT_SUPPORTED
         
         #init bitmap capability
@@ -676,7 +676,7 @@ class Server(PDULayer):
                 if bitmapData.flags.value & data.BitmapFlag.BITMAP_COMPRESSION:
                     bitmapData.flags.value |= data.BitmapFlag.NO_BITMAP_COMPRESSION_HDR
         
-        if self._clientFastPathSupported and not self._fastPathSender is None:
+        if self._clientFastPathSupported and self._fastPathSender is not None:
             #fast path case
             fastPathUpdateDataPDU = data.FastPathBitmapUpdateDataPDU()
             fastPathUpdateDataPDU.rectangles._array = bitmapDatas

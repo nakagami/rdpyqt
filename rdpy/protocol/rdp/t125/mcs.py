@@ -544,7 +544,7 @@ class Server(MCSLayer):
         self.readDomainParams(data)
         self._clientSettings = gcc.readConferenceCreateRequest(Stream(ber.readOctetString(data)))
         
-        if not self._clientSettings.CS_NET is None:
+        if self._clientSettings.CS_NET is not None:
             i = 1
             for channelDef in self._clientSettings.CS_NET.channelDefArray._array:
                 self._serverSettings.SC_NET.channelIdArray._array.append(UInt16Le(i + Channel.MCS_GLOBAL_CHANNEL))

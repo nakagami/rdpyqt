@@ -144,10 +144,10 @@ def encodeDERTRequest(negoTypes = [], authInfo = None, pubKeyAuth = None):
     if i > 0:
         request.setComponentByName("negoTokens", negoData)
     
-    if not authInfo is None:
+    if authInfo is not None:
         request.setComponentByName("authInfo", univ.OctetString(authInfo).subtype(explicitTag=tag.Tag(tag.tagClassContext, tag.tagFormatConstructed, 2)))
     
-    if not pubKeyAuth is None:
+    if pubKeyAuth is not None:
         request.setComponentByName("pubKeyAuth", univ.OctetString(pubKeyAuth).subtype(explicitTag=tag.Tag(tag.tagClassContext, tag.tagFormatConstructed, 3))) 
         
     return der_encoder.encode(request)
@@ -306,6 +306,6 @@ class CSSP(protocol.Protocol):
         self.transport.write(encodeDERTRequest( authInfo = self._interface.GSS_WrapEx(encodeDERTCredentials(domain, user, password))))
         #reset state back to normal state
         self.dataReceived = lambda x: self.__class__.dataReceived(self, x)
-        if not self._callback is None:
+        if self._callback is not None:
             from twisted.internet import reactor
             reactor.callLater(0, self._callback)

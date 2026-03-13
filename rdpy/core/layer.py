@@ -63,7 +63,7 @@ class Layer(object):
         #transport layer under layer in model
         self._transport = None
         #auto set transport layer of own presentation layer
-        if not self._presentation is None:
+        if self._presentation is not None:
             self._presentation._transport = self
     
     def connect(self):
@@ -71,7 +71,7 @@ class Layer(object):
         @summary:  Call when transport layer is connected
                     default is send connect event to presentation layer
         """
-        if not self._presentation is None:
+        if self._presentation is not None:
             log.debug("Layer.connect()")
             self._presentation.connect()
     
@@ -80,7 +80,7 @@ class Layer(object):
         @summary:  Close layer event
                     default is sent to transport layer
         """
-        if not self._transport is None:
+        if self._transport is not None:
             self._transport.close()
             
 class LayerAutomata(Layer, IStreamListener):

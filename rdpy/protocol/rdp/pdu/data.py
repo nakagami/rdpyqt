@@ -606,7 +606,7 @@ class ControlDataPDU(CompositeType):
         """
         log.debug("pdu.data.ControlDataPDU()")
         CompositeType.__init__(self, readLen = readLen)
-        self.action = UInt16Le(action, constant = True) if not action is None else UInt16Le()
+        self.action = UInt16Le(action, constant = True) if action is not None else UInt16Le()
         self.grantId = UInt16Le()
         self.controlId = UInt32Le()
         

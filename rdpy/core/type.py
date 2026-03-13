@@ -460,7 +460,7 @@ class CompositeType(Type):
                 s.readType(self.__dict__[name])
                 readLen += sizeof(self.__dict__[name])
                 #read is ok but read out of bound
-                if not self._readLen is None and readLen > self._readLen.value:
+                if self._readLen is not None and readLen > self._readLen.value:
                     #roll back
                     s.pos -= sizeof(self.__dict__[name])
                     #and notify if not optional
@@ -476,7 +476,7 @@ class CompositeType(Type):
                     s.pos -= sizeof(self.__dict__[tmpName])
                 raise e
             
-        if not self._readLen is None and readLen < self._readLen.value:
+        if self._readLen is not None and readLen < self._readLen.value:
             log.debug("Still have correct data in packet %s, read %s bytes as padding"%(self.__class__, self._readLen.value - readLen))
             s.read(self._readLen.value - readLen)
             
@@ -498,7 +498,7 @@ class CompositeType(Type):
         @summary: Call sizeof on each sub type
         @return: sum of sizeof of each Type attributes
         """
-        if self._is_readed and not self._readLen is None:
+        if self._is_readed and self._readLen is not None:
             return self._readLen.value
         
         size = 0
@@ -793,7 +793,7 @@ class String(Type, CallableValue):
         """
         toWrite = self.value
         
-        if not self._until is None:
+        if self._until is not None:
             toWrite += self._until
         if self._unicode:
             v = self.value
@@ -957,7 +957,7 @@ class ArrayType(Type):
         self._typeFactory = typeFactory
         self._readLen = readLen
         self._array = []
-        if not init is None:
+        if init is not None:
             self._array = init
         
     def __read__(self, s):
