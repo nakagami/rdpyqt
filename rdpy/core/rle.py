@@ -1,6 +1,9 @@
 
 # https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/b6a3f5c2-0804-4c10-9d25-a321720fd23e
 
+import array
+import sys
+
 
 def CVAL(p):
     return p[0], p[1:]
@@ -111,16 +114,23 @@ def _decompress1(output, width, height, input_data):
                     count -= 1
                     x += 1
                     continue
-                while count > 0 and x < width:
-                    output[x + line] = 0 if prevline == 0 else output[prevline + x]
-                    count -= 1
-                    x += 1
+                n_pix = min(count, width - x)
+                if prevline == 0:
+                    output[line + x : line + x + n_pix] = bytes(n_pix)
+                else:
+                    output[line + x : line + x + n_pix] = output[prevline + x : prevline + x + n_pix]
+                count -= n_pix
+                x += n_pix
 
             elif opcode == 1:  # Mix
-                while count > 0 and x < width:
-                    output[x + line] = mix if prevline == 0 else (output[prevline + x] ^ mix) & 0xff
-                    count -= 1
-                    x += 1
+                n_pix = min(count, width - x)
+                if prevline == 0:
+                    output[line + x : line + x + n_pix] = bytes([mix]) * n_pix
+                else:
+                    src = output[prevline + x : prevline + x + n_pix]
+                    output[line + x : line + x + n_pix] = bytes(b ^ mix for b in src)
+                count -= n_pix
+                x += n_pix
 
             elif opcode == 2:  # Fill or Mix
                 while count > 0 and x < width:
@@ -139,16 +149,17 @@ def _decompress1(output, width, height, input_data):
                     x += 1
 
             elif opcode == 3:  # Colour
-                while count > 0 and x < width:
-                    output[x + line] = colour2
-                    count -= 1
-                    x += 1
+                n_pix = min(count, width - x)
+                output[line + x : line + x + n_pix] = bytes([colour2]) * n_pix
+                count -= n_pix
+                x += n_pix
 
             elif opcode == 4:  # Copy
-                while count > 0 and x < width:
-                    output[x + line] = inp[pos]; pos += 1
-                    count -= 1
-                    x += 1
+                n_pix = min(count, width - x)
+                output[line + x : line + x + n_pix] = inp[pos : pos + n_pix]
+                pos += n_pix
+                count -= n_pix
+                x += n_pix
 
             elif opcode == 8:  # Bicolour
                 while count > 0 and x < width:
@@ -163,16 +174,16 @@ def _decompress1(output, width, height, input_data):
                     x += 1
 
             elif opcode == 0xd:  # White
-                while count > 0 and x < width:
-                    output[x + line] = 0xff
-                    count -= 1
-                    x += 1
+                n_pix = min(count, width - x)
+                output[line + x : line + x + n_pix] = b'\xff' * n_pix
+                count -= n_pix
+                x += n_pix
 
             elif opcode == 0xe:  # Black
-                while count > 0 and x < width:
-                    output[x + line] = 0
-                    count -= 1
-                    x += 1
+                n_pix = min(count, width - x)
+                output[line + x : line + x + n_pix] = bytes(n_pix)
+                count -= n_pix
+                x += n_pix
 
             else:
                 return
@@ -202,7 +213,7 @@ def _decompress2(output, width, height, input_data):
     mixmask = 0
 
     # Internal buffer of uint16 pixel values (pixel-indexed)
-    pixels = [0] * (width * height)
+    pixels = array.array('H', bytes(width * height * 2))
 
     def read_pixel():
         nonlocal pos
@@ -253,16 +264,23 @@ def _decompress2(output, width, height, input_data):
                     count -= 1
                     x += 1
                     continue
-                while count > 0 and x < width:
-                    pixels[x + line] = 0 if prevline == 0 else pixels[prevline + x]
-                    count -= 1
-                    x += 1
+                n_pix = min(count, width - x)
+                if prevline == 0:
+                    pixels[line + x : line + x + n_pix] = array.array('H', bytes(n_pix * 2))
+                else:
+                    pixels[line + x : line + x + n_pix] = pixels[prevline + x : prevline + x + n_pix]
+                count -= n_pix
+                x += n_pix
 
             elif opcode == 1:  # Mix
-                while count > 0 and x < width:
-                    pixels[x + line] = mix if prevline == 0 else (pixels[prevline + x] ^ mix) & 0xffff
-                    count -= 1
-                    x += 1
+                n_pix = min(count, width - x)
+                if prevline == 0:
+                    pixels[line + x : line + x + n_pix] = array.array('H', [mix]) * n_pix
+                else:
+                    src = pixels[prevline + x : prevline + x + n_pix]
+                    pixels[line + x : line + x + n_pix] = array.array('H', (v ^ mix for v in src))
+                count -= n_pix
+                x += n_pix
 
             elif opcode == 2:  # Fill or Mix
                 while count > 0 and x < width:
@@ -281,16 +299,19 @@ def _decompress2(output, width, height, input_data):
                     x += 1
 
             elif opcode == 3:  # Colour
-                while count > 0 and x < width:
-                    pixels[x + line] = colour2
-                    count -= 1
-                    x += 1
+                n_pix = min(count, width - x)
+                pixels[line + x : line + x + n_pix] = array.array('H', [colour2]) * n_pix
+                count -= n_pix
+                x += n_pix
 
             elif opcode == 4:  # Copy
-                while count > 0 and x < width:
-                    pixels[x + line] = read_pixel()
-                    count -= 1
-                    x += 1
+                n_pix = min(count, width - x)
+                chunk = array.array('H')
+                chunk.frombytes(inp[pos : pos + n_pix * 2])
+                pixels[line + x : line + x + n_pix] = chunk
+                pos += n_pix * 2
+                count -= n_pix
+                x += n_pix
 
             elif opcode == 8:  # Bicolour
                 while count > 0 and x < width:
@@ -305,26 +326,24 @@ def _decompress2(output, width, height, input_data):
                     x += 1
 
             elif opcode == 0xd:  # White
-                while count > 0 and x < width:
-                    pixels[x + line] = 0xffff
-                    count -= 1
-                    x += 1
+                n_pix = min(count, width - x)
+                pixels[line + x : line + x + n_pix] = array.array('H', [0xffff]) * n_pix
+                count -= n_pix
+                x += n_pix
 
             elif opcode == 0xe:  # Black
-                while count > 0 and x < width:
-                    pixels[x + line] = 0
-                    count -= 1
-                    x += 1
+                n_pix = min(count, width - x)
+                pixels[line + x : line + x + n_pix] = array.array('H', bytes(n_pix * 2))
+                count -= n_pix
+                x += n_pix
 
             else:
                 return
 
-    # Write uint16 pixels to output bytearray as little-endian
-    j = 0
-    for v in pixels:
-        output[j] = v & 0xff
-        output[j + 1] = (v >> 8) & 0xff
-        j += 2
+    # Serialize uint16 pixels to output bytearray as little-endian
+    if sys.byteorder == 'big':
+        pixels.byteswap()
+    output[:] = pixels.tobytes()
 
 
 def _decompress3(output, width, height, input_data):
@@ -391,42 +410,38 @@ def _decompress3(output, width, height, input_data):
 
             if opcode == 0:  # Fill
                 if insertmix:
+                    off = line + 3 * x
                     if prevline == 0:
-                        output[3 * x + line] = mix[0]
-                        output[3 * x + line + 1] = mix[1]
-                        output[3 * x + line + 2] = mix[2]
+                        output[off : off + 3] = mix
                     else:
-                        output[3 * x + line] = (output[prevline + 3 * x] ^ mix[0]) & 0xff
-                        output[3 * x + line + 1] = (output[prevline + 3 * x + 1] ^ mix[1]) & 0xff
-                        output[3 * x + line + 2] = (output[prevline + 3 * x + 2] ^ mix[2]) & 0xff
+                        poff = prevline + 3 * x
+                        output[off : off + 3] = bytes(a ^ b for a, b in zip(output[poff : poff + 3], mix))
                     insertmix = False
                     count -= 1
                     x += 1
                     continue
-                while count > 0 and x < width:
-                    if prevline == 0:
-                        output[3 * x + line] = 0
-                        output[3 * x + line + 1] = 0
-                        output[3 * x + line + 2] = 0
-                    else:
-                        output[3 * x + line] = output[prevline + 3 * x]
-                        output[3 * x + line + 1] = output[prevline + 3 * x + 1]
-                        output[3 * x + line + 2] = output[prevline + 3 * x + 2]
-                    count -= 1
-                    x += 1
+                n_pix = min(count, width - x)
+                off = line + 3 * x
+                if prevline == 0:
+                    output[off : off + 3 * n_pix] = bytes(3 * n_pix)
+                else:
+                    poff = prevline + 3 * x
+                    output[off : off + 3 * n_pix] = output[poff : poff + 3 * n_pix]
+                count -= n_pix
+                x += n_pix
 
             elif opcode == 1:  # Mix
-                while count > 0 and x < width:
-                    if prevline == 0:
-                        output[3 * x + line] = mix[0]
-                        output[3 * x + line + 1] = mix[1]
-                        output[3 * x + line + 2] = mix[2]
-                    else:
-                        output[3 * x + line] = (output[prevline + 3 * x] ^ mix[0]) & 0xff
-                        output[3 * x + line + 1] = (output[prevline + 3 * x + 1] ^ mix[1]) & 0xff
-                        output[3 * x + line + 2] = (output[prevline + 3 * x + 2] ^ mix[2]) & 0xff
-                    count -= 1
-                    x += 1
+                n_pix = min(count, width - x)
+                off = line + 3 * x
+                mix_bytes = bytes(mix)
+                if prevline == 0:
+                    output[off : off + 3 * n_pix] = mix_bytes * n_pix
+                else:
+                    poff = prevline + 3 * x
+                    src = output[poff : poff + 3 * n_pix]
+                    output[off : off + 3 * n_pix] = bytes(a ^ b for a, b in zip(src, mix_bytes * n_pix))
+                count -= n_pix
+                x += n_pix
 
             elif opcode == 2:  # Fill or Mix
                 while count > 0 and x < width:
@@ -437,74 +452,65 @@ def _decompress3(output, width, height, input_data):
                         else:
                             mask = inp[pos]; pos += 1
                         mixmask = 1
+                    off = line + 3 * x
                     if mask & mixmask:
                         if prevline == 0:
-                            output[3 * x + line] = mix[0]
-                            output[3 * x + line + 1] = mix[1]
-                            output[3 * x + line + 2] = mix[2]
+                            output[off : off + 3] = mix
                         else:
-                            output[3 * x + line] = (output[prevline + 3 * x] ^ mix[0]) & 0xff
-                            output[3 * x + line + 1] = (output[prevline + 3 * x + 1] ^ mix[1]) & 0xff
-                            output[3 * x + line + 2] = (output[prevline + 3 * x + 2] ^ mix[2]) & 0xff
+                            poff = prevline + 3 * x
+                            output[off]     = (output[poff]     ^ mix[0]) & 0xff
+                            output[off + 1] = (output[poff + 1] ^ mix[1]) & 0xff
+                            output[off + 2] = (output[poff + 2] ^ mix[2]) & 0xff
                     else:
                         if prevline == 0:
-                            output[3 * x + line] = 0
-                            output[3 * x + line + 1] = 0
-                            output[3 * x + line + 2] = 0
+                            output[off : off + 3] = b'\x00\x00\x00'
                         else:
-                            output[3 * x + line] = output[prevline + 3 * x]
-                            output[3 * x + line + 1] = output[prevline + 3 * x + 1]
-                            output[3 * x + line + 2] = output[prevline + 3 * x + 2]
+                            poff = prevline + 3 * x
+                            output[off : off + 3] = output[poff : poff + 3]
                     count -= 1
                     x += 1
 
             elif opcode == 3:  # Colour
-                while count > 0 and x < width:
-                    output[3 * x + line] = colour2[0]
-                    output[3 * x + line + 1] = colour2[1]
-                    output[3 * x + line + 2] = colour2[2]
-                    count -= 1
-                    x += 1
+                n_pix = min(count, width - x)
+                off = line + 3 * x
+                output[off : off + 3 * n_pix] = bytes(colour2) * n_pix
+                count -= n_pix
+                x += n_pix
 
             elif opcode == 4:  # Copy
-                while count > 0 and x < width:
-                    output[3 * x + line] = inp[pos]; pos += 1
-                    output[3 * x + line + 1] = inp[pos]; pos += 1
-                    output[3 * x + line + 2] = inp[pos]; pos += 1
-                    count -= 1
-                    x += 1
+                n_pix = min(count, width - x)
+                off = line + 3 * x
+                output[off : off + 3 * n_pix] = inp[pos : pos + 3 * n_pix]
+                pos += 3 * n_pix
+                count -= n_pix
+                x += n_pix
 
             elif opcode == 8:  # Bicolour
                 while count > 0 and x < width:
+                    off = line + 3 * x
                     if bicolour:
-                        output[3 * x + line] = colour2[0]
-                        output[3 * x + line + 1] = colour2[1]
-                        output[3 * x + line + 2] = colour2[2]
+                        output[off : off + 3] = colour2
                         bicolour = False
                     else:
-                        output[3 * x + line] = colour1[0]
-                        output[3 * x + line + 1] = colour1[1]
-                        output[3 * x + line + 2] = colour1[2]
+                        output[off : off + 3] = colour1
                         bicolour = True
                         count += 1
                     count -= 1
                     x += 1
 
             elif opcode == 0xd:  # White
-                while count > 0 and x < width:
-                    output[3 * x + line] = 0xff
-                    output[3 * x + line + 1] = 0xff
-                    output[3 * x + line + 2] = 0xff
-                    count -= 1
-                    x += 1
+                n_pix = min(count, width - x)
+                off = line + 3 * x
+                output[off : off + 3 * n_pix] = b'\xff\xff\xff' * n_pix
+                count -= n_pix
+                x += n_pix
 
             elif opcode == 0xe:  # Black
-                while count > 0 and x < width:
-                    output[3 * x + line] = 0
-                    output[3 * x + line + 1] = 0
-                    output[3 * x + line + 2] = 0
-                    count -= 1
-                    x += 1
+                n_pix = min(count, width - x)
+                off = line + 3 * x
+                output[off : off + 3 * n_pix] = bytes(3 * n_pix)
+                count -= n_pix
+                x += n_pix
 
             else:
                 return
@@ -538,11 +544,11 @@ def bitmap_decompress(input_data, width, height, bpp):
 
 
 def process_plane(input_data, width, height, output, j):
-    ln = len(input_data)
+    inp = input_data if isinstance(input_data, (bytes, bytearray)) else bytes(input_data)
+    pos = 0
 
     lastline = 0
     indexh = 0
-    i = 0
     while indexh < height:
         thisline = j + (indexh * width * 4)
         color = 0
@@ -551,57 +557,52 @@ def process_plane(input_data, width, height, output, j):
 
         if indexh == 0:
             while indexw < width:
-                code, input_data = CVAL(input_data)
+                code = inp[pos]; pos += 1
                 replen = code & 0x0F
                 collen = (code >> 4) & 0xF
                 revcode = (replen << 4) | collen
-                if revcode <= 47 and revcode >= 16:
+                if 16 <= revcode <= 47:
                     replen = revcode
                     collen = 0
                 while collen > 0:
-                    color, input_data = CVAL(input_data)
+                    color = inp[pos]; pos += 1
                     output[i] = color & 0xFF
                     i += 4
                     indexw += 1
                     collen -= 1
-                while replen > 0:
-                    output[i] = color & 0xFF
-                    i += 4
-                    indexw += 1
-                    replen -= 1
+                if replen > 0:
+                    output[i : i + replen * 4 : 4] = bytes([color & 0xFF]) * replen
+                    i += replen * 4
+                    indexw += replen
         else:
             while indexw < width:
-                code, input_data = CVAL(input_data)
+                code = inp[pos]; pos += 1
                 replen = code & 0x0F
                 collen = (code >> 4) & 0x0F
                 revcode = (replen << 4) | collen
-                if revcode <= 47 and revcode >=16:
+                if 16 <= revcode <= 47:
                     replen = revcode
                     collen = 0
-                while collen >0:
-                    x, input_data = CVAL(input_data)
-                    if x & 1 != 0:
-                        x = x >> 1
-                        x = x + 1
-                        color = -x
+                while collen > 0:
+                    x_val = inp[pos]; pos += 1
+                    if x_val & 1:
+                        color = -(x_val >> 1) - 1
                     else:
-                        x = x >> 1
-                        color = x
-                    x = output[indexw * 4 + lastline] + color
-                    output[i] = x & 0xFF
+                        color = x_val >> 1
+                    val = output[indexw * 4 + lastline] + color
+                    output[i] = val & 0xFF
                     i += 4
                     indexw += 1
                     collen -= 1
-                while replen > 0:
-                    x = output[indexw * 4 + lastline] + color
-                    output[i] = x & 0xFF
-                    i += 4
-                    indexw += 1
-                    replen -= 1
+                if replen > 0:
+                    vals = bytes((output[(indexw + k) * 4 + lastline] + color) & 0xFF for k in range(replen))
+                    output[i : i + replen * 4 : 4] = vals
+                    i += replen * 4
+                    indexw += replen
         indexh += 1
         lastline = thisline
 
-    return ln - len(input_data), input_data
+    return pos, input_data[pos:]
 
 
 def bitmap_decompress4(input_data, width, height):
