@@ -13,7 +13,7 @@ cdef inline (int, int, int) _parse_opcode(const unsigned char *inp, int pos) noe
     pos += 1
     opcode = code >> 4
 
-    if opcode in (0xc, 0xd, 0xe):
+    if opcode >= 0xc and opcode <= 0xe:
         opcode -= 6
         count = code & 0xf
         offset = 16
@@ -327,8 +327,7 @@ cdef void _decompress2(unsigned char *output, int width, int height,
 
             elif opcode == 0xd:  # White
                 n_pix = min(count, width - x)
-                for i in range(n_pix):
-                    pixels[line + x + i] = 0xffff
+                memset(&pixels[line + x], 0xff, n_pix * 2)
                 count -= n_pix
                 x += n_pix
 
@@ -647,40 +646,49 @@ def bitmap_decompress4(input_data, int width, int height):
     cdef int BPP = 4
     cdef int size = width * height * BPP
     cdef bytearray output = bytearray(size)
-    cdef int code, total, process_ln, i
+    cdef int code, total, process_ln, i, npix
     cdef bint rle_flag, no_alpha
 
     if len(input_data) == 0:
         return bytes(output)
 
-    code = input_data[0]
-    input_data = input_data[1:]
+    cdef const unsigned char[::1] inp_view
+    inp_bytes = bytes(input_data) if not isinstance(input_data, (bytes, bytearray)) else input_data
+    inp_view = inp_bytes
+    cdef const unsigned char *inp_ptr = &inp_view[0]
+    cdef int inp_len = len(inp_bytes)
+    cdef int inp_pos = 0
+
+    cdef unsigned char *out_ptr = <unsigned char *><char *>output
+
+    code = inp_ptr[0]
+    inp_pos = 1
     rle_flag = (code & 0x10) != 0
     no_alpha = (code & 0x20) != 0
 
     if not rle_flag:
         return bytes(output)
 
-    total = 1
+    npix = width * height
 
     if no_alpha:
-        for i in range(width * height):
-            output[3 + i * 4] = 0xff
+        for i in range(npix):
+            out_ptr[3 + i * 4] = 0xff
     else:
-        process_ln, input_data = process_plane(input_data, width, height, output, 3)
-        total += process_ln
+        process_ln = _process_plane(&inp_ptr[inp_pos], inp_len - inp_pos, width, height, out_ptr, 3)
+        inp_pos += process_ln
 
-    process_ln, input_data = process_plane(input_data, width, height, output, 2)
-    total += process_ln
+    process_ln = _process_plane(&inp_ptr[inp_pos], inp_len - inp_pos, width, height, out_ptr, 2)
+    inp_pos += process_ln
 
-    process_ln, input_data = process_plane(input_data, width, height, output, 1)
-    total += process_ln
+    process_ln = _process_plane(&inp_ptr[inp_pos], inp_len - inp_pos, width, height, out_ptr, 1)
+    inp_pos += process_ln
 
-    process_ln, input_data = process_plane(input_data, width, height, output, 0)
-    total += process_ln
+    process_ln = _process_plane(&inp_ptr[inp_pos], inp_len - inp_pos, width, height, out_ptr, 0)
+    inp_pos += process_ln
 
     # Force alpha to 0xFF
-    for i in range(width * height):
-        output[3 + i * 4] = 0xff
+    for i in range(npix):
+        out_ptr[3 + i * 4] = 0xff
 
     return bytes(output)

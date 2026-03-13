@@ -68,6 +68,7 @@ def _decompress1(output, width, height, input_data):
     fom_mask = 0
     mask = 0
     mixmask = 0
+    mix_table = bytes(i ^ mix for i in range(256))
 
     while pos < n:
         fom_mask = 0
@@ -84,6 +85,7 @@ def _decompress1(output, width, height, input_data):
             colour2 = inp[pos]; pos += 1
         elif opcode == 6 or opcode == 7:  # SetMix/Mix or SetMix/FillOrMix
             mix = inp[pos]; pos += 1
+            mix_table = bytes(i ^ mix for i in range(256))
             opcode -= 5
         elif opcode == 9:  # FillOrMix_1
             mask = 0x03
@@ -128,7 +130,7 @@ def _decompress1(output, width, height, input_data):
                     output[line + x : line + x + n_pix] = bytes([mix]) * n_pix
                 else:
                     src = output[prevline + x : prevline + x + n_pix]
-                    output[line + x : line + x + n_pix] = bytes(b ^ mix for b in src)
+                    output[line + x : line + x + n_pix] = src.translate(mix_table)
                 count -= n_pix
                 x += n_pix
 
