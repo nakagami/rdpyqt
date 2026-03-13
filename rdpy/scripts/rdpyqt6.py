@@ -26,8 +26,6 @@ from PyQt6.QtWidgets import QApplication
 from rdpy.ui.qt6 import RDPClientQt
 from rdpy.protocol.rdp import rdp
 from rdpy.core.error import RDPSecurityNegoFail
-from rdpy.core import rss
-
 import rdpy.core.log as log
 log._LOG_LEVEL = log.Level.INFO
 
@@ -59,7 +57,6 @@ class RDPClientQtRecorder(RDPClientQt):
         @param data: {str} bitmap data
         """
         log.debug(f"RDPClientRecorder.onUpdate() {destLeft}, {destTop}, {destRight}, {destBottom}, {width}, {height}, {bitsPerPixel}, {isCompress}, {data}")
-        self._rssRecorder.update(destLeft, destTop, destRight, destBottom, width, height, bitsPerPixel, rss.UpdateFormat.BMP if isCompress else rss.UpdateFormat.RAW, data)
         RDPClientQt.onUpdate(self, destLeft, destTop, destRight, destBottom, width, height, bitsPerPixel, isCompress, data)
     
     def onReady(self):
@@ -67,7 +64,6 @@ class RDPClientQtRecorder(RDPClientQt):
         @summary: Call when stack is ready
         """
         log.debug("RDPClientRecorder.onReady()")
-        self._rssRecorder.screen(self._screensize[0], self._screensize[1], self._controller.getColorDepth())
         RDPClientQt.onReady(self)
           
     def onClose(self):
@@ -75,7 +71,6 @@ class RDPClientQtRecorder(RDPClientQt):
         @summary: Call when stack is close
         """
         log.debug("RDPClientRecorder.onClose()")
-        self._rssRecorder.close()
         RDPClientQt.onClose(self)
         
     def closeEvent(self, e):
@@ -84,7 +79,6 @@ class RDPClientQtRecorder(RDPClientQt):
         @param e: QCloseEvent
         """
         log.debug("RDPClientRecorder.onEvent()")
-        self._rssRecorder.close()
         RDPClientQt.closeEvent(self, e)
 
 class RDPClientQtFactory(rdp.ClientFactory):
