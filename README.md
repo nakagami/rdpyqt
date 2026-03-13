@@ -28,6 +28,7 @@ rdpyqt6 [options] ip[:port]
 | `-l`    | Height of screen                              | `1024`               |
 | `-kt`   | Keyboard type (see values below)              | `IBM_101_102_KEYS`   |
 | `-kl`   | Keyboard layout (see values below)            | `US`                 |
+| `--swap-alt-meta` | Swap Alt and Meta (Windows/Super/Command) keys | (disabled)     |
 
 #### `-kt` Keyboard Type values
 

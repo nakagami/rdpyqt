@@ -20,7 +20,7 @@
 example of use rdpy as rdp client
 """
 
-import sys, os, getopt, socket
+import sys, getopt, socket
 
 from PyQt6.QtWidgets import QApplication
 from rdpy.ui.qt6 import RDPClientQt
@@ -36,16 +36,14 @@ class RDPClientQtRecorder(RDPClientQt):
     """
     @summary: Widget with record session
     """
-    def __init__(self, controller, width, height, rssRecorder):
+    def __init__(self, controller, width, height):
         """
         @param controller: {RDPClientController} RDP controller
         @param width: {int} width of widget
         @param height: {int} height of widget
-        @param rssRecorder: {rss.FileRecorder}
         """
         RDPClientQt.__init__(self, controller, width, height)
         self._screensize = width, height
-        self._rssRecorder = rssRecorder
         
     def onUpdate(self, destLeft, destTop, destRight, destBottom, width, height, bitsPerPixel, isCompress, data):
         """
@@ -186,11 +184,8 @@ def help():
     \t-d: domain
     \t-w: width of screen [default : 1280]
     \t-l: height of screen [default : 1024]
-    \t-f: enable full screen mode [default : False]
     \t-kt: keyboard type (e.g. IBM_101_102_KEYS) [default : IBM_101_102_KEYS]
     \t-kl: keyboard layout (e.g. US, FRENCH) [default : US]
-    \t-o: optimized session (disable costly effect) [default : False]
-    \t-r: rss_filepath Recorded Session Scenario [default : None]
     \t--swap-alt-meta: swap Alt and Meta (Windows/Super/Command) keys [default : False]
     """)
 
