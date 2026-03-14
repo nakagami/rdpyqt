@@ -116,6 +116,7 @@ class RDPClientQtFactory(rdp.ClientFactory):
             self._security = security
         self._swap_alt_meta = swap_alt_meta
         self._w = None
+        self._resizing = False
         
     def buildObserver(self, controller, addr):
         """
@@ -125,10 +126,14 @@ class RDPClientQtFactory(rdp.ClientFactory):
         @param addr: destination address
         @return: RDPClientQt
         """
-        self._client = RDPClientQt(controller, self._width, self._height, self._swap_alt_meta)
-        self._w = self._client.getWidget()
-        self._w.setWindowTitle('rdpyqt6')
-        self._w.show()
+        if self._w is not None:
+            self._client = RDPClientQt(controller, self._width, self._height, self._swap_alt_meta, widget=self._w)
+        else:
+            self._client = RDPClientQt(controller, self._width, self._height, self._swap_alt_meta)
+            self._w = self._client.getWidget()
+            self._w.setWindowTitle('rdpyqt6')
+            self._w.show()
+        self._client.setResizeCallback(self._onResize)
         
         controller.setUsername(self._username)
         controller.setPassword(self._passwod)
@@ -140,12 +145,27 @@ class RDPClientQtFactory(rdp.ClientFactory):
         
         return self._client
     
+    def _onResize(self, width, height):
+        """
+        @summary: Called when user resizes the window, triggers reconnection
+        """
+        self._width = width
+        self._height = height
+        self._resizing = True
+        self._client._controller.close()
+
     def clientConnectionLost(self, connector, reason):
         """
         @summary: Connection lost event
         @param connector: twisted connector use for rdp connection (use reconnect to restart connection)
         @param reason: str use to advertise reason of lost connection
         """
+        if self._resizing:
+            log.info("Reconnecting with new screen size %dx%d" % (self._width, self._height))
+            self._resizing = False
+            connector.connect()
+            return
+
         if reason.type == RDPSecurityNegoFail and self._nego:
             log.info("due to security nego error back to standard RDP security layer")
             self._nego = False

@@ -75,6 +75,14 @@ class QAdaptor(object):
         @param: QCloseEvent
         """ 
         raise CallPureVirtualFuntion("%s:%s defined by interface %s"%(self.__class__, "closeEvent", "QAdaptor"))
+
+    def onResizeRequest(self, width, height):
+        """
+        @summary: Interface to handle window resize and request RDP reconnection
+        @param width: {int} new width
+        @param height: {int} new height
+        """
+        raise CallPureVirtualFuntion("%s:%s defined by interface %s"%(self.__class__, "onResizeRequest", "QAdaptor"))
     
 def qtImageFormatFromRFBPixelFormat(pixelFormat):
     """
@@ -147,17 +155,23 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
     """
     @summary: Adaptor for RDP client
     """
-    def __init__(self, controller, width, height, swap_alt_meta=False):
+    def __init__(self, controller, width, height, swap_alt_meta=False, widget=None):
         """
         @param controller: {RDPClientController} RDP controller
         @param width: {int} width of widget
         @param height: {int} height of widget
         @param swap_alt_meta: {bool} swap Alt and Meta (Windows) keys
+        @param widget: {QRemoteDesktop} existing widget to reuse (for resize reconnection)
         """
         RDPClientObserver.__init__(self, controller)
-        self._widget = QRemoteDesktop(width, height, self)
+        if widget is not None:
+            self._widget = widget
+            self._widget.setAdaptor(self)
+        else:
+            self._widget = QRemoteDesktop(width, height, self)
         self._pointerCache = {}
         self._swap_alt_meta = swap_alt_meta
+        self._resizeCallback = None
         #set widget screen to RDP stack
         controller.setScreen(width, height)
 
@@ -361,6 +375,19 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
         """
         self._controller.close()
 
+    def setResizeCallback(self, callback):
+        """
+        @param callback: callable(width, height) to invoke on resize
+        """
+        self._resizeCallback = callback
+
+    def onResizeRequest(self, width, height):
+        """
+        @summary: Called when the user resizes the widget, triggers reconnection
+        """
+        if self._resizeCallback:
+            self._resizeCallback(width, height)
+
     def onUpdate(self, destLeft, destTop, destRight, destBottom, width, height, bitsPerPixel, isCompress, data):
         """
         @summary: Notify bitmap update
@@ -546,7 +573,13 @@ class QRemoteDesktop(QtWidgets.QWidget):
         self.setMouseTracking(True)
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         self._updateSignal.connect(self._doNotifyImage)
-        #set correct size; this sets self._buffer via the overridden resize()
+        #resize debounce
+        self._programmaticResize = False
+        self._resizeTimer = QtCore.QTimer()
+        self._resizeTimer.setSingleShot(True)
+        self._resizeTimer.timeout.connect(self._handleResizeTimeout)
+        self._pendingSize = None
+        #set correct size; buffer is created in resizeEvent
         self.resize(width, height)
 
     def notifyImage(self, x, y, qimage, width, height):
@@ -575,14 +608,45 @@ class QRemoteDesktop(QtWidgets.QWidget):
         #force update only the dirty region (avoids full-widget repaint)
         self.update(x, y, width, height)
 
+    def setAdaptor(self, adaptor):
+        """
+        @summary: Update the adaptor (used when reconnecting with existing widget)
+        @param adaptor: {QAdaptor}
+        """
+        self._adaptor = adaptor
+
     def resize(self, width, height):
         """
-        @summary: override resize function
+        @summary: Programmatic resize (does not trigger RDP reconnection)
         @param width: {int} width of widget
         @param height: {int} height of widget
         """
+        self._programmaticResize = True
         QtWidgets.QWidget.resize(self, width, height)
-        self._buffer = QtGui.QImage(width, height, QtGui.QImage.Format.Format_RGB32)
+
+    def resizeEvent(self, event):
+        """
+        @summary: Called by Qt whenever the widget size changes
+        @param event: QResizeEvent
+        """
+        w = event.size().width()
+        h = event.size().height()
+        self._buffer = QtGui.QImage(w, h, QtGui.QImage.Format.Format_RGB32)
+        if self._programmaticResize:
+            self._programmaticResize = False
+            return
+        if w > 0 and h > 0:
+            self._pendingSize = (w, h)
+            self._resizeTimer.start(500)
+
+    def _handleResizeTimeout(self):
+        """
+        @summary: Called after resize debounce period to trigger RDP reconnection
+        """
+        if self._pendingSize:
+            w, h = self._pendingSize
+            self._pendingSize = None
+            self._adaptor.onResizeRequest(w, h)
 
     def paintEvent(self, e):
         """
