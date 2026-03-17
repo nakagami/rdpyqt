@@ -6,9 +6,7 @@ import sys
 
 # Cache for mix XOR translation tables (keyed by mix value).
 # _mix_table_cache: for 8bpp, maps uint8 mix -> 256-byte translate table
-# _uint16_xor_cache: for 16bpp, maps uint16 mix -> (lo_table, hi_table)
 _mix_table_cache: dict = {}
-_uint16_xor_cache: dict = {}
 
 
 def _get_mix_table(mix: int) -> bytes:
@@ -16,18 +14,6 @@ def _get_mix_table(mix: int) -> bytes:
     if mix not in _mix_table_cache:
         _mix_table_cache[mix] = bytes(i ^ mix for i in range(256))
     return _mix_table_cache[mix]
-
-
-def _get_uint16_xor_tables(mix: int):
-    """Return (lo_table, hi_table) to XOR little-endian uint16 bytes with mix."""
-    if mix not in _uint16_xor_cache:
-        lo = mix & 0xff
-        hi = (mix >> 8) & 0xff
-        _uint16_xor_cache[mix] = (
-            bytes(i ^ lo for i in range(256)),
-            bytes(i ^ hi for i in range(256)),
-        )
-    return _uint16_xor_cache[mix]
 
 
 def CVAL(p):
@@ -304,15 +290,10 @@ def _decompress2(output, width, height, input_data):
                 if prevline == 0:
                     pixels[line + x : line + x + n_pix] = array.array('H', [mix]) * n_pix
                 else:
-                    src = pixels[prevline + x : prevline + x + n_pix]
-                    tbl_lo, tbl_hi = _get_uint16_xor_tables(mix)
-                    raw = src.tobytes()
-                    xored = bytearray(len(raw))
-                    xored[0::2] = raw[0::2].translate(tbl_lo)
-                    xored[1::2] = raw[1::2].translate(tbl_hi)
-                    result = array.array('H')
-                    result.frombytes(xored)
-                    pixels[line + x : line + x + n_pix] = result
+                    dst = line + x
+                    src_off = prevline + x
+                    for i in range(n_pix):
+                        pixels[dst + i] = (pixels[src_off + i] ^ mix) & 0xffff
                 count -= n_pix
                 x += n_pix
 

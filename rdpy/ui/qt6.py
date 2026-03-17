@@ -93,6 +93,16 @@ def qtImageFormatFromRFBPixelFormat(pixelFormat):
     elif pixelFormat.BitsPerPixel.value == 16:
         return QtGui.QImage.Format.Format_RGB16
 
+def _flip_rows_inplace(buf, width, height, bytes_per_pixel):
+    """Flip bottom-up bitmap data to top-down order in-place."""
+    stride = width * bytes_per_pixel
+    half = height // 2
+    for y in range(half):
+        top = y * stride
+        bot = (height - 1 - y) * stride
+        buf[top:top + stride], buf[bot:bot + stride] = buf[bot:bot + stride], buf[top:top + stride]
+
+
 def RDPBitmapToQtImage(width, height, bitsPerPixel, isCompress, data):
     image = None
 
@@ -102,48 +112,66 @@ def RDPBitmapToQtImage(width, height, bitsPerPixel, isCompress, data):
     elif not isinstance(data, (bytes, bytearray)):
         data = bytes(data)
 
-    # RLE decompression (bitmap_decompress / bitmap_decompress4) stores the
-    # result in top-down scanline order, so the buffer can be used directly.
-    # .copy() detaches the QImage from the local buffer so it survives after
-    # this function returns.
+    # Compressed data is already in top-down order from the RLE decoder.
+    # We attach the buffer as _buffer_ref on the QImage so Python keeps
+    # the data alive — avoiding an expensive .copy().
     #
-    # Uncompressed bitmap data from the RDP server is in bottom-up scanline
-    # order (Windows BMP convention), so it needs mirrored(False, True) to
-    # flip to top-down — which also produces a deep copy.
+    # Uncompressed data is bottom-up (Windows BMP convention).  We flip
+    # it in-place inside a bytearray then wrap with QImage, avoiding the
+    # extra allocation that .mirrored() would cause.
 
     if bitsPerPixel == 15:
+        bpp = 2
+        fmt = QtGui.QImage.Format.Format_RGB555
         if isCompress:
-            buf = rle.bitmap_decompress(data, width, height, 2)
-            image = QtGui.QImage(buf, width, height, width * 2, QtGui.QImage.Format.Format_RGB555).copy()
+            buf = rle.bitmap_decompress(data, width, height, bpp)
+            image = QtGui.QImage(buf, width, height, width * bpp, fmt)
+            image._buffer_ref = buf
         else:
-            image = QtGui.QImage(data, width, height, width * 2, QtGui.QImage.Format.Format_RGB555)
-            image = image.mirrored(False, True)
+            raw = bytearray(data)
+            _flip_rows_inplace(raw, width, height, bpp)
+            image = QtGui.QImage(raw, width, height, width * bpp, fmt)
+            image._buffer_ref = raw
 
     elif bitsPerPixel == 16:
+        bpp = 2
+        fmt = QtGui.QImage.Format.Format_RGB16
         if isCompress:
-            buf = rle.bitmap_decompress(data, width, height, 2)
-            image = QtGui.QImage(buf, width, height, width * 2, QtGui.QImage.Format.Format_RGB16).copy()
+            buf = rle.bitmap_decompress(data, width, height, bpp)
+            image = QtGui.QImage(buf, width, height, width * bpp, fmt)
+            image._buffer_ref = buf
         else:
-            image = QtGui.QImage(data, width, height, width * 2, QtGui.QImage.Format.Format_RGB16)
-            image = image.mirrored(False, True)
+            raw = bytearray(data)
+            _flip_rows_inplace(raw, width, height, bpp)
+            image = QtGui.QImage(raw, width, height, width * bpp, fmt)
+            image._buffer_ref = raw
 
     elif bitsPerPixel == 24:
+        bpp = 3
+        fmt = QtGui.QImage.Format.Format_BGR888
         if isCompress:
-            buf = rle.bitmap_decompress(data, width, height, 3)
-            image = QtGui.QImage(buf, width, height, width * 3, QtGui.QImage.Format.Format_BGR888).copy()
+            buf = rle.bitmap_decompress(data, width, height, bpp)
+            image = QtGui.QImage(buf, width, height, width * bpp, fmt)
+            image._buffer_ref = buf
         else:
-            image = QtGui.QImage(data, width, height, width * 3, QtGui.QImage.Format.Format_BGR888)
-            image = image.mirrored(False, True)
+            raw = bytearray(data)
+            _flip_rows_inplace(raw, width, height, bpp)
+            image = QtGui.QImage(raw, width, height, width * bpp, fmt)
+            image._buffer_ref = raw
 
     elif bitsPerPixel == 32:
+        bpp = 4
+        fmt = QtGui.QImage.Format.Format_RGB32
         if isCompress:
             buf = rle.bitmap_decompress4(data, width, height)
-            image = QtGui.QImage(buf, width, height, width * 4, QtGui.QImage.Format.Format_RGB32).copy()
+            image = QtGui.QImage(buf, width, height, width * bpp, fmt)
+            image._buffer_ref = buf
         else:
             raw = bytearray(data)
             raw[3::4] = b'\xff' * (width * height)
-            image = QtGui.QImage(raw, width, height, width * 4, QtGui.QImage.Format.Format_RGB32)
-            image = image.mirrored(False, True)
+            _flip_rows_inplace(raw, width, height, bpp)
+            image = QtGui.QImage(raw, width, height, width * bpp, fmt)
+            image._buffer_ref = raw
     else:
         log.error("Receive image in bad format")
         image = QtGui.QImage(width, height, QtGui.QImage.Format.Format_RGB32)
