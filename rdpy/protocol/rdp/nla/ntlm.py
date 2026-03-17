@@ -26,7 +26,11 @@ import hashlib, hmac, struct, datetime
 import binascii
 from Crypto.Hash import MD4 as CryptoMD4
 from . import sspi
-import rdpy.security.rc4 as rc4
+from cryptography.hazmat.primitives.ciphers import Cipher
+try:
+    from cryptography.hazmat.decrepit.ciphers.algorithms import ARC4
+except ImportError:
+    from cryptography.hazmat.primitives.ciphers.algorithms import ARC4
 from rdpy.security.rsa_wrapper import random
 from Crypto.Cipher import DES as _CryptoDES
 from rdpy.core.type import CompositeType, CallableValue, String, UInt8, UInt16Le, UInt24Le, UInt32Le, sizeof, Stream
@@ -412,7 +416,7 @@ def RC4K(key, plaintext):
     @param plaintext: {str} plaintext
     @return {str} encrypted text
     """
-    return rc4.crypt(rc4.RC4Key(key), plaintext)
+    return Cipher(ARC4(key), mode=None).encryptor().update(plaintext)
 
 def KXKEYv2(SessionBaseKey, LmChallengeResponse, ServerChallenge):
     """
@@ -485,7 +489,7 @@ def ComputeResponsev2(ResponseKeyNT, ResponseKeyLM, ServerChallenge, ClientChall
 def MAC(handle, SigningKey, SeqNum, Message):
     """
     @summary: generate signature for application message
-    @param handle: {rc4.RC4Key} handle on crypt
+    @param handle: ARC4 encryptor for crypt
     @param SigningKey: {str} Signing key
     @param SeqNum: {int} Sequence number
     @param Message: Message to sign
@@ -498,7 +502,7 @@ def MAC(handle, SigningKey, SeqNum, Message):
     s = Stream()
     s.writeType(signature.SeqNum)
     
-    signature.Checksum.value = rc4.crypt(handle, HMAC_MD5(SigningKey, s.getvalue() + Message)[:8])
+    signature.Checksum.value = handle.update(HMAC_MD5(SigningKey, s.getvalue() + Message)[:8])
     
     return signature
 
@@ -596,7 +600,7 @@ class NTLMv2(sspi.IAuthenticationProtocol):
         ClientSealingKey = SEALKEY(ExportedSessionKey, True)
         ServerSealingKey = SEALKEY(ExportedSessionKey, False)
         
-        interface = NTLMv2SecurityInterface(rc4.RC4Key(ClientSealingKey), rc4.RC4Key(ServerSealingKey), ClientSigningKey, ServerSigningKey)
+        interface = NTLMv2SecurityInterface(Cipher(ARC4(ClientSealingKey), mode=None).encryptor(), Cipher(ARC4(ServerSealingKey), mode=None).encryptor(), ClientSigningKey, ServerSigningKey)
         
         return self._authenticateMessage, interface
     
@@ -617,8 +621,8 @@ class NTLMv2SecurityInterface(sspi.IGenericSecurityService):
     """
     def __init__(self, encryptHandle, decryptHandle, signingKey, verifyKey):
         """
-        @param encryptHandle: {rc4.RC4Key} rc4 keystream for encrypt phase
-        @param decryptHandle: {rc4.RC4Key} rc4 keystream for decrypt phase
+        @param encryptHandle: ARC4 encryptor for encrypt phase
+        @param decryptHandle: ARC4 encryptor for decrypt phase
         @param signingKey: {str} signingKey
         @param verifyKey: {str} verifyKey
         """
@@ -634,7 +638,7 @@ class NTLMv2SecurityInterface(sspi.IGenericSecurityService):
         @param data: data to encrypt
         @return: {str} encrypted data
         """
-        encryptedData = rc4.crypt(self._encryptHandle, data)
+        encryptedData = self._encryptHandle.update(data)
         signature = MAC(self._encryptHandle, self._signingKey, self._seqNum, data)
         self._seqNum += 1
         s = Stream()
@@ -652,8 +656,8 @@ class NTLMv2SecurityInterface(sspi.IGenericSecurityService):
         s.readType((signature, message))
         
         #decrypt message
-        plaintextMessage = rc4.crypt(self._decryptHandle, message.value)
-        checksum = rc4.crypt(self._decryptHandle, signature.Checksum.value)
+        plaintextMessage = self._decryptHandle.update(message.value)
+        checksum = self._decryptHandle.update(signature.Checksum.value)
         
         #recompute checksum
         t = Stream()

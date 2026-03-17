@@ -183,6 +183,8 @@ class RawLayer(protocol.Protocol, LayerAutomata, IStreamSender):
         LayerAutomata.__init__(self, presentation)
         #data buffer received from twisted network layer
         self._buffer = bytearray()
+        #offset into _buffer where unconsumed data starts
+        self._bufferOffset = 0
         #len of next packet pass to next state function
         self._expectedLen = 0
         self._factory = None
@@ -203,11 +205,16 @@ class RawLayer(protocol.Protocol, LayerAutomata, IStreamSender):
         #add in buffer (bytearray.extend avoids full-buffer copy)
         self._buffer.extend(data)
         #while buffer have expected size call local callback
-        while self._expectedLen > 0 and len(self._buffer) >= self._expectedLen:
+        while self._expectedLen > 0 and (len(self._buffer) - self._bufferOffset) >= self._expectedLen:
             #expected data is first expected bytes
-            expectedData = Stream(bytes(self._buffer[:self._expectedLen]))
-            #remove consumed data in-place
-            del self._buffer[:self._expectedLen]
+            end = self._bufferOffset + self._expectedLen
+            expectedData = Stream(bytes(self._buffer[self._bufferOffset:end]))
+            #advance offset instead of O(n) memmove
+            self._bufferOffset = end
+            #compact buffer when consumed portion exceeds remaining data
+            if self._bufferOffset > len(self._buffer) - self._bufferOffset:
+                del self._buffer[:self._bufferOffset]
+                self._bufferOffset = 0
             #call recv function
             self.recv(expectedData)
             

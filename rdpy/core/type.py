@@ -140,6 +140,7 @@ class CallableValue(object):
         @param value: value will be wrapped (raw python type  | lambda | function)
         """
         self._value = None
+        self._is_callable = False
         self.value = value
     
     def __getValue__(self):
@@ -149,7 +150,9 @@ class CallableValue(object):
                     self.value is call
         @return: value expression evaluated
         """
-        return self._value()
+        if self._is_callable:
+            return self._value()
+        return self._value
     
     def __setValue__(self, value):
         """
@@ -158,11 +161,12 @@ class CallableValue(object):
                     self.value = value is call
         @param value: new value wrapped if constant -> lambda function
         """
-        value_callable = lambda:value
         if callable(value):
-            value_callable = value
-            
-        self._value = value_callable
+            self._value = value
+            self._is_callable = True
+        else:
+            self._value = value
+            self._is_callable = False
     
     @property
     def value(self):
@@ -201,6 +205,11 @@ class SimpleType(Type, CallableValue):
         self._signed = signed
         self._typeSize = typeSize
         self._structFormat = structFormat
+        #pre-compute mask to avoid per-access overhead
+        mask = 0xff
+        for _ in range(1, typeSize):
+            mask = mask << 8 | 0xff
+        self._mask = mask
         Type.__init__(self, conditional = conditional, optional = optional, constant = constant)
         CallableValue.__init__(self, value)
         
@@ -262,15 +271,8 @@ class SimpleType(Type, CallableValue):
       
     def mask(self):
         """
-        @summary:  Compute bit mask for type
-                    Because in Python all numbers are Int long or float
-                    Cache result in self._mask field
+        @summary:  Return pre-computed bit mask for type
         """
-        if not "_mask" in self.__dict__:
-            mask = 0xff
-            for _ in range(1, self._typeSize):
-                mask = mask << 8 | 0xff
-            self._mask = mask
         return self._mask
     
     def isInRange(self, value):
@@ -455,17 +457,19 @@ class CompositeType(Type):
         @raise InvalidSize: if stream is greater than readLen parameter
         """
         readLen = 0
+        readLenLimit = self._readLen.value if self._readLen is not None else None
         for name in self._typeName:            
             try:
                 # If readLen is defined and fully consumed, skip remaining fields
-                if self._readLen is not None and readLen >= self._readLen.value:
+                if readLenLimit is not None and readLen >= readLenLimit:
                     break
                 s.readType(self.__dict__[name])
-                readLen += sizeof(self.__dict__[name])
+                fieldSize = sizeof(self.__dict__[name])
+                readLen += fieldSize
                 #read is ok but read out of bound
-                if self._readLen is not None and readLen > self._readLen.value:
+                if readLenLimit is not None and readLen > readLenLimit:
                     #roll back
-                    s.pos -= sizeof(self.__dict__[name])
+                    s.pos -= fieldSize
                     #and notify if not optional
                     if not self.__dict__[name]._optional:
                         raise InvalidSize("Impossible to read type %s : read length is too small"%(self.__class__))
@@ -479,9 +483,9 @@ class CompositeType(Type):
                     s.pos -= sizeof(self.__dict__[tmpName])
                 raise e
             
-        if self._readLen is not None and readLen < self._readLen.value:
-            log.debug("Still have correct data in packet %s, read %s bytes as padding"%(self.__class__, self._readLen.value - readLen))
-            s.read(self._readLen.value - readLen)
+        if readLenLimit is not None and readLen < readLenLimit:
+            log.debug("Still have correct data in packet %s, read %s bytes as padding"%(self.__class__, readLenLimit - readLen))
+            s.read(readLenLimit - readLen)
             
     def __write__(self, s):
         """
