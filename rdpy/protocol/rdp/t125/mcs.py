@@ -356,7 +356,7 @@ class Client(MCSLayer):
         
         #static virtual channel
         if self._nbChannelRequested < self._serverSettings.getBlock(gcc.MessageType.SC_NET).channelCount.value:
-            channelId = self._serverSettings.getBlock(gcc.MessageType.SC_NET).channelIdArray[self._nbChannelRequested]
+            channelId = self._serverSettings.getBlock(gcc.MessageType.SC_NET).channelIdArray[self._nbChannelRequested].value
             log.debug(f"static virtual channel {channelId=}")
             self._nbChannelRequested += 1
             self.sendChannelJoinRequest(channelId)

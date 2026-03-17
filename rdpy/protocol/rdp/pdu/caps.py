@@ -235,7 +235,7 @@ class Capability(CompositeType):
             """
             Closure for capability factory
             """
-            for c in [GeneralCapability, BitmapCapability, OrderCapability, BitmapCacheCapability, PointerCapability, InputCapability, BrushCapability, GlyphCapability, OffscreenBitmapCacheCapability, VirtualChannelCapability, SoundCapability, ControlCapability, WindowActivationCapability, FontCapability, ColorCacheCapability, ShareCapability, DesktopCompositionCapability, MultiFragmentUpdate]:
+            for c in [GeneralCapability, BitmapCapability, OrderCapability, BitmapCacheCapability, BitmapCache2Capability, PointerCapability, InputCapability, BrushCapability, GlyphCapability, OffscreenBitmapCacheCapability, VirtualChannelCapability, SoundCapability, ControlCapability, WindowActivationCapability, FontCapability, ColorCacheCapability, ShareCapability, RemoteProgramsCapability, DesktopCompositionCapability, MultiFragmentUpdate, SurfaceCommandsCapability, LargePointerCapability, BitmapCodecsCapability, FrameAcknowledgeCapability]:
                 if self.capabilitySetType.value == c._TYPE_ and (self.lengthCapability.value - 4) > 0:
                     return c(readLen = self.lengthCapability - 4)
             log.debug("unknown Capability type : %s"%hex(self.capabilitySetType.value))
@@ -262,13 +262,13 @@ class GeneralCapability(CompositeType):
         CompositeType.__init__(self, readLen = readLen)
         self.osMajorType = UInt16Le()
         self.osMinorType = UInt16Le()
-        self.protocolVersion = UInt16Le(0x0200, constant = True)
+        self.protocolVersion = UInt16Le(0x0200)
         self.pad2octetsA = UInt16Le()
-        self.generalCompressionTypes = UInt16Le(0, constant = True)
+        self.generalCompressionTypes = UInt16Le(0)
         self.extraFlags = UInt16Le()
-        self.updateCapabilityFlag = UInt16Le(0, constant = True)
-        self.remoteUnshareFlag = UInt16Le(0, constant = True)
-        self.generalCompressionLevel = UInt16Le(0, constant = True)
+        self.updateCapabilityFlag = UInt16Le(0)
+        self.remoteUnshareFlag = UInt16Le(0)
+        self.generalCompressionLevel = UInt16Le(0)
         self.refreshRectSupport = UInt8()
         self.suppressOutputSupport = UInt8()
         
@@ -291,10 +291,10 @@ class BitmapCapability(CompositeType):
         self.desktopHeight = UInt16Le()
         self.pad2octets = UInt16Le()
         self.desktopResizeFlag = UInt16Le()
-        self.bitmapCompressionFlag = UInt16Le(0x0001, constant = True)
+        self.bitmapCompressionFlag = UInt16Le(0x0001)
         self.highColorFlags = UInt8(0)
         self.drawingFlags = UInt8()
-        self.multipleRectangleSupport = UInt16Le(0x0001, constant = True)
+        self.multipleRectangleSupport = UInt16Le(0x0001)
         self.pad2octetsB = UInt16Le()
         
 class OrderCapability(CompositeType):
@@ -348,6 +348,29 @@ class BitmapCacheCapability(CompositeType):
         self.cache1MaximumCellSize = UInt16Le()
         self.cache2Entries = UInt16Le()
         self.cache2MaximumCellSize = UInt16Le()
+
+class BitmapCache2Capability(CompositeType):
+    """
+    @summary: Revision 2 bitmap cache capability
+    client -> server
+    @see: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/a4812595-069c-4297-8643-42e53770f3a3
+    """
+    _TYPE_ = CapsType.CAPSTYPE_BITMAPCACHE_REV2
+    
+    PERSISTENT_KEYS_EXPECTED_FLAG = 0x0001
+    ALLOW_CACHE_WAITING_LIST_FLAG = 0x0002
+    
+    def __init__(self, readLen = None):
+        CompositeType.__init__(self, readLen = readLen)
+        self.cacheFlags = UInt16Le(0)
+        self.pad2 = UInt8(0)
+        self.numCellCaches = UInt8(0)
+        self.bitmapCache0CellInfo = UInt32Le(0)
+        self.bitmapCache1CellInfo = UInt32Le(0)
+        self.bitmapCache2CellInfo = UInt32Le(0)
+        self.bitmapCache3CellInfo = UInt32Le(0)
+        self.bitmapCache4CellInfo = UInt32Le(0)
+        self.pad3 = String(b"\x00" * 12, readLen = CallableValue(12))
         
 class PointerCapability(CompositeType):
     """
@@ -528,6 +551,27 @@ class ShareCapability(CompositeType):
         self.nodeId = UInt16Le()
         self.pad2octets = UInt16Le()
         
+class RemoteProgramsCapability(CompositeType):
+    """
+    @summary: Remote Programs (RAIL) capability
+    client -> server
+    @see: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdperp/a31680ae-4aa5-4b8d-9fce-dff028e9f852
+    """
+    _TYPE_ = CapsType.CAPSTYPE_RAIL
+
+    RAIL_LEVEL_SUPPORTED = 0x00000001
+    RAIL_LEVEL_DOCKED_LANGBAR_SUPPORTED = 0x00000002
+    RAIL_LEVEL_SHELL_INTEGRATION_SUPPORTED = 0x00000004
+    RAIL_LEVEL_LANGUAGE_IME_SYNC_SUPPORTED = 0x00000008
+    RAIL_LEVEL_SERVER_TO_CLIENT_IME_SYNC_SUPPORTED = 0x00000010
+    RAIL_LEVEL_HIDE_MINIMIZED_APPS_SUPPORTED = 0x00000020
+    RAIL_LEVEL_WINDOW_CLOAKING_SUPPORTED = 0x00000040
+    RAIL_LEVEL_HANDSHAKE_EX_SUPPORTED = 0x00000080
+
+    def __init__(self, readLen = None):
+        CompositeType.__init__(self, readLen = readLen)
+        self.railSupportLevel = UInt32Le(0)
+
 class DesktopCompositionCapability(CompositeType):
     """
     @summary: Desktop Composition capability
@@ -552,3 +596,102 @@ class MultiFragmentUpdate(CompositeType):
     def __init__(self, readLen = None):
         CompositeType.__init__(self, readLen = readLen)
         self.MaxRequestSize = UInt32Le(0)
+
+class SurfaceCommandsCapability(CompositeType):
+    """
+    @summary: Surface Commands capability
+    client -> server
+    @see: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/28023aa4-628e-49c7-93c2-9c7836313e8e
+    """
+    _TYPE_ = CapsType.CAPSETTYPE_SURFACE_COMMANDS
+
+    SURFCMDS_SET_SURFACE_BITS = 0x00000002
+    SURFCMDS_FRAME_MARKER = 0x00000010
+    SURFCMDS_STREAM_SURFACE_BITS = 0x00000040
+
+    def __init__(self, readLen = None):
+        CompositeType.__init__(self, readLen = readLen)
+        self.cmdFlags = UInt32Le(0)
+        self.reserved = UInt32Le(0)
+
+class LargePointerCapability(CompositeType):
+    """
+    @summary: Large Pointer capability
+    client -> server
+    @see: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/60aed6e0-d3d3-4fc3-a081-3347e1814e5f
+    """
+    _TYPE_ = CapsType.CAPSETTYPE_LARGE_POINTER
+
+    LARGE_POINTER_FLAG_96x96 = 0x0001
+    LARGE_POINTER_FLAG_384x384 = 0x0002
+
+    def __init__(self, readLen = None):
+        CompositeType.__init__(self, readLen = readLen)
+        self.largePointerSupportFlags = UInt16Le(0)
+
+class BitmapCodecsCapability(CompositeType):
+    """
+    @summary: Bitmap Codecs capability
+    client -> server
+    @see: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/17e6b1cc-2910-4979-ad55-52bac8dc1571
+    """
+    _TYPE_ = CapsType.CAPSETTYPE_BITMAP_CODECS
+
+    # NSCodec GUID: CA8D1BB9-000F-154F-589FAE2D1A87E2D6
+    NSCODEC_GUID = b'\xb9\x1b\x8d\xca\x0f\x00\x4f\x15\x58\x9f\xae\x2d\x1a\x87\xe2\xd6'
+    # RemoteFX GUID: 76772F12-BD72-4463-AFB3-B73C9C6F7886
+    REMOTEFX_GUID = b'\x12\x2f\x77\x76\x72\xbd\x63\x44\xaf\xb3\xb7\x3c\x9c\x6f\x78\x86'
+
+    def __init__(self, readLen = None):
+        CompositeType.__init__(self, readLen = readLen)
+        self.bitmapCodecCount = UInt8(0)
+        self.bitmapCodecArray = String(b"", readLen = CallableValue(lambda:(readLen.value - 1 if readLen is not None and readLen.value > 1 else 0)))
+
+    @staticmethod
+    def buildClientCodecs():
+        """
+        @summary: Build a BitmapCodecsCapability with NSCodec and RemoteFX codecs
+        """
+        import struct
+        cap = BitmapCodecsCapability()
+        cap.bitmapCodecCount.value = 2
+        # NSCodec entry
+        nscodec = BitmapCodecsCapability.NSCODEC_GUID
+        nscodec += struct.pack('<B', 1)     # codecID (client chooses 1 for NSCodec)
+        nscodec_props = struct.pack('<BBB', 1, 1, 3)  # dynamicFidelity=1, subsampling=1, colorLossLevel=3
+        nscodec += struct.pack('<H', len(nscodec_props))  # codecPropertiesLength
+        nscodec += nscodec_props
+
+        # RemoteFX entry with full TS_RFX_CLNT_CAPS_CONTAINER
+        rfx = BitmapCodecsCapability.REMOTEFX_GUID
+        rfx += struct.pack('<B', 0)         # codecID (0 for RemoteFX)
+        # Build TS_RFX_CLNT_CAPS_CONTAINER per MS-RDPRFX
+        icap = struct.pack('<HHBBBB',
+            0x0100,  # version
+            0x0040,  # tileSize (CT_TILE_64x64)
+            0x01,    # flags (CODEC_MODE)
+            0x01,    # colConvBits
+            0x01,    # transformBits
+            0x01)    # entropyBits (CLW_ENTROPY_RLGR1)
+        capset_data = struct.pack('<BHH', 0x01, 0xCFC0, 1) + struct.pack('<H', 8) + icap
+        capset_block = struct.pack('<HI', 0xCBC1, 6 + len(capset_data)) + capset_data
+        caps_block = struct.pack('<HIH', 0xCBC0, 8, 1)
+        caps_data = caps_block + capset_block
+        rfx_props = struct.pack('<III', 12 + len(caps_data), 0, len(caps_data)) + caps_data
+        rfx += struct.pack('<H', len(rfx_props))
+        rfx += rfx_props
+
+        cap.bitmapCodecArray = String(nscodec + rfx)
+        return cap
+
+class FrameAcknowledgeCapability(CompositeType):
+    """
+    @summary: Frame Acknowledge capability
+    client -> server
+    @see: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdprfx/18fe8b18-cbbb-4c21-92c7-7a34ab3ad2e5
+    """
+    _TYPE_ = CapsType.CAPSSETTYPE_FRAME_ACKNOWLEDGE
+
+    def __init__(self, readLen = None):
+        CompositeType.__init__(self, readLen = readLen)
+        self.maxUnacknowledgedFrameCount = UInt32Le(0)

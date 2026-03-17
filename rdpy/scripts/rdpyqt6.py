@@ -27,7 +27,7 @@ from rdpy.ui.qt6 import RDPClientQt
 from rdpy.protocol.rdp import rdp
 from rdpy.core.error import RDPSecurityNegoFail
 import rdpy.core.log as log
-log._LOG_LEVEL = log.Level.INFO
+log._LOG_LEVEL = log.Level.DEBUG
 
 
 class RDPClientQtRecorder(RDPClientQt):
@@ -143,6 +143,11 @@ class RDPClientQtFactory(rdp.ClientFactory):
         controller.setHostname(socket.gethostname())
         controller.setSecurityLevel(self._security)
         
+        #set routing token for server redirection reconnection
+        if self._redirectRoutingToken:
+            controller.setRoutingToken(self._redirectRoutingToken)
+            self._redirectRoutingToken = None
+        
         return self._client
     
     def _onResize(self, width, height):
@@ -160,6 +165,11 @@ class RDPClientQtFactory(rdp.ClientFactory):
         @param connector: twisted connector use for rdp connection (use reconnect to restart connection)
         @param reason: str use to advertise reason of lost connection
         """
+        if self._redirectRoutingToken:
+            log.info("Reconnecting with routing token for server redirection")
+            connector.connect()
+            return
+
         if self._resizing:
             log.info("Reconnecting with new screen size %dx%d" % (self._width, self._height))
             self._resizing = False

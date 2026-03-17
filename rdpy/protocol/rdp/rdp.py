@@ -25,7 +25,7 @@ from rdpy.core import layer
 from rdpy.core.error import CallPureVirtualFuntion, InvalidValue
 from . import pdu
 import rdpy.core.log as log
-from . import tpkt, x224, sec
+from . import tpkt, x224, sec, drdynvc
 from .t125 import mcs, gcc
 from .nla import cssp, ntlm
 
@@ -44,12 +44,16 @@ class RDPClientController(pdu.layer.PDUClientListener):
     def __init__(self):
         #list of observer
         self._clientObserver = []
+        #dynamic virtual channel layer
+        self._drdynvcLayer = drdynvc.DrdynvcLayer()
+        self._drdynvcLayer.setGfxCallback(self._onGfxBitmap)
+        self._drdynvcLayer.setCapsConfirmCallback(self._onGfxCapsConfirm)
         #PDU layer
         self._pduLayer = pdu.layer.Client(self)
         #secure layer
         self._secLayer = sec.Client(self._pduLayer)
-        #multi channel service
-        self._mcsLayer = mcs.Client(self._secLayer)
+        #multi channel service with drdynvc virtual channel
+        self._mcsLayer = mcs.Client(self._secLayer, [(gcc.ChannelDef(b"drdynvc", gcc.ChannelOptions.CHANNEL_OPTION_INITIALIZED | gcc.ChannelOptions.CHANNEL_OPTION_ENCRYPT_RDP), self._drdynvcLayer)])
         #transport pdu layer
         self._x224Layer = x224.Client(self._mcsLayer)
         #transport packet (protocol layer)
@@ -59,6 +63,11 @@ class RDPClientController(pdu.layer.PDUClientListener):
         self._secLayer.initFastPath(self._tpktLayer)
         #is pdu layer is ready to send
         self._isReady = False
+        # GFX input gating: suppress input events until CAPS_CONFIRM or timeout
+        self._gfxPending = False
+        self._gfxTimer = None
+        #routing token for server redirection
+        self._redirectRoutingToken = None
         
     def getProtocol(self):
         """
@@ -160,6 +169,13 @@ class RDPClientController(pdu.layer.PDUClientListener):
         """
 #        self._mcsLayer._clientSettings.CS_CORE.clientName.value = hostname[:15] + "\x00" * (15 - len(hostname))
         self._secLayer._licenceManager._hostname = hostname
+
+    def setRoutingToken(self, token):
+        """
+        @summary: Set routing token for server redirection reconnection
+        @param token: {bytes} routing token from server redirection PDU
+        """
+        self._x224Layer.setRoutingToken(token)
         
     def setSecurityLevel(self, level):
         """
@@ -199,6 +215,12 @@ class RDPClientController(pdu.layer.PDUClientListener):
             #for each rectangle in update PDU
             for rectangle in rectangles:
                 observer.onUpdate(rectangle.destLeft.value, rectangle.destTop.value, rectangle.destRight.value, rectangle.destBottom.value, rectangle.width.value, rectangle.height.value, rectangle.bitsPerPixel.value, rectangle.flags.value & pdu.data.BitmapFlag.BITMAP_COMPRESSION, rectangle.bitmapDataStream.value)
+
+    def _onGfxBitmap(self, destLeft, destTop, destRight, destBottom, width, height, bpp, isCompress, data):
+        """Callback from DrdynvcLayer for RDPGFX bitmap delivery."""
+        for observer in self._clientObserver:
+            observer.onUpdate(destLeft, destTop, destRight, destBottom,
+                              width, height, bpp, isCompress, data)
 
     def onPointerHide(self):
         """
@@ -242,9 +264,28 @@ class RDPClientController(pdu.layer.PDUClientListener):
         @summary: Call when PDU layer is connected
         """
         self._isReady = True
+        # Start GFX input gating: suppress input until CAPS_CONFIRM or timeout
+        self._gfxPending = True
+        from twisted.internet import reactor
+        self._gfxTimer = reactor.callLater(5, self._onGfxTimeout)
+        log.debug("RDPClientController: GFX input gating active (5s timeout)")
         #signal all listener
         for observer in self._clientObserver:
             observer.onReady()
+
+    def _onGfxCapsConfirm(self):
+        """Called by DrdynvcLayer when RDPGFX CAPS_CONFIRM is received."""
+        log.info("RDPClientController: GFX CAPS_CONFIRM received, enabling input")
+        self._gfxPending = False
+        if self._gfxTimer and self._gfxTimer.active():
+            self._gfxTimer.cancel()
+            self._gfxTimer = None
+
+    def _onGfxTimeout(self):
+        """Fallback: enable input after timeout even without CAPS_CONFIRM."""
+        log.info("RDPClientController: GFX timeout, enabling input")
+        self._gfxPending = False
+        self._gfxTimer = None
             
     def onSessionReady(self):
         """
@@ -260,8 +301,27 @@ class RDPClientController(pdu.layer.PDUClientListener):
         @summary: Event call when RDP stack is closed
         """
         self._isReady = False
+        self._gfxPending = False
+        if self._gfxTimer and self._gfxTimer.active():
+            self._gfxTimer.cancel()
+            self._gfxTimer = None
         for observer in self._clientObserver:
             observer.onClose()
+    
+    def onRedirect(self, redirPDU):
+        """
+        @summary: Called when server sends a redirection PDU (e.g., GNOME Remote Desktop).
+        Extracts routing token and closes connection to trigger redirect reconnection.
+        @param redirPDU: ServerRedirectionPDU object
+        """
+        log.info("Server redirection received, flags=0x%x" % redirPDU.redirFlags.value)
+        lbInfo = redirPDU.getLoadBalanceInfo()
+        if lbInfo:
+            log.info("Load balance info: %s" % repr(lbInfo))
+            self._redirectRoutingToken = lbInfo
+            self.close()
+        else:
+            log.warning("Server redirection PDU received but no load balance info found")
     
     def sendPointerEvent(self, x, y, button, isPressed):
         """
@@ -271,7 +331,7 @@ class RDPClientController(pdu.layer.PDUClientListener):
         @param button: 1 or 2 or 3
         @param isPressed: true if button is pressed or false if it's released
         """
-        if not self._isReady:
+        if not self._isReady or self._gfxPending:
             return
 
         try:
@@ -317,7 +377,7 @@ class RDPClientController(pdu.layer.PDUClientListener):
         @param scroll: signed scroll value (positive=up/right, negative=down/left)
         @param isHorizontal: horizontal wheel (default is vertical)
         """
-        if not self._isReady:
+        if not self._isReady or self._gfxPending:
             return
 
         try:
@@ -352,7 +412,7 @@ class RDPClientController(pdu.layer.PDUClientListener):
         @param isPressed: True if key is pressed and false if it's released
         @param extended: {boolean} extended scancode like ctr or win button
         """
-        if not self._isReady:
+        if not self._isReady or self._gfxPending:
             return
         
         try:
@@ -376,7 +436,7 @@ class RDPClientController(pdu.layer.PDUClientListener):
         @param code: unicode
         @param isPressed: True if key is pressed and false if it's released
         """
-        if not self._isReady:
+        if not self._isReady or self._gfxPending:
             return
         
         try:
@@ -607,6 +667,8 @@ class ClientFactory(layer.RawLayerClientFactory):
     @summary: Factory of Client RDP protocol
     @param reason: twisted reason
     """
+    _redirectRoutingToken = None
+    
     def connectionLost(self, csspLayer, reason):
         #retrieve controller
         tpktLayer = csspLayer._layer
@@ -615,6 +677,9 @@ class ClientFactory(layer.RawLayerClientFactory):
         secLayer = mcsLayer._channels[mcs.Channel.MCS_GLOBAL_CHANNEL]
         pduLayer = secLayer._presentation
         controller = pduLayer._listener
+        #save redirect routing token before closing
+        if controller._redirectRoutingToken:
+            self._redirectRoutingToken = controller._redirectRoutingToken
         controller.onClose()
         
     def buildRawLayer(self, addr):

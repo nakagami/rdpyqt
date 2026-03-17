@@ -67,6 +67,7 @@ class PDUType2(object):
     PDUTYPE2_ARC_STATUS_PDU = 0x32
     PDUTYPE2_STATUS_INFO_PDU = 0x36
     PDUTYPE2_MONITOR_LAYOUT_PDU = 0x37
+    PDUTYPE2_FRAME_ACKNOWLEDGE = 0x38
      
 class StreamId(object):
     """
@@ -478,7 +479,7 @@ class PDU(CompositeType):
             """
             @summary: build message in accordance of type self.shareControlHeader.pduType.value
             """
-            for c in [DemandActivePDU, ConfirmActivePDU, DataPDU, DeactiveAllPDU]:
+            for c in [DemandActivePDU, ConfirmActivePDU, DataPDU, DeactiveAllPDU, ServerRedirectionPDU]:
                 if self.shareControlHeader.pduType.value == c._PDUTYPE_:
                     return c(readLen = CallableValue(self.shareControlHeader.totalLength.value - sizeof(self.shareControlHeader)))
             log.debug("unknown PDU type : %s"%hex(self.shareControlHeader.pduType.value))
@@ -524,7 +525,7 @@ class ConfirmActivePDU(CompositeType):
         log.debug("pdu.data.ConfirmActivePDU()")
         CompositeType.__init__(self, readLen = readLen)
         self.shareId = UInt32Le()
-        self.originatorId = UInt16Le(0x03EA, constant = True)
+        self.originatorId = UInt16Le(0x03EA)
         self.lengthSourceDescriptor = UInt16Le(lambda:sizeof(self.sourceDescriptor))
         self.lengthCombinedCapabilities = UInt16Le(lambda:(sizeof(self.numberCapabilities) + sizeof(self.pad2Octets) + sizeof(self.capabilitySets)))
         self.sourceDescriptor = String(b"rdpy", readLen = self.lengthSourceDescriptor)
@@ -565,7 +566,7 @@ class DataPDU(CompositeType):
             """
             @summary: Create object in accordance self.shareDataHeader.pduType2 value
             """
-            for c in [UpdateDataPDU, SynchronizeDataPDU, ControlDataPDU, ErrorInfoDataPDU, FontListDataPDU, FontMapDataPDU, PersistentListPDU, ClientInputEventPDU, ShutdownDeniedPDU, ShutdownRequestPDU, SupressOutputDataPDU, SaveSessionInfoPDU]:
+            for c in [UpdateDataPDU, SynchronizeDataPDU, ControlDataPDU, ErrorInfoDataPDU, FontListDataPDU, FontMapDataPDU, PersistentListPDU, ClientInputEventPDU, ShutdownDeniedPDU, ShutdownRequestPDU, SupressOutputDataPDU, SaveSessionInfoPDU, FrameAcknowledgeDataPDU]:
                 if self.shareDataHeader.pduType2.value == c._PDUTYPE2_:
                     return c(readLen = CallableValue(readLen.value - sizeof(self.shareDataHeader)))
             log.debug("unknown PDU data type : %s"%hex(self.shareDataHeader.pduType2.value))
@@ -774,6 +775,17 @@ class RefreshRectPDU(CompositeType):
         self.pad3Octets = (UInt8(), UInt8(), UInt8())
         self.areasToRefresh = ArrayType(InclusiveRectangle, readLen = self.numberOfAreas)
 
+class FrameAcknowledgeDataPDU(CompositeType):
+    """
+    @summary: Frame Acknowledge PDU - sent to acknowledge GFX frames
+    @see: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    """
+    _PDUTYPE2_ = PDUType2.PDUTYPE2_FRAME_ACKNOWLEDGE
+
+    def __init__(self, frameId = 0, readLen = None):
+        CompositeType.__init__(self, readLen = readLen)
+        self.frameID = UInt32Le(frameId)
+
 class UpdateDataPDU(CompositeType):
     """
     @summary: Update data PDU use by server to inform update image or palet
@@ -831,14 +843,15 @@ class FastPathUpdatePDU(CompositeType):
         log.debug("pdu.data.FastPathUpdatePDU()")
         CompositeType.__init__(self)
         self.updateHeader = UInt8(lambda:updateData.__class__._FASTPATH_UPDATE_TYPE_)
-        self.compressionFlags = UInt8(conditional = lambda:((self.updateHeader.value >> 4) & FastPathOutputCompression.FASTPATH_OUTPUT_COMPRESSION_USED))
+        # Compression bits are at positions 6-7 of updateHeader (not 4-5, which are fragmentation)
+        self.compressionFlags = UInt8(conditional = lambda:((self.updateHeader.value >> 6) & FastPathOutputCompression.FASTPATH_OUTPUT_COMPRESSION_USED))
         self.size = UInt16Le(lambda:sizeof(self.updateData))
         
         def UpdateDataFactory():
             """
             @summary: Create correct object in accordance to self.updateHeader field
             """
-            for c in [FastPathBitmapUpdateDataPDU, FastPathPointerHidePDU, FastPathPointerDefaultPDU, FastPathColorPointerPDU, FastPathCachedPointerPDU, FastPathPointerUpdatePDU]:
+            for c in [FastPathBitmapUpdateDataPDU, FastPathPointerHidePDU, FastPathPointerDefaultPDU, FastPathColorPointerPDU, FastPathCachedPointerPDU, FastPathPointerUpdatePDU, FastPathSurfaceCmdsPDU]:
                 if (self.updateHeader.value & 0xf) == c._FASTPATH_UPDATE_TYPE_:
                     return c(readLen = self.size)
             log.debug("unknown Fast Path PDU update data type : %s"%hex(self.updateHeader.value & 0xf))
@@ -1106,3 +1119,87 @@ class UnicodeKeyEvent(CompositeType):
         self.keyboardFlags = UInt16Le()
         self.unicode = UInt16Le()
         self.pad2Octets = UInt16Le()
+
+class ServerRedirectionPDU(CompositeType):
+    """
+    @summary: Server Redirection PDU - sent by GRD during connection
+    @see: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/e4f83c5d-c449-4e64-9c13-940b4b865e4f
+    """
+    _PDUTYPE_ = PDUType.PDUTYPE_SERVER_REDIR_PKT
+
+    # Redirection flags
+    LB_TARGET_NET_ADDRESS = 0x00000001
+    LB_LOAD_BALANCE_INFO = 0x00000002
+    LB_USERNAME = 0x00000004
+    LB_DOMAIN = 0x00000008
+    LB_PASSWORD = 0x00000010
+    LB_DONTSTOREUSERNAME = 0x00000020
+    LB_SMARTCARD_LOGON = 0x00000040
+    LB_NOREDIRECT = 0x00000080
+    LB_TARGET_FQDN = 0x00000100
+    LB_TARGET_NETBIOS_NAME = 0x00000200
+    LB_TARGET_NET_ADDRESSES = 0x00000800
+    LB_CLIENT_TSV_URL = 0x00001000
+    LB_SERVER_TSV_CAPABLE = 0x00002000
+
+    def __init__(self, readLen = None):
+        CompositeType.__init__(self, readLen = readLen)
+        # 2-byte padding per MS-RDPBCGR 2.2.13.2.1 Enhanced Security Server Redirection PDU
+        self.pad = UInt16Le()
+        self.flags = UInt16Le()
+        self.length = UInt16Le()
+        self.sessionId = UInt32Le()
+        self.redirFlags = UInt32Le()
+        # Variable-length fields are read as raw data
+        # pad(2) + flags(2) + length(2) + sessionId(4) + redirFlags(4) = 14 bytes header
+        self.rawData = String(readLen = CallableValue(lambda:(readLen.value - 14 if readLen is not None and readLen.value > 14 else 0)))
+
+    def getLoadBalanceInfo(self):
+        """
+        @summary: Parse and return load balance info from raw data
+        """
+        import struct
+        data = self.rawData.value
+        offset = 0
+        flags = self.redirFlags.value
+
+        if flags & self.LB_TARGET_NET_ADDRESS:
+            if offset + 4 > len(data):
+                return None
+            length = struct.unpack_from('<I', data, offset)[0]
+            offset += 4 + length
+
+        if flags & self.LB_LOAD_BALANCE_INFO:
+            if offset + 4 > len(data):
+                return None
+            length = struct.unpack_from('<I', data, offset)[0]
+            offset += 4
+            if offset + length > len(data):
+                return None
+            return data[offset:offset + length]
+
+        return None
+
+class SurfaceCommand(object):
+    """
+    @summary: Surface command types
+    @see: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    """
+    CMDTYPE_SET_SURFACE_BITS = 0x0001
+    CMDTYPE_FRAME_MARKER = 0x0004
+    CMDTYPE_STREAM_SURFACE_BITS = 0x0006
+
+class FrameMarkerAction(object):
+    FRAME_START = 0x0000
+    FRAME_END = 0x0001
+
+class FastPathSurfaceCmdsPDU(CompositeType):
+    """
+    @summary: Fast path surface commands update
+    @see: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    """
+    _FASTPATH_UPDATE_TYPE_ = FastPathUpdateType.FASTPATH_UPDATETYPE_SURFCMDS
+
+    def __init__(self, readLen = None):
+        CompositeType.__init__(self, readLen = readLen)
+        self.surfaceData = String(readLen = readLen)

@@ -323,7 +323,7 @@ class RDPInfo(CompositeType):
         #code page
         self.codePage = UInt32Le()
         #support flag
-        self.flag = UInt32Le(InfoFlag.INFO_MOUSE | InfoFlag.INFO_UNICODE | InfoFlag.INFO_LOGONNOTIFY | InfoFlag.INFO_LOGONERRORS | InfoFlag.INFO_DISABLECTRLALTDEL | InfoFlag.INFO_ENABLEWINDOWSKEY)
+        self.flag = UInt32Le(InfoFlag.INFO_MOUSE | InfoFlag.INFO_UNICODE | InfoFlag.INFO_LOGONNOTIFY | InfoFlag.INFO_LOGONERRORS | InfoFlag.INFO_DISABLECTRLALTDEL | InfoFlag.INFO_ENABLEWINDOWSKEY | InfoFlag.INFO_MAXIMIZESHELL | InfoFlag.INFO_MOUSE_HAS_WHEEL | InfoFlag.INFO_FORCE_ENCRYPTED_CS_PDU)
         self.cbDomain = UInt16Le(lambda:sizeof(self.domain) - 2)
         self.cbUserName = UInt16Le(lambda:sizeof(self.userName) - 2)
         self.cbPassword = UInt16Le(lambda:sizeof(self.password) - 2)
@@ -353,7 +353,7 @@ class RDPExtendedInfo(CompositeType):
         #TODO make tiomezone
         self.clientTimeZone = String(b"\x00" * 172)
         self.clientSessionId = UInt32Le()
-        self.performanceFlags = UInt32Le()
+        self.performanceFlags = UInt32Le(PerfFlag.PERF_DISABLE_FULLWINDOWDRAG | PerfFlag.PERF_DISABLE_MENUANIMATIONS | PerfFlag.PERF_ENABLE_FONT_SMOOTHING | PerfFlag.PERF_ENABLE_DESKTOP_COMPOSITION)
 
 class SecLayer(LayerAutomata, IStreamSender, tpkt.IFastPathListener, tpkt.IFastPathSender, mcs.IGCCConfig):
     """

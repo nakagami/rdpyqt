@@ -25,7 +25,7 @@ In this layer are managed all mains bitmap update orders end user inputs
 
 from rdpy.core.layer import LayerAutomata
 from rdpy.core.error import CallPureVirtualFuntion
-from rdpy.core.type import ArrayType
+from rdpy.core.type import ArrayType, Stream
 import rdpy.core.log as log
 import rdpy.protocol.rdp.tpkt as tpkt
 from . import data, caps
@@ -128,16 +128,25 @@ class PDULayer(LayerAutomata, tpkt.IFastPathListener):
             caps.CapsType.CAPSTYPE_GENERAL : caps.Capability(caps.GeneralCapability()),
             caps.CapsType.CAPSTYPE_BITMAP : caps.Capability(caps.BitmapCapability()),
             caps.CapsType.CAPSTYPE_ORDER : caps.Capability(caps.OrderCapability()),
-            caps.CapsType.CAPSTYPE_BITMAPCACHE : caps.Capability(caps.BitmapCacheCapability()),
-            caps.CapsType.CAPSTYPE_POINTER : caps.Capability(caps.PointerCapability()),
+            caps.CapsType.CAPSTYPE_BITMAPCACHE_REV2 : caps.Capability(caps.BitmapCache2Capability()),
+            caps.CapsType.CAPSTYPE_CONTROL : caps.Capability(caps.ControlCapability()),
+            caps.CapsType.CAPSTYPE_ACTIVATION : caps.Capability(caps.WindowActivationCapability()),
+            caps.CapsType.CAPSTYPE_POINTER : caps.Capability(caps.PointerCapability(isServer=True)),
+            caps.CapsType.CAPSTYPE_SHARE : caps.Capability(caps.ShareCapability()),
+            caps.CapsType.CAPSTYPE_COLORCACHE : caps.Capability(caps.ColorCacheCapability()),
             caps.CapsType.CAPSTYPE_INPUT : caps.Capability(caps.InputCapability()),
+            caps.CapsType.CAPSTYPE_FONT : caps.Capability(caps.FontCapability()),
             caps.CapsType.CAPSTYPE_BRUSH : caps.Capability(caps.BrushCapability()),
             caps.CapsType.CAPSTYPE_GLYPHCACHE : caps.Capability(caps.GlyphCapability()),
-            caps.CapsType.CAPSTYPE_OFFSCREENCACHE : caps.Capability(caps.OffscreenBitmapCacheCapability()),
             caps.CapsType.CAPSTYPE_VIRTUALCHANNEL : caps.Capability(caps.VirtualChannelCapability()),
             caps.CapsType.CAPSTYPE_SOUND : caps.Capability(caps.SoundCapability()),
             caps.CapsType.CAPSETTYPE_MULTIFRAGMENTUPDATE : caps.Capability(caps.MultiFragmentUpdate()),
-            caps.CapsType.CAPSETTYPE_COMPDESK : caps.Capability(caps.DesktopCompositionCapability())
+            caps.CapsType.CAPSETTYPE_COMPDESK : caps.Capability(caps.DesktopCompositionCapability()),
+            caps.CapsType.CAPSTYPE_RAIL : caps.Capability(caps.RemoteProgramsCapability()),
+            caps.CapsType.CAPSETTYPE_SURFACE_COMMANDS : caps.Capability(caps.SurfaceCommandsCapability()),
+            caps.CapsType.CAPSETTYPE_LARGE_POINTER : caps.Capability(caps.LargePointerCapability()),
+            caps.CapsType.CAPSETTYPE_BITMAP_CODECS : caps.Capability(caps.BitmapCodecsCapability()),
+            caps.CapsType.CAPSSETTYPE_FRAME_ACKNOWLEDGE : caps.Capability(caps.FrameAcknowledgeCapability()),
         }
         #share id between client and server
         self._shareId = 0x103EA
@@ -177,6 +186,8 @@ class Client(PDULayer):
         """
         PDULayer.__init__(self)
         self._listener = listener
+        self._fastPathFragBuf = bytearray()
+        self._fastPathFragType = None
         
     def connect(self):
         """
@@ -208,6 +219,15 @@ class Client(PDULayer):
         pdu = data.PDU()
         s.readType(pdu)
         
+        if pdu.shareControlHeader.pduType.value == data.PDUType.PDUTYPE_SERVER_REDIR_PKT:
+            log.info("Received server redirection PDU during connection sequence")
+            self._handleServerRedirection(pdu.pduMessage)
+            return
+        
+        if pdu.shareControlHeader.pduType.value == data.PDUType.PDUTYPE_DEACTIVATEALLPDU:
+            log.info("Received DeactivateAll PDU, waiting for new DemandActive")
+            return
+        
         if pdu.shareControlHeader.pduType.value != data.PDUType.PDUTYPE_DEMANDACTIVEPDU:
             #not a blocking error because in deactive reactive sequence 
             #input can be send too but ignored
@@ -236,6 +256,10 @@ class Client(PDULayer):
         log.debug("PDULayer.recvServerSynchronizePDU()")
         pdu = data.PDU()
         s.readType(pdu)
+        if pdu.shareControlHeader.pduType.value == data.PDUType.PDUTYPE_DEACTIVATEALLPDU:
+            log.info("Received DeactivateAll during sync, restarting capability exchange")
+            self.setNextState(self.recvDemandActivePDU)
+            return
         if pdu.shareControlHeader.pduType.value != data.PDUType.PDUTYPE_DATAPDU or pdu.pduMessage.shareDataHeader.pduType2.value != data.PDUType2.PDUTYPE2_SYNCHRONIZE:
             #not a blocking error because in deactive reactive sequence 
             #input can be send too but ignored
@@ -253,6 +277,10 @@ class Client(PDULayer):
         log.debug("PDULayer.recvServerControlCooperatePDU()")
         pdu = data.PDU()
         s.readType(pdu)
+        if pdu.shareControlHeader.pduType.value == data.PDUType.PDUTYPE_DEACTIVATEALLPDU:
+            log.info("Received DeactivateAll during control cooperate, restarting capability exchange")
+            self.setNextState(self.recvDemandActivePDU)
+            return
         if pdu.shareControlHeader.pduType.value != data.PDUType.PDUTYPE_DATAPDU or pdu.pduMessage.shareDataHeader.pduType2.value != data.PDUType2.PDUTYPE2_CONTROL or pdu.pduMessage.pduData.action.value != data.Action.CTRLACTION_COOPERATE:
             #not a blocking error because in deactive reactive sequence 
             #input can be send too but ignored
@@ -270,6 +298,10 @@ class Client(PDULayer):
         log.debug("PDULayer.recvServerControlGrantedPDU()")
         pdu = data.PDU()
         s.readType(pdu)
+        if pdu.shareControlHeader.pduType.value == data.PDUType.PDUTYPE_DEACTIVATEALLPDU:
+            log.info("Received DeactivateAll during control granted, restarting capability exchange")
+            self.setNextState(self.recvDemandActivePDU)
+            return
         if pdu.shareControlHeader.pduType.value != data.PDUType.PDUTYPE_DATAPDU or pdu.pduMessage.shareDataHeader.pduType2.value != data.PDUType2.PDUTYPE2_CONTROL or pdu.pduMessage.pduData.action.value != data.Action.CTRLACTION_GRANTED_CONTROL:
             #not a blocking error because in deactive reactive sequence 
             #input can be send too but ignored
@@ -287,11 +319,19 @@ class Client(PDULayer):
         log.debug("PDULayer.recvServerFontMapPDU()")
         pdu = data.PDU()
         s.readType(pdu)
+        if pdu.shareControlHeader.pduType.value == data.PDUType.PDUTYPE_DEACTIVATEALLPDU:
+            log.info("Received DeactivateAll during font map, restarting capability exchange")
+            self.setNextState(self.recvDemandActivePDU)
+            return
         if pdu.shareControlHeader.pduType.value != data.PDUType.PDUTYPE_DATAPDU or pdu.pduMessage.shareDataHeader.pduType2.value != data.PDUType2.PDUTYPE2_FONTMAP:
             #not a blocking error because in deactive reactive sequence 
             #input can be send too but ignored
             log.debug("recvServerFontMapPDU() Ignore message type %s during connection sequence"%hex(pdu.shareControlHeader.pduType.value))
             return
+        
+        # Send SuppressOutputPDU with ALLOW_DISPLAY_UPDATES
+        # Required by GNOME Remote Desktop to start sending graphics
+        self._sendSuppressOutput()
         
         self.setNextState(self.recvPDU)
         #here i'm connected
@@ -313,43 +353,124 @@ class Client(PDULayer):
                 #next state is either a capabilities re exchange or disconnection
                 #http://msdn.microsoft.com/en-us/library/cc240454.aspx
                 self.setNextState(self.recvDemandActivePDU)
+            elif pdu.shareControlHeader.pduType.value == data.PDUType.PDUTYPE_SERVER_REDIR_PKT:
+                log.info("Received server redirection PDU")
+                self._handleServerRedirection(pdu.pduMessage)
         
     def recvFastPath(self, secFlag, fastPathS):
         """
         @summary: Implement IFastPathListener interface
         Fast path is needed by RDP 8.0
+        Manually parses FastPath updates with fragment reassembly.
         @param fastPathS: {Stream} that contain fast path data
         @param secFlag: {SecFlags}
         """
+        import struct
         log.debug("PDULayer.recvFastPath()")
-        updates = ArrayType(data.FastPathUpdatePDU)
-        fastPathS.readType(updates)
-        for update in updates:
-            updateType = update.updateHeader.value & 0xf
-            if updateType == data.FastPathUpdateType.FASTPATH_UPDATETYPE_BITMAP:
-                self._listener.onUpdate(update.updateData.rectangles._array)
-            elif updateType == data.FastPathUpdateType.FASTPATH_UPDATETYPE_PTR_NULL:
-                self._listener.onPointerHide()
-            elif updateType == data.FastPathUpdateType.FASTPATH_UPDATETYPE_PTR_DEFAULT:
-                self._listener.onPointerDefault()
-            elif updateType == data.FastPathUpdateType.FASTPATH_UPDATETYPE_COLOR:
-                ud = update.updateData
+
+        rawData = fastPathS.getvalue()[fastPathS.pos:]
+        offset = 0
+
+        while offset < len(rawData):
+            if offset + 1 > len(rawData):
+                break
+            updateHeader = rawData[offset]
+            offset += 1
+
+            updateCode = updateHeader & 0x0f
+            fragmentation = (updateHeader >> 4) & 0x03
+            compression = (updateHeader >> 6) & 0x03
+
+            # Read compressionFlags if compression is indicated
+            if compression & data.FastPathOutputCompression.FASTPATH_OUTPUT_COMPRESSION_USED:
+                if offset + 1 > len(rawData):
+                    break
+                # compressionFlags = rawData[offset]
+                offset += 1
+
+            if offset + 2 > len(rawData):
+                break
+            size = struct.unpack_from('<H', rawData, offset)[0]
+            offset += 2
+
+            if offset + size > len(rawData):
+                break
+            updatePayload = rawData[offset:offset + size]
+            offset += size
+
+            # Fragment reassembly (MS-RDPBCGR 2.2.9.1.2.1)
+            FRAG_SINGLE = 0
+            FRAG_LAST = 1
+            FRAG_FIRST = 2
+            FRAG_NEXT = 3
+
+            if fragmentation == FRAG_FIRST:
+                self._fastPathFragBuf = bytearray(updatePayload)
+                self._fastPathFragType = updateCode
+                continue
+            elif fragmentation == FRAG_NEXT:
+                self._fastPathFragBuf.extend(updatePayload)
+                continue
+            elif fragmentation == FRAG_LAST:
+                self._fastPathFragBuf.extend(updatePayload)
+                updatePayload = bytes(self._fastPathFragBuf)
+                updateCode = self._fastPathFragType if self._fastPathFragType is not None else updateCode
+                self._fastPathFragBuf = bytearray()
+                self._fastPathFragType = None
+            # else FRAG_SINGLE: use updatePayload as-is
+
+            self._dispatchFastPathUpdate(updateCode, updatePayload)
+
+    def _dispatchFastPathUpdate(self, updateCode, payload):
+        """Dispatch a complete (reassembled) FastPath update."""
+        if updateCode == data.FastPathUpdateType.FASTPATH_UPDATETYPE_BITMAP:
+            try:
+                pduData = data.FastPathBitmapUpdateDataPDU()
+                s = Stream(payload)
+                s.readType(pduData)
+                self._listener.onUpdate(pduData.rectangles._array)
+            except Exception as e:
+                log.warning("Failed to parse bitmap update: %s" % e)
+        elif updateCode == data.FastPathUpdateType.FASTPATH_UPDATETYPE_PTR_NULL:
+            self._listener.onPointerHide()
+        elif updateCode == data.FastPathUpdateType.FASTPATH_UPDATETYPE_PTR_DEFAULT:
+            self._listener.onPointerDefault()
+        elif updateCode == data.FastPathUpdateType.FASTPATH_UPDATETYPE_COLOR:
+            try:
+                ud = data.FastPathColorPointerPDU()
+                s = Stream(payload)
+                s.readType(ud)
                 self._listener.onPointerUpdate(
                     24, ud.cacheIndex.value,
                     ud.hotSpotX.value, ud.hotSpotY.value,
                     ud.width.value, ud.height.value,
                     ud.andMaskData.value, ud.xorMaskData.value
                 )
-            elif updateType == data.FastPathUpdateType.FASTPATH_UPDATETYPE_CACHED:
-                self._listener.onPointerCached(update.updateData.cacheIndex.value)
-            elif updateType == data.FastPathUpdateType.FASTPATH_UPDATETYPE_POINTER:
-                ud = update.updateData
+            except Exception as e:
+                log.warning("Failed to parse color pointer update: %s" % e)
+        elif updateCode == data.FastPathUpdateType.FASTPATH_UPDATETYPE_CACHED:
+            try:
+                ud = data.FastPathCachedPointerPDU()
+                s = Stream(payload)
+                s.readType(ud)
+                self._listener.onPointerCached(ud.cacheIndex.value)
+            except Exception as e:
+                log.warning("Failed to parse cached pointer update: %s" % e)
+        elif updateCode == data.FastPathUpdateType.FASTPATH_UPDATETYPE_POINTER:
+            try:
+                ud = data.FastPathPointerUpdatePDU()
+                s = Stream(payload)
+                s.readType(ud)
                 self._listener.onPointerUpdate(
                     ud.xorBpp.value, ud.cacheIndex.value,
                     ud.hotSpotX.value, ud.hotSpotY.value,
                     ud.width.value, ud.height.value,
                     ud.andMaskData.value, ud.xorMaskData.value
                 )
+            except Exception as e:
+                log.warning("Failed to parse pointer update: %s" % e)
+        elif updateCode == data.FastPathUpdateType.FASTPATH_UPDATETYPE_SURFCMDS:
+            self._handleSurfaceCommands(payload)
         
     def readDataPDU(self, dataPDU):
         """
@@ -361,9 +482,10 @@ class Client(PDULayer):
             #ignore 0 error code because is not an error code
             if dataPDU.pduData.errorInfo.value == 0:
                 return
-            errorMessage = "Unknown code %s"%hex(dataPDU.pduData.errorInfo.value)
-            if data.ErrorInfo._MESSAGES_.has_key(dataPDU.pduData.errorInfo):
-                errorMessage = data.ErrorInfo._MESSAGES_[dataPDU.pduData.errorInfo] 
+            errorCode = dataPDU.pduData.errorInfo.value
+            errorMessage = "Unknown code %s"%hex(errorCode)
+            if errorCode in data.ErrorInfo._MESSAGES_:
+                errorMessage = data.ErrorInfo._MESSAGES_[errorCode]
             log.error("INFO PDU : %s"%errorMessage)
             
         elif dataPDU.shareDataHeader.pduType2.value == data.PDUType2.PDUTYPE2_SHUTDOWN_DENIED:
@@ -394,19 +516,56 @@ class Client(PDULayer):
         generalCapability = self._clientCapabilities[caps.CapsType.CAPSTYPE_GENERAL].capability
         generalCapability.osMajorType.value = caps.MajorType.OSMAJORTYPE_WINDOWS
         generalCapability.osMinorType.value = caps.MinorType.OSMINORTYPE_WINDOWS_NT
-        generalCapability.extraFlags.value = caps.GeneralExtraFlag.LONG_CREDENTIALS_SUPPORTED | caps.GeneralExtraFlag.NO_BITMAP_COMPRESSION_HDR | caps.GeneralExtraFlag.ENC_SALTED_CHECKSUM
+        generalCapability.extraFlags.value = (caps.GeneralExtraFlag.LONG_CREDENTIALS_SUPPORTED |
+                                              caps.GeneralExtraFlag.NO_BITMAP_COMPRESSION_HDR |
+                                              caps.GeneralExtraFlag.AUTORECONNECT_SUPPORTED)
         if self._fastPathSender is not None:
             generalCapability.extraFlags.value |= caps.GeneralExtraFlag.FASTPATH_OUTPUT_SUPPORTED
+        generalCapability.refreshRectSupport.value = 1
+        generalCapability.suppressOutputSupport.value = 1
         
         #init bitmap capability
         bitmapCapability = self._clientCapabilities[caps.CapsType.CAPSTYPE_BITMAP].capability
         bitmapCapability.preferredBitsPerPixel.value = 32
         bitmapCapability.desktopWidth = self._gccCore.desktopWidth
         bitmapCapability.desktopHeight = self._gccCore.desktopHeight
+        bitmapCapability.desktopResizeFlag.value = 0x0001
          
         #init order capability
         orderCapability = self._clientCapabilities[caps.CapsType.CAPSTYPE_ORDER].capability
-        orderCapability.orderFlags.value |= caps.OrderFlag.ZEROBOUNDSDELTASSUPPORT
+        orderCapability.orderFlags.value = (caps.OrderFlag.NEGOTIATEORDERSUPPORT |
+                                            caps.OrderFlag.ZEROBOUNDSDELTASSUPPORT |
+                                            caps.OrderFlag.COLORINDEXSUPPORT |
+                                            caps.OrderFlag.ORDERFLAGS_EXTRA_FLAGS)
+        orderCapability.orderSupportExFlags.value |= caps.OrderEx.ORDERFLAGS_EX_ALTSEC_FRAME_MARKER_SUPPORT
+        orderCapability.textANSICodePage.value = 0x04e4
+        for idx in [caps.Order.TS_NEG_DSTBLT_INDEX, caps.Order.TS_NEG_PATBLT_INDEX,
+                    caps.Order.TS_NEG_SCRBLT_INDEX]:
+            orderCapability.orderSupport._array[idx].value = 1
+        
+        #init bitmap cache rev2 capability
+        bmpCacheCap = self._clientCapabilities[caps.CapsType.CAPSTYPE_BITMAPCACHE_REV2].capability
+        bmpCacheCap.cacheFlags.value = caps.BitmapCache2Capability.ALLOW_CACHE_WAITING_LIST_FLAG
+        bmpCacheCap.numCellCaches.value = 5
+        bmpCacheCap.bitmapCache0CellInfo.value = 0x258
+        bmpCacheCap.bitmapCache1CellInfo.value = 0x258
+        bmpCacheCap.bitmapCache2CellInfo.value = 0x800
+        bmpCacheCap.bitmapCache3CellInfo.value = 0x1000
+        bmpCacheCap.bitmapCache4CellInfo.value = 0x800
+        
+        #init pointer capability
+        pointerCap = self._clientCapabilities[caps.CapsType.CAPSTYPE_POINTER].capability
+        pointerCap.colorPointerFlag.value = 1
+        pointerCap.colorPointerCacheSize.value = 20
+        pointerCap.pointerCacheSize.value = 20
+        
+        #init brush capability
+        brushCap = self._clientCapabilities[caps.CapsType.CAPSTYPE_BRUSH].capability
+        brushCap.brushSupportLevel.value = caps.BrushSupport.BRUSH_COLOR_8x8
+        
+        #init sound capability
+        soundCap = self._clientCapabilities[caps.CapsType.CAPSTYPE_SOUND].capability
+        soundCap.soundFlags.value = caps.SoundFlag.SOUND_BEEPS_FLAG
         
         #init input capability
         inputCapability = self._clientCapabilities[caps.CapsType.CAPSTYPE_INPUT].capability
@@ -414,8 +573,48 @@ class Client(PDULayer):
         inputCapability.keyboardLayout = self._gccCore.kbdLayout
         inputCapability.keyboardType = self._gccCore.keyboardType
         inputCapability.keyboardSubType = self._gccCore.keyboardSubType
-        inputCapability.keyboardrFunctionKey = self._gccCore.keyboardFnKeys
+        inputCapability.keyboardFunctionKey = self._gccCore.keyboardFnKeys
         inputCapability.imeFileName = self._gccCore.imeFileName
+        
+        #init virtual channel capability
+        vcCap = self._clientCapabilities[caps.CapsType.CAPSTYPE_VIRTUALCHANNEL].capability
+        vcCap.VCChunkSize.value = 1600
+        
+        #init RAIL (Remote Programs) capability
+        railCap = self._clientCapabilities[caps.CapsType.CAPSTYPE_RAIL].capability
+        railCap.railSupportLevel.value = (caps.RemoteProgramsCapability.RAIL_LEVEL_SUPPORTED |
+                                          caps.RemoteProgramsCapability.RAIL_LEVEL_DOCKED_LANGBAR_SUPPORTED |
+                                          caps.RemoteProgramsCapability.RAIL_LEVEL_SHELL_INTEGRATION_SUPPORTED |
+                                          caps.RemoteProgramsCapability.RAIL_LEVEL_LANGUAGE_IME_SYNC_SUPPORTED |
+                                          caps.RemoteProgramsCapability.RAIL_LEVEL_SERVER_TO_CLIENT_IME_SYNC_SUPPORTED |
+                                          caps.RemoteProgramsCapability.RAIL_LEVEL_HIDE_MINIMIZED_APPS_SUPPORTED |
+                                          caps.RemoteProgramsCapability.RAIL_LEVEL_WINDOW_CLOAKING_SUPPORTED |
+                                          caps.RemoteProgramsCapability.RAIL_LEVEL_HANDSHAKE_EX_SUPPORTED)
+        
+        #init multifragment update - large buffer for GFX
+        multiFragCap = self._clientCapabilities[caps.CapsType.CAPSETTYPE_MULTIFRAGMENTUPDATE].capability
+        multiFragCap.MaxRequestSize.value = 0x3F0000
+        
+        #init surface commands capability
+        surfCmdsCap = self._clientCapabilities[caps.CapsType.CAPSETTYPE_SURFACE_COMMANDS].capability
+        surfCmdsCap.cmdFlags.value = (caps.SurfaceCommandsCapability.SURFCMDS_SET_SURFACE_BITS |
+                                      caps.SurfaceCommandsCapability.SURFCMDS_STREAM_SURFACE_BITS |
+                                      caps.SurfaceCommandsCapability.SURFCMDS_FRAME_MARKER)
+        
+        #init large pointer capability
+        largePointerCap = self._clientCapabilities[caps.CapsType.CAPSETTYPE_LARGE_POINTER].capability
+        largePointerCap.largePointerSupportFlags.value = caps.LargePointerCapability.LARGE_POINTER_FLAG_96x96
+        
+        #init bitmap codecs capability (NSCodec + RemoteFX)
+        self._clientCapabilities[caps.CapsType.CAPSETTYPE_BITMAP_CODECS] = caps.Capability(caps.BitmapCodecsCapability.buildClientCodecs())
+        
+        #init frame acknowledge capability
+        frameAckCap = self._clientCapabilities[caps.CapsType.CAPSSETTYPE_FRAME_ACKNOWLEDGE].capability
+        frameAckCap.maxUnacknowledgedFrameCount.value = 2
+        
+        #init share capability with actual user channel ID
+        shareCap = self._clientCapabilities[caps.CapsType.CAPSTYPE_SHARE].capability
+        shareCap.nodeId.value = self._transport.getUserId()
         
         #make active PDU packet
         confirmActivePDU = data.ConfirmActivePDU()
@@ -454,6 +653,122 @@ class Client(PDULayer):
         pdu = data.ClientInputEventPDU()
         pdu.slowPathInputEvents._array = [data.SlowPathInputEvent(x) for x in pointerEvents]
         self.sendDataPDU(pdu)
+    
+    def _sendSuppressOutput(self):
+        """
+        @summary: Send SuppressOutputPDU with ALLOW_DISPLAY_UPDATES.
+        Required by GNOME Remote Desktop to start sending graphics.
+        """
+        log.debug("PDULayer._sendSuppressOutput()")
+        suppressPDU = data.SupressOutputDataPDU()
+        suppressPDU.allowDisplayUpdates.value = data.Display.ALLOW_DISPLAY_UPDATES
+        suppressPDU.desktopRect.left.value = 0
+        suppressPDU.desktopRect.top.value = 0
+        suppressPDU.desktopRect.right.value = self._gccCore.desktopWidth.value
+        suppressPDU.desktopRect.bottom.value = self._gccCore.desktopHeight.value
+        self.sendDataPDU(suppressPDU)
+    
+    def _handleSurfaceCommands(self, surfData):
+        """
+        @summary: Parse surface commands from fast path, decode bitmaps (NSCodec),
+        deliver them to the display, and acknowledge frame markers.
+        @param surfData: raw bytes of surface command data
+        @see: MS-RDPBCGR 2.2.9.1.2.1.10
+        """
+        import struct
+        from rdpy.protocol.rdp.nscodec import decode_nscodec
+
+        offset = 0
+        while offset + 2 <= len(surfData):
+            cmdType = struct.unpack_from('<H', surfData, offset)[0]
+            offset += 2
+
+            if cmdType == data.SurfaceCommand.CMDTYPE_FRAME_MARKER:
+                # frameAction(2) + frameId(4) = 6 bytes
+                if offset + 6 > len(surfData):
+                    break
+                frameAction = struct.unpack_from('<H', surfData, offset)[0]
+                frameId = struct.unpack_from('<I', surfData, offset + 2)[0]
+                offset += 6
+                if frameAction == data.FrameMarkerAction.FRAME_END:
+                    self._sendFrameAcknowledge(frameId)
+
+            elif (cmdType == data.SurfaceCommand.CMDTYPE_SET_SURFACE_BITS or
+                  cmdType == data.SurfaceCommand.CMDTYPE_STREAM_SURFACE_BITS):
+                # destLeft(2) + destTop(2) + destRight(2) + destBottom(2) = 8
+                # TS_BITMAP_DATA_EX: bpp(1) + flags(1) + reserved(1) + codecID(1) + width(2) + height(2) + bitmapDataLength(4) = 12
+                # Total header after cmdType: 20 bytes
+                if offset + 20 > len(surfData):
+                    break
+                destLeft = struct.unpack_from('<H', surfData, offset)[0]
+                destTop = struct.unpack_from('<H', surfData, offset + 2)[0]
+                destRight = struct.unpack_from('<H', surfData, offset + 4)[0]
+                destBottom = struct.unpack_from('<H', surfData, offset + 6)[0]
+
+                bpp = surfData[offset + 8]
+                flags = surfData[offset + 9]
+                # reserved = surfData[offset + 10]
+                codecID = surfData[offset + 11]
+                width = struct.unpack_from('<H', surfData, offset + 12)[0]
+                height = struct.unpack_from('<H', surfData, offset + 14)[0]
+                bitmapDataLength = struct.unpack_from('<I', surfData, offset + 16)[0]
+                offset += 20
+
+                # Extended compressed bitmap header (24 bytes) included in bitmapDataLength
+                if flags & 0x01:
+                    offset += 24
+                    bitmapDataLength -= 24
+
+                if offset + bitmapDataLength > len(surfData):
+                    log.warning("Surface bits data truncated")
+                    break
+
+                bitmapData = surfData[offset:offset + bitmapDataLength]
+                offset += bitmapDataLength
+
+                pixels = None
+                outBpp = bpp
+                if codecID == 0:
+                    # Uncompressed
+                    pixels = bitmapData
+                elif codecID == 1:
+                    # NSCodec
+                    pixels = decode_nscodec(bytes(bitmapData), width, height)
+                    outBpp = 32
+                else:
+                    log.warning("Unsupported surface codec: %d" % codecID)
+                    continue
+
+                if pixels is None:
+                    continue
+
+                # Deliver decoded bitmap to display (not RLE compressed).
+                # RDPBitmapToQtImage handles the top-down to bottom-up flip via .mirrored().
+                if hasattr(self._listener, '_onGfxBitmap'):
+                    self._listener._onGfxBitmap(
+                        destLeft, destTop, destRight, destBottom,
+                        width, height, outBpp, False, pixels)
+            else:
+                log.debug("Unknown surface command type: %s" % hex(cmdType))
+                break
+    
+    def _sendFrameAcknowledge(self, frameId):
+        """
+        @summary: Send frame acknowledge PDU for GFX frame marker
+        @param frameId: frame ID to acknowledge
+        """
+        log.debug("PDULayer._sendFrameAcknowledge(frameId=%d)" % frameId)
+        frameAckData = data.FrameAcknowledgeDataPDU(frameId)
+        self.sendDataPDU(frameAckData)
+    
+    def _handleServerRedirection(self, redirPDU):
+        """
+        @summary: Handle server redirection PDU
+        @param redirPDU: ServerRedirectionPDU object
+        """
+        log.info("Server redirection requested")
+        if hasattr(self._listener, 'onRedirect'):
+            self._listener.onRedirect(redirPDU)
         
 class Server(PDULayer):
     """

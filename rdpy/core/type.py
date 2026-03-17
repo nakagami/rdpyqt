@@ -781,7 +781,10 @@ class String(Type, CallableValue):
         """
         if self._unicode:
             return self.value.decode("utf-16-le")
-        return self.value.decode('utf-8')
+        try:
+            return self.value.decode('utf-8')
+        except UnicodeDecodeError:
+            return self.value.hex()
 
     def __write__(self, s):
         """

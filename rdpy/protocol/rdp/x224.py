@@ -80,7 +80,7 @@ class ClientConnectionRequestPDU(CompositeType):
         self.len = UInt8(lambda:sizeof(self) - 1)
         self.code = UInt8(MessageType.X224_TPDU_CONNECTION_REQUEST, constant = True)
         self.padding = (UInt16Be(), UInt16Be(), UInt8())
-        self.cookie = String(until = b"\x0d\x0a", conditional = lambda:(self.len._is_readed and self.len.value > 14))
+        self.cookie = String(until = b"\x0d\x0a", conditional = lambda:(self.len._is_readed and self.len.value > 14) or len(self.cookie.value) > 0)
         #read if there is enough data
         self.protocolNeg = Negotiation(optional = True)
 
@@ -166,6 +166,14 @@ class Client(X224Layer):
         @param presentation: upper layer, MCS layer in RDP case
         """
         X224Layer.__init__(self, presentation)
+        self._routingToken = None
+        
+    def setRoutingToken(self, token):
+        """
+        @summary: Set routing token for server redirection reconnection
+        @param token: {bytes} routing token (e.g. b"Cookie: msts=...\r\n")
+        """
+        self._routingToken = token
         
     def connect(self):
         """
@@ -181,6 +189,8 @@ class Client(X224Layer):
         @see: http://msdn.microsoft.com/en-us/library/cc240500.aspx
         """
         message = ClientConnectionRequestPDU()
+        if self._routingToken:
+            message.cookie.value = self._routingToken
         message.protocolNeg.code.value = NegociationType.TYPE_RDP_NEG_REQ
         message.protocolNeg.selectedProtocol.value = self._requestedProtocol
         log.debug(f"Client.sendConnectRequest() {message}")

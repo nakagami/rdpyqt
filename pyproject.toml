@@ -25,6 +25,7 @@ dependencies = [
     "Pillow",
     "PyQt6",
     "qt-reactor",
+    "numpy",
 ]
 
 [project.scripts]
