@@ -457,6 +457,9 @@ class CompositeType(Type):
         readLen = 0
         for name in self._typeName:            
             try:
+                # If readLen is defined and fully consumed, skip remaining fields
+                if self._readLen is not None and readLen >= self._readLen.value:
+                    break
                 s.readType(self.__dict__[name])
                 readLen += sizeof(self.__dict__[name])
                 #read is ok but read out of bound

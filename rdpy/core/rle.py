@@ -561,8 +561,8 @@ def bitmap_decompress(input_data, width, height, bpp):
 
     Returns:
         bytes: decompressed bitmap data, width * height * bpp bytes,
-               stored in bottom-up scan-line order (first row in buffer
-               is the bottom row of the image).
+               stored in top-down scan-line order (first row in buffer
+               is the top row of the image).
     """
     if not input_data or width == 0 or height == 0:
         return bytes(width * height * bpp)

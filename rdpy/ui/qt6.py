@@ -102,11 +102,19 @@ def RDPBitmapToQtImage(width, height, bitsPerPixel, isCompress, data):
     elif not isinstance(data, (bytes, bytearray)):
         data = bytes(data)
 
+    # RLE decompression (bitmap_decompress / bitmap_decompress4) stores the
+    # result in top-down scanline order, so the buffer can be used directly.
+    # .copy() detaches the QImage from the local buffer so it survives after
+    # this function returns.
+    #
+    # Uncompressed bitmap data from the RDP server is in bottom-up scanline
+    # order (Windows BMP convention), so it needs mirrored(False, True) to
+    # flip to top-down — which also produces a deep copy.
+
     if bitsPerPixel == 15:
         if isCompress:
             buf = rle.bitmap_decompress(data, width, height, 2)
-            image = QtGui.QImage(buf, width, height, width * 2, QtGui.QImage.Format.Format_RGB555)
-            image = image.mirrored(False, True)  # Flip vertically; also ensures the buffer is not garbage-collected
+            image = QtGui.QImage(buf, width, height, width * 2, QtGui.QImage.Format.Format_RGB555).copy()
         else:
             image = QtGui.QImage(data, width, height, width * 2, QtGui.QImage.Format.Format_RGB555)
             image = image.mirrored(False, True)
@@ -114,8 +122,7 @@ def RDPBitmapToQtImage(width, height, bitsPerPixel, isCompress, data):
     elif bitsPerPixel == 16:
         if isCompress:
             buf = rle.bitmap_decompress(data, width, height, 2)
-            image = QtGui.QImage(buf, width, height, width * 2, QtGui.QImage.Format.Format_RGB16)
-            image = image.mirrored(False, True)
+            image = QtGui.QImage(buf, width, height, width * 2, QtGui.QImage.Format.Format_RGB16).copy()
         else:
             image = QtGui.QImage(data, width, height, width * 2, QtGui.QImage.Format.Format_RGB16)
             image = image.mirrored(False, True)
@@ -123,24 +130,16 @@ def RDPBitmapToQtImage(width, height, bitsPerPixel, isCompress, data):
     elif bitsPerPixel == 24:
         if isCompress:
             buf = rle.bitmap_decompress(data, width, height, 3)
-            # RDP sends BGR order; use Format_BGR888 directly to avoid rgbSwapped() copy
-            image = QtGui.QImage(buf, width, height, width * 3, QtGui.QImage.Format.Format_BGR888)
-            image = image.mirrored(False, True)
+            image = QtGui.QImage(buf, width, height, width * 3, QtGui.QImage.Format.Format_BGR888).copy()
         else:
-            # RDP sends BGR order; use Format_BGR888 directly to avoid rgbSwapped() copy
             image = QtGui.QImage(data, width, height, width * 3, QtGui.QImage.Format.Format_BGR888)
             image = image.mirrored(False, True)
 
     elif bitsPerPixel == 32:
         if isCompress:
-            # bitmap_decompress4 already forces alpha to 0xFF and decodes planes
-            # in [B, G, R, 0xFF] order matching Qt Format_RGB32 on little-endian
             buf = rle.bitmap_decompress4(data, width, height)
-            image = QtGui.QImage(buf, width, height, width * 4, QtGui.QImage.Format.Format_RGB32)
-            image = image.mirrored(False, True)
+            image = QtGui.QImage(buf, width, height, width * 4, QtGui.QImage.Format.Format_RGB32).copy()
         else:
-            # RDP sends [B, G, R, A] per pixel; Qt Format_RGB32 on little-endian
-            # expects [B, G, R, 0xFF]. Force the alpha byte to 0xFF.
             raw = bytearray(data)
             raw[3::4] = b'\xff' * (width * height)
             image = QtGui.QImage(raw, width, height, width * 4, QtGui.QImage.Format.Format_RGB32)
