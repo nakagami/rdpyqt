@@ -4,6 +4,7 @@
 #
 
 import struct
+import numpy as np
 import rdpy.core.log as log
 
 
@@ -67,14 +68,6 @@ def _decompress_plane(data, plane_size, original_size):
     return _nrle_decode(data[:plane_size], original_size)
 
 
-def _clamp(v):
-    if v < 0:
-        return 0
-    if v > 255:
-        return 255
-    return v
-
-
 def decode_nscodec(data, width, height):
     """Decode NSCodec (MS-RDPNSC) bitmap data into BGRA pixels.
     Returns bytes of length width*height*4."""
@@ -129,61 +122,58 @@ def decode_nscodec(data, width, height):
     if alpha_len > 0:
         a_plane = _decompress_plane(remaining[off:off + alpha_len], alpha_len, a_orig_size)
 
-    # YCoCg to BGRA conversion (matching FreeRDP/grdp)
-    pixels = bytearray(width * height * 4)
+    # YCoCg to BGRA conversion (matching FreeRDP/grdp) — vectorized with numpy
+    n_pixels = width * height
+
+    y_np = np.frombuffer(y_plane, dtype=np.uint8)
+    co_np = np.frombuffer(co_plane, dtype=np.uint8)
+    cg_np = np.frombuffer(cg_plane, dtype=np.uint8)
 
     y_row_width = temp_width if chroma_sub > 0 else width
     co_row_width = (temp_width >> 1) if chroma_sub > 0 else width
 
-    for py in range(height):
-        y_row_off = py * y_row_width
-        if chroma_sub > 0:
-            co_row_off = (py >> 1) * co_row_width
-            cg_row_off = co_row_off
-        else:
-            co_row_off = py * co_row_width
-            cg_row_off = co_row_off
+    if chroma_sub > 0:
+        py_arr = np.arange(height, dtype=np.int32)
+        px_arr = np.arange(width, dtype=np.int32)
+        py_grid, px_grid = np.meshgrid(py_arr, px_arr, indexing='ij')
 
-        co_idx = co_row_off
-        cg_idx = cg_row_off
+        y_flat_idx = (py_grid * y_row_width + px_grid).ravel()
+        co_flat_idx = ((py_grid >> 1) * co_row_width + (px_grid >> 1)).ravel()
 
-        for px in range(width):
-            out_idx = py * width + px
-            y_idx = y_row_off + px
+        np.clip(y_flat_idx, 0, len(y_plane) - 1, out=y_flat_idx)
+        np.clip(co_flat_idx, 0, len(co_plane) - 1, out=co_flat_idx)
 
-            y_val = y_plane[y_idx] if y_idx < len(y_plane) else 0
+        y_vals = y_np[y_flat_idx].astype(np.int32)
+        co_raw = co_np[co_flat_idx].astype(np.int32)
+        cg_raw = cg_np[co_flat_idx].astype(np.int32)
+    else:
+        y_vals = y_np[:n_pixels].astype(np.int32)
+        co_raw = co_np[:n_pixels].astype(np.int32)
+        cg_raw = cg_np[:n_pixels].astype(np.int32)
 
-            # FreeRDP: co_val = (INT16)(INT8)(((INT16)*coplane) << shift)
-            co_raw = co_plane[co_idx] if co_idx < len(co_plane) else 0
-            cg_raw = cg_plane[cg_idx] if cg_idx < len(cg_plane) else 0
+    # Shift and truncate to int8 (signed byte)
+    co_val = ((co_raw << shift) & 0xFF)
+    co_val[co_val >= 128] -= 256
+    cg_val = ((cg_raw << shift) & 0xFF)
+    cg_val[cg_val >= 128] -= 256
 
-            # Shift and truncate to int8 (signed byte)
-            co_val = ((co_raw << shift) & 0xFF)
-            if co_val >= 128:
-                co_val -= 256
-            cg_val = ((cg_raw << shift) & 0xFF)
-            if cg_val >= 128:
-                cg_val -= 256
+    rv = y_vals + co_val - cg_val
+    gv = y_vals + cg_val
+    bv = y_vals - co_val - cg_val
 
-            rv = y_val + co_val - cg_val
-            gv = y_val + cg_val
-            bv = y_val - co_val - cg_val
+    np.clip(rv, 0, 255, out=rv)
+    np.clip(gv, 0, 255, out=gv)
+    np.clip(bv, 0, 255, out=bv)
 
-            off4 = out_idx * 4
-            pixels[off4] = _clamp(bv)
-            pixels[off4 + 1] = _clamp(gv)
-            pixels[off4 + 2] = _clamp(rv)
-            if a_plane is not None and out_idx < len(a_plane):
-                pixels[off4 + 3] = a_plane[out_idx]
-            else:
-                pixels[off4 + 3] = 0xFF
+    # Assemble BGRA output
+    pixels = np.empty((n_pixels, 4), dtype=np.uint8)
+    pixels[:, 0] = bv
+    pixels[:, 1] = gv
+    pixels[:, 2] = rv
+    if a_plane is not None:
+        a_np = np.frombuffer(a_plane, dtype=np.uint8)
+        pixels[:, 3] = a_np[:n_pixels]
+    else:
+        pixels[:, 3] = 0xFF
 
-            # Advance chroma pointer
-            if chroma_sub > 0:
-                co_idx += px % 2
-                cg_idx += px % 2
-            else:
-                co_idx += 1
-                cg_idx += 1
-
-    return bytes(pixels)
+    return pixels.tobytes()

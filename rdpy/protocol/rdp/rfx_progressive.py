@@ -394,29 +394,40 @@ def _place_tile(y_coeffs, cb_coeffs, cr_coeffs, x_idx, y_idx, output, out_w, out
     if tile_w <= 0 or tile_h <= 0:
         return
 
+    # Build indices into coefficient arrays (RFX_TILE_SIZE-wide rows)
+    rows = np.arange(tile_h)
+    cols = np.arange(tile_w)
+    row_grid, col_grid = np.meshgrid(rows, cols, indexing='ij')
+    coeff_idx = (row_grid * RFX_TILE_SIZE + col_grid).ravel()
+
+    y_arr = y_coeffs[coeff_idx].astype(np.int32)
+    cb_arr = cb_coeffs[coeff_idx].astype(np.int32)
+    cr_arr = cr_coeffs[coeff_idx].astype(np.int32)
+
+    # ICT (YCbCr → RGB) with fixed-point arithmetic matching FreeRDP/grdp
+    y_scaled = (y_arr + 4096) << 16
+    r = (cr_arr * 91916 + y_scaled) >> 21
+    g = (y_scaled - cb_arr * 22527 - cr_arr * 46819) >> 21
+    b = (cb_arr * 115992 + y_scaled) >> 21
+
+    np.clip(r, 0, 255, out=r)
+    np.clip(g, 0, 255, out=g)
+    np.clip(b, 0, 255, out=b)
+
+    # Assemble BGRA tile
+    bgra = np.empty((tile_h * tile_w, 4), dtype=np.uint8)
+    bgra[:, 0] = b
+    bgra[:, 1] = g
+    bgra[:, 2] = r
+    bgra[:, 3] = 0xFF
+    bgra_bytes = bgra.tobytes()
+
+    # Write into output row by row
+    stride = tile_w * 4
     for row in range(tile_h):
-        for col in range(tile_w):
-            idx = row * RFX_TILE_SIZE + col
-            y_val = int(y_coeffs[idx])
-            cb = int(cb_coeffs[idx])
-            cr = int(cr_coeffs[idx])
-
-            # ICT (YCbCr → RGB) with fixed-point arithmetic matching FreeRDP/grdp
-            y_scaled = (y_val + 4096) << 16
-            r = (cr * 91916 + y_scaled) >> 21
-            g = (y_scaled - cb * 22527 - cr * 46819) >> 21
-            b = (cb * 115992 + y_scaled) >> 21
-
-            r = max(0, min(255, r))
-            g = max(0, min(255, g))
-            b = max(0, min(255, b))
-
-            out_idx = ((tile_y + row) * out_w + (tile_x + col)) * 4
-            if out_idx + 3 < len(output):
-                output[out_idx] = b
-                output[out_idx + 1] = g
-                output[out_idx + 2] = r
-                output[out_idx + 3] = 0xFF
+        out_start = ((tile_y + row) * out_w + tile_x) * 4
+        if out_start + stride <= len(output):
+            output[out_start:out_start + stride] = bgra_bytes[row * stride:(row + 1) * stride]
 
 
 # ---------------------------------------------------------------
