@@ -258,75 +258,51 @@ def _idwt_2d_level(buf, n):
     nn = n * n
     size = 2 * n
 
-    hl = buf[0:nn].copy()
-    lh = buf[nn:2*nn].copy()
-    hh = buf[2*nn:3*nn].copy()
-    ll = buf[3*nn:4*nn].copy()
+    # Extract subbands as int32 2D arrays
+    hl = buf[0:nn].astype(np.int32).reshape(n, n)
+    lh = buf[nn:2*nn].astype(np.int32).reshape(n, n)
+    hh = buf[2*nn:3*nn].astype(np.int32).reshape(n, n)
+    ll = buf[3*nn:4*nn].astype(np.int32).reshape(n, n)
 
-    # Reshape for 2D operations
-    hl_2d = hl.reshape(n, n)
-    lh_2d = lh.reshape(n, n)
-    hh_2d = hh.reshape(n, n)
-    ll_2d = ll.reshape(n, n)
+    # --- Step 1: Horizontal IDWT (all rows at once) ---
+    # Stack L-part and H-part: rows 0..n-1 use (ll,hl), rows n..2n-1 use (lh,hh)
+    lo = np.vstack([ll, lh])   # (2n, n)
+    hi = np.vstack([hl, hh])   # (2n, n)
 
-    # tmp: L part (rows 0..n-1) and H part (rows n..2n-1), each of width 'size'
-    tmp = np.zeros((size, size), dtype=np.int32)
+    # Even positions (undo update step)
+    even_h = np.empty((2 * n, n), dtype=np.int32)
+    even_h[:, 0] = lo[:, 0] - ((hi[:, 0] * 2 + 1) >> 1)
+    even_h[:, 1:] = lo[:, 1:] - ((hi[:, :-1] + hi[:, 1:] + 1) >> 1)
 
-    # Step 1: Horizontal IDWT on each row
-    for row in range(n):
-        lo_l = ll_2d[row]    # L-L
-        hi_l = hl_2d[row]    # H-L
-        lo_h = lh_2d[row]    # L-H
-        hi_h = hh_2d[row]    # H-H
+    # Odd positions (undo predict step, H<<1 scaling)
+    odd_h = np.empty((2 * n, n), dtype=np.int32)
+    odd_h[:, :-1] = (hi[:, :-1] << 1) + ((even_h[:, :-1] + even_h[:, 1:]) >> 1)
+    odd_h[:, -1] = (hi[:, -1] << 1) + even_h[:, -1]
 
-        # Even positions (undo update step)
-        # col=0 boundary: hPrev = h[0]
-        tmp[row, 0] = int(lo_l[0]) - ((int(hi_l[0]) * 2 + 1) >> 1)
-        tmp[row + n, 0] = int(lo_h[0]) - ((int(hi_h[0]) * 2 + 1) >> 1)
+    # Interleave even/odd into tmp columns
+    tmp = np.empty((2 * n, size), dtype=np.int32)
+    tmp[:, 0::2] = even_h
+    tmp[:, 1::2] = odd_h
 
-        for col in range(1, n):
-            x = col * 2
-            tmp[row, x] = int(lo_l[col]) - ((int(hi_l[col - 1]) + int(hi_l[col]) + 1) >> 1)
-            tmp[row + n, x] = int(lo_h[col]) - ((int(hi_h[col - 1]) + int(hi_h[col]) + 1) >> 1)
+    # --- Step 2: Vertical IDWT (all columns at once) ---
+    lo_v = tmp[:n, :]    # L rows
+    hi_v = tmp[n:, :]    # H rows
 
-        # Odd positions (undo predict step, with H<<1 scaling)
-        for col in range(n - 1):
-            x = col * 2
-            tmp[row, x + 1] = (int(hi_l[col]) << 1) + ((int(tmp[row, x]) + int(tmp[row, x + 2])) >> 1)
-            tmp[row + n, x + 1] = (int(hi_h[col]) << 1) + ((int(tmp[row + n, x]) + int(tmp[row + n, x + 2])) >> 1)
+    # Even rows
+    even_v = np.empty((n, size), dtype=np.int32)
+    even_v[0, :] = lo_v[0, :] - ((hi_v[0, :] * 2 + 1) >> 1)
+    even_v[1:, :] = lo_v[1:, :] - ((hi_v[:-1, :] + hi_v[1:, :] + 1) >> 1)
 
-        # Last odd (boundary: eNext = eCur)
-        x = (n - 1) * 2
-        tmp[row, x + 1] = (int(hi_l[n - 1]) << 1) + int(tmp[row, x])
-        tmp[row + n, x + 1] = (int(hi_h[n - 1]) << 1) + int(tmp[row + n, x])
+    # Odd rows
+    odd_v = np.empty((n, size), dtype=np.int32)
+    odd_v[:-1, :] = (hi_v[:-1, :] << 1) + ((even_v[:-1, :] + even_v[1:, :]) >> 1)
+    odd_v[-1, :] = (hi_v[-1, :] << 1) + even_v[-1, :]
 
-    # Step 2: Vertical IDWT on each column
-    out = np.zeros((size, size), dtype=np.int32)
+    # Interleave even/odd into output rows
+    out = np.empty((size, size), dtype=np.int32)
+    out[0::2, :] = even_v
+    out[1::2, :] = odd_v
 
-    for col in range(size):
-        # Row 0 boundary
-        l_val = int(tmp[0, col])
-        h_val = int(tmp[n, col])
-        out[0, col] = l_val - ((h_val * 2 + 1) >> 1)
-
-        for row in range(1, n):
-            l_cur = int(tmp[row, col])
-            h_cur = int(tmp[row + n, col])
-            h_prev = int(tmp[row - 1 + n, col])
-
-            even = l_cur - ((h_prev + h_cur + 1) >> 1)
-            out[2 * row, col] = even
-
-            prev_even = int(out[2 * row - 2, col])
-            odd = (h_prev << 1) + ((prev_even + even) >> 1)
-            out[2 * row - 1, col] = odd
-
-        # Last odd
-        last_even = int(out[(2 * n - 2), col])
-        last_h = int(tmp[2 * n - 1, col])
-        out[2 * n - 1, col] = (last_h << 1) + last_even
-
-    # Write back as int16
     buf[:size * size] = out.reshape(-1).astype(np.int16)
 
 
