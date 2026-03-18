@@ -158,6 +158,10 @@ class DrdynvcLayer(LayerAutomata):
         # Callbacks
         self._gfxCallback = None       # bitmap delivery callback
         self._capsConfirmCallback = None  # called when CAPS_CONFIRM received
+        # RDPSND DVC routing
+        self._rdpsndLayer = None       # set via setRdpsndLayer() for DVC audio routing
+        self._rdpsndDvcChannelIds = set()  # DVC channelIds for rdpsnd audio
+        self._rdpsndDvcPrimaryId = None    # primary channel for sending responses
 
     def setGfxCallback(self, callback):
         """Set callback for RDPGFX bitmap delivery: callback(x, y, w, h, bpp, data)"""
@@ -166,6 +170,10 @@ class DrdynvcLayer(LayerAutomata):
     def setCapsConfirmCallback(self, callback):
         """Set callback for RDPGFX CAPS_CONFIRM notification."""
         self._capsConfirmCallback = callback
+
+    def setRdpsndLayer(self, rdpsndLayer):
+        """Set the RDPSND layer for DVC audio routing."""
+        self._rdpsndLayer = rdpsndLayer
 
     def connect(self):
         log.debug("DrdynvcLayer.connect()")
@@ -205,6 +213,8 @@ class DrdynvcLayer(LayerAutomata):
             self._processDataPdu(data, cbId)
         elif cmd == DrdynvcCmd.CLOSE:
             self._processClose(data, cbId)
+        elif cmd == DrdynvcCmd.SOFT_SYNC_REQUEST:
+            self._processSoftSyncRequest(data)
         else:
             log.debug("DrdynvcLayer: unknown cmd=%d" % cmd)
 
@@ -233,12 +243,59 @@ class DrdynvcLayer(LayerAutomata):
             return
         version = struct.unpack_from('<H', data, 2)[0]
         log.debug("DrdynvcLayer: server DRDYNVC version=%d" % version)
-        # Cap at version 2 to avoid Soft-Sync requirement of version 3
-        self._version = min(version, 2)
+        # Accept up to version 3 (Soft-Sync)
+        self._version = min(version, 3)
 
         response = struct.pack('<BBH', 0x50, 0x00, self._version)
         self._send(response)
         log.debug("DrdynvcLayer: sent capabilities response version=%d" % self._version)
+
+    def _processSoftSyncRequest(self, data):
+        """Handle DVC Soft-Sync Request (version 3). Parse and respond."""
+        # data[0] = header (already parsed), data[1] = pad
+        if len(data) < 10:
+            log.warning("DrdynvcLayer: Soft-Sync Request too short (%d bytes)" % len(data))
+            return
+        offset = 1  # skip header byte
+        pad = data[offset]; offset += 1
+        length = struct.unpack_from('<I', data, offset)[0]; offset += 4
+        flags = struct.unpack_from('<H', data, offset)[0]; offset += 2
+        numTunnels = struct.unpack_from('<H', data, offset)[0]; offset += 2
+        log.info("DrdynvcLayer: Soft-Sync Request flags=0x%04x numTunnels=%d" % (flags, numTunnels))
+
+        tunnelTypes = []
+        for i in range(numTunnels):
+            if offset + 4 > len(data):
+                break
+            tt = struct.unpack_from('<I', data, offset)[0]; offset += 4
+            tunnelTypes.append(tt)
+            log.info("DrdynvcLayer: Soft-Sync tunnel[%d] type=0x%08x" % (i, tt))
+
+        SOFT_SYNC_CHANNEL_LIST_PRESENT = 0x0002
+        if flags & SOFT_SYNC_CHANNEL_LIST_PRESENT:
+            if offset + 2 <= len(data):
+                numChannels = struct.unpack_from('<H', data, offset)[0]; offset += 2
+                for i in range(numChannels):
+                    if offset + 8 > len(data):
+                        break
+                    dvcChId = struct.unpack_from('<I', data, offset)[0]; offset += 4
+                    chTunnelType = struct.unpack_from('<I', data, offset)[0]; offset += 4
+                    log.info("DrdynvcLayer: Soft-Sync channel[%d] dvcId=%d tunnelType=0x%08x" %
+                             (i, dvcChId, chTunnelType))
+
+        # Send Soft-Sync Response
+        SOFT_SYNC_TCP_FLUSHED = 0x0001
+        resp = bytearray()
+        resp.append(0x90)  # header: cmd=SOFT_SYNC_RESPONSE(0x09) << 4
+        resp.append(0x00)  # pad
+        respPayload = struct.pack('<H', SOFT_SYNC_TCP_FLUSHED)  # flags
+        respPayload += struct.pack('<H', numTunnels)  # numberOfTunnels
+        for tt in tunnelTypes:
+            respPayload += struct.pack('<I', tt)
+        resp += struct.pack('<I', len(respPayload))  # length
+        resp += respPayload
+        self._send(bytes(resp))
+        log.info("DrdynvcLayer: sent Soft-Sync Response")
 
     def _processCreateRequest(self, data, cbId):
         channelId, offset = self._readChannelId(data, 1, cbId)
@@ -263,6 +320,24 @@ class DrdynvcLayer(LayerAutomata):
         if channelName == RDPGFX_CHANNEL_NAME:
             self._gfxChannelId = channelId
             self._sendRdpgfxCapsAdvertise(channelId, cbId)
+        elif channelName in ("rdpsnd", "AUDIO_PLAYBACK_DVC", "AUDIO_PLAYBACK_LOSSY_DVC"):
+            self._rdpsndDvcChannelIds.add(channelId)
+            log.info("DrdynvcLayer: RDPSND DVC channel mapped to channelId=%d (%s)" % (channelId, channelName))
+            if self._rdpsndLayer is not None and self._rdpsndDvcPrimaryId is None:
+                # Use the first audio channel as the primary for sending responses
+                self._rdpsndDvcPrimaryId = channelId
+                def dvcSendRdpsnd(data, _chId=channelId, _cbId=cbId):
+                    header = (DrdynvcCmd.DATA << 4) | _cbId
+                    pdu = bytearray([header])
+                    if _cbId == 0:
+                        pdu += struct.pack('<B', _chId)
+                    elif _cbId == 1:
+                        pdu += struct.pack('<H', _chId)
+                    elif _cbId == 2:
+                        pdu += struct.pack('<I', _chId)
+                    pdu += data
+                    self._send(bytes(pdu))
+                self._rdpsndLayer._dvcSendCallback = dvcSendRdpsnd
 
     def _processDataFirst(self, data, cbId, sp):
         """Handle DVC DATA_FIRST: first fragment of a large DVC message."""
@@ -298,6 +373,9 @@ class DrdynvcLayer(LayerAutomata):
         channelName = self._dynamicChannels.get(channelId, "unknown")
         if channelId == self._gfxChannelId and len(payload) >= 8:
             self._processRdpgfxStream(payload)
+        elif channelId in self._rdpsndDvcChannelIds and self._rdpsndLayer is not None:
+            log.info("DrdynvcLayer: routing DVC rdpsnd data len=%d to RdpsndLayer" % len(payload))
+            self._rdpsndLayer._processData(payload)
         else:
             log.debug("DrdynvcLayer: data on channelId=%d (%s) len=%d" %
                       (channelId, channelName, len(payload)))
