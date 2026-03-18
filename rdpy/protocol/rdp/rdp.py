@@ -25,9 +25,18 @@ from rdpy.core import layer
 from rdpy.core.error import CallPureVirtualFuntion, InvalidValue
 from . import pdu
 import rdpy.core.log as log
-from . import tpkt, x224, sec, drdynvc
+from . import tpkt, x224, sec, drdynvc, rdpsnd
 from .t125 import mcs, gcc
 from .nla import cssp, ntlm
+
+class _StubVChannel(layer.LayerAutomata):
+    """Stub virtual channel layer that accepts and discards all data."""
+    def __init__(self):
+        layer.LayerAutomata.__init__(self, None)
+    def connect(self):
+        pass
+    def recv(self, s):
+        pass
 
 class SecurityLevel(object):
     """
@@ -48,12 +57,20 @@ class RDPClientController(pdu.layer.PDUClientListener):
         self._drdynvcLayer = drdynvc.DrdynvcLayer()
         self._drdynvcLayer.setGfxCallback(self._onGfxBitmap)
         self._drdynvcLayer.setCapsConfirmCallback(self._onGfxCapsConfirm)
+        #audio output virtual channel layer
+        self._rdpsndLayer = rdpsnd.RdpsndLayer()
+        self._drdynvcLayer.setRdpsndLayer(self._rdpsndLayer)
         #PDU layer
         self._pduLayer = pdu.layer.Client(self)
         #secure layer
         self._secLayer = sec.Client(self._pduLayer)
-        #multi channel service with drdynvc virtual channel
-        self._mcsLayer = mcs.Client(self._secLayer, [(gcc.ChannelDef(b"drdynvc", gcc.ChannelOptions.CHANNEL_OPTION_INITIALIZED | gcc.ChannelOptions.CHANNEL_OPTION_ENCRYPT_RDP), self._drdynvcLayer)])
+        #multi channel service with drdynvc, rdpsnd, cliprdr, and rdpdr virtual channels
+        self._mcsLayer = mcs.Client(self._secLayer, [
+            (gcc.ChannelDef(b"rdpdr", gcc.ChannelOptions.CHANNEL_OPTION_INITIALIZED | gcc.ChannelOptions.CHANNEL_OPTION_ENCRYPT_RDP | gcc.ChannelOptions.CHANNEL_OPTION_COMPRESS_RDP), _StubVChannel()),
+            (gcc.ChannelDef(b"rdpsnd", gcc.ChannelOptions.CHANNEL_OPTION_INITIALIZED | gcc.ChannelOptions.CHANNEL_OPTION_ENCRYPT_RDP), self._rdpsndLayer),
+            (gcc.ChannelDef(b"cliprdr", gcc.ChannelOptions.CHANNEL_OPTION_INITIALIZED | gcc.ChannelOptions.CHANNEL_OPTION_ENCRYPT_RDP | gcc.ChannelOptions.CHANNEL_OPTION_COMPRESS_RDP), _StubVChannel()),
+            (gcc.ChannelDef(b"drdynvc", gcc.ChannelOptions.CHANNEL_OPTION_INITIALIZED | gcc.ChannelOptions.CHANNEL_OPTION_ENCRYPT_RDP), self._drdynvcLayer),
+        ])
         #transport pdu layer
         self._x224Layer = x224.Client(self._mcsLayer)
         #transport packet (protocol layer)
@@ -305,6 +322,7 @@ class RDPClientController(pdu.layer.PDUClientListener):
         if self._gfxTimer and self._gfxTimer.active():
             self._gfxTimer.cancel()
             self._gfxTimer = None
+        self._rdpsndLayer._stopAudio()
         for observer in self._clientObserver:
             observer.onClose()
     

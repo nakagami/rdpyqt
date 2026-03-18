@@ -122,6 +122,9 @@ class Version(object):
     """
     RDP_VERSION_4 = 0x00080001
     RDP_VERSION_5_PLUS = 0x00080004
+    RDP_VERSION_10 = 0x00080005
+    RDP_VERSION_10_1 = 0x00080006
+    RDP_VERSION_10_2 = 0x00080007
 
 class Sequence(object):
     RNS_UD_SAS_DEL = 0xAA03
@@ -246,13 +249,13 @@ class ClientCoreData(CompositeType):
     def __init__(self, readLen = None):
         # https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/2610fcc7-3df4-4166-85bb-2c7ae21f6151
         CompositeType.__init__(self, readLen = readLen)
-        self.rdpVersion = UInt32Le(Version.RDP_VERSION_5_PLUS)
+        self.rdpVersion = UInt32Le(Version.RDP_VERSION_10_2)
         self.desktopWidth = UInt16Le(1280)
         self.desktopHeight = UInt16Le(800)
         self.colorDepth = UInt16Le(ColorDepth.RNS_UD_COLOR_8BPP)
         self.sasSequence = UInt16Le(Sequence.RNS_UD_SAS_DEL)
         self.kbdLayout = UInt32Le(KeyboardLayout.US)
-        self.clientBuild = UInt32Le(3790)
+        self.clientBuild = UInt32Le(22621)
         self.clientName = String(("rdpy".encode("utf_16_le") + b"\x00" * 32)[:32], readLen = CallableValue(32))
         self.keyboardType = UInt32Le(KeyboardType.IBM_101_102_KEYS)
         self.keyboardSubType = UInt32Le(0)
@@ -263,9 +266,9 @@ class ClientCoreData(CompositeType):
         self.serialNumber = UInt32Le(0, optional = True)
         self.highColorDepth = UInt16Le(HighColor.HIGH_COLOR_24BPP, optional = True)
         self.supportedColorDepths = UInt16Le(Support.RNS_UD_15BPP_SUPPORT | Support.RNS_UD_16BPP_SUPPORT | Support.RNS_UD_24BPP_SUPPORT | Support.RNS_UD_32BPP_SUPPORT, optional = True)
-        self.earlyCapabilityFlags = UInt16Le(CapabilityFlags.RNS_UD_CS_SUPPORT_ERRINFO_PDU | CapabilityFlags.RNS_UD_CS_WANT_32BPP_SESSION | CapabilityFlags.RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL, optional = True)
+        self.earlyCapabilityFlags = UInt16Le(CapabilityFlags.RNS_UD_CS_SUPPORT_ERRINFO_PDU | CapabilityFlags.RNS_UD_CS_WANT_32BPP_SESSION | CapabilityFlags.RNS_UD_CS_VALID_CONNECTION_TYPE | CapabilityFlags.RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL, optional = True)
         self.clientDigProductId = String(b"\x00" * 64, readLen = CallableValue(64), optional = True)
-        self.connectionType = UInt8(optional = True)
+        self.connectionType = UInt8(ConnectionType.CONNECTION_TYPE_LAN, optional = True)
         self.pad1octet = UInt8(optional = True)
         self.serverSelectedProtocol = UInt32Le(optional = True)
     

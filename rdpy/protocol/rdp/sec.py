@@ -374,7 +374,7 @@ class SecLayer(LayerAutomata, IStreamSender, tpkt.IFastPathListener, tpkt.IFastP
         self._fastPathPresentation = None
         
         #credentials
-        self._info = RDPInfo(extendedInfoConditional = lambda:(self.getGCCServerSettings().SC_CORE.rdpVersion.value == gcc.Version.RDP_VERSION_5_PLUS))
+        self._info = RDPInfo(extendedInfoConditional = lambda:(self.getGCCServerSettings().SC_CORE.rdpVersion.value >= gcc.Version.RDP_VERSION_5_PLUS))
         
         #True if classic encryption is enable
         self._enableEncryption = False
