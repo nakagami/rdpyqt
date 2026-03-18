@@ -25,6 +25,7 @@ Desktop and other modern RDP servers.
 """
 
 import struct
+import numpy as np
 from rdpy.core.layer import LayerAutomata
 import rdpy.core.log as log
 from rdpy.protocol.rdp.rfx_progressive import RfxProgressiveDecoder
@@ -708,8 +709,7 @@ class DrdynvcLayer(LayerAutomata):
         # RDPGFX XRGB_8888: pixels are [B, G, R, X] (same as RDP BGRX)
         # Force alpha to 0xFF for Qt Format_RGB32 compatibility
         raw = bytearray(data[:expected])
-        for i in range(3, expected, 4):
-            raw[i] = 0xFF
+        raw[3::4] = b'\xff' * (expected // 4)
 
         # Also update the surface buffer so cache operations work
         self._blitToSurface(surfaceId, left, top, width, height, raw)
@@ -748,15 +748,14 @@ class DrdynvcLayer(LayerAutomata):
         if residual_len > 0:
             res_data = data[off:off + residual_len]
             off += residual_len
-            for y in range(height):
-                for x in range(width):
-                    si = (y * width + x) * 3
-                    di = (y * width + x) * 4
-                    if si + 2 < len(res_data) and di + 3 < len(out):
-                        out[di] = res_data[si]         # B
-                        out[di + 1] = res_data[si + 1] # G
-                        out[di + 2] = res_data[si + 2] # R
-                        out[di + 3] = 0xFF
+            n_pixels = width * height
+            usable = min(len(res_data) // 3, n_pixels)
+            if usable > 0:
+                bgr = np.frombuffer(res_data[:usable * 3], dtype=np.uint8).reshape(usable, 3)
+                bgra = np.empty((usable, 4), dtype=np.uint8)
+                bgra[:, :3] = bgr
+                bgra[:, 3] = 0xFF
+                out[:usable * 4] = bgra.tobytes()
 
         # 2. Band layer
         if band_len > 0:
@@ -899,33 +898,29 @@ class DrdynvcLayer(LayerAutomata):
             remaining -= bmp_len
             if subcodec_id == 0:
                 # RAW BGR
-                for y in range(h):
-                    for x in range(w):
-                        si = (y * w + x) * 3
-                        dy = y_start + y
-                        dx = x_start + x
-                        di = (dy * surfW + dx) * 4
-                        if si + 2 < len(bmp_data) and di + 3 < len(out):
-                            out[di] = bmp_data[si]
-                            out[di + 1] = bmp_data[si + 1]
-                            out[di + 2] = bmp_data[si + 2]
-                            out[di + 3] = 0xFF
+                usable_sc = min(len(bmp_data) // 3, w * h)
+                if usable_sc > 0:
+                    bgr = np.frombuffer(bmp_data[:usable_sc * 3], dtype=np.uint8).reshape(usable_sc, 3)
+                    bgra = np.empty((usable_sc, 4), dtype=np.uint8)
+                    bgra[:, :3] = bgr
+                    bgra[:, 3] = 0xFF
+                    bgra_2d = bgra.reshape(h, w, 4) if usable_sc == w * h else None
+                    if bgra_2d is not None:
+                        for y in range(h):
+                            dy = y_start + y
+                            di = (dy * surfW + x_start) * 4
+                            if di + w * 4 <= len(out):
+                                out[di:di + w * 4] = bgra_2d[y].tobytes()
             elif subcodec_id == 2:
                 # NSCodec (single color fill): 3 bytes BGR
                 if len(bmp_data) >= 3:
-                    b_val = bmp_data[0]
-                    g_val = bmp_data[1]
-                    r_val = bmp_data[2]
+                    pixel = bytes([bmp_data[0], bmp_data[1], bmp_data[2], 0xFF])
+                    row_data = pixel * w
                     for y in range(h):
-                        for x in range(w):
-                            dy = y_start + y
-                            dx = x_start + x
-                            di = (dy * surfW + dx) * 4
-                            if di + 3 < len(out):
-                                out[di] = b_val
-                                out[di + 1] = g_val
-                                out[di + 2] = r_val
-                                out[di + 3] = 0xFF
+                        dy = y_start + y
+                        di = (dy * surfW + x_start) * 4
+                        if di + w * 4 <= len(out):
+                            out[di:di + w * 4] = row_data
 
     def _blitToSurface(self, surfaceId, left, top, width, height, data):
         """Write pixel data (top-down BGRA) into the surface buffer."""
@@ -1073,8 +1068,8 @@ class DrdynvcLayer(LayerAutomata):
             return
         stride = width * (bpp // 8)
         # Flip scanlines from top-down (RDPGFX) to bottom-up (traditional RDP)
-        flipped = b''.join(data[i * stride:(i + 1) * stride]
-                          for i in range(height - 1, -1, -1))
+        arr = np.frombuffer(data[:stride * height], dtype=np.uint8).reshape(height, stride)
+        flipped = np.ascontiguousarray(arr[::-1]).tobytes()
         self._gfxCallback(x, y, x + width - 1, y + height - 1,
                           width, height, bpp, False, flipped)
 

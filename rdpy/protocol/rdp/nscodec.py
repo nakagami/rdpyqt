@@ -41,10 +41,9 @@ def _nrle_decode(data, original_size):
                         in_pos += 4
             if run_len > left:
                 run_len = left
-            for _ in range(run_len):
-                if out_pos < original_size:
-                    output[out_pos] = value
-                    out_pos += 1
+            end = min(out_pos + run_len, original_size)
+            output[out_pos:end] = bytes([value]) * (end - out_pos)
+            out_pos = end
             left -= run_len
         else:
             # Single byte
