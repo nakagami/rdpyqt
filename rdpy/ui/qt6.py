@@ -202,11 +202,36 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
         #set widget screen to RDP stack
         controller.setScreen(width, height)
 
+        # Clipboard integration
+        self._clipboard = QtWidgets.QApplication.clipboard()
+        self._clipboard.dataChanged.connect(self._onLocalClipboardChanged)
+        controller.setClipboardCallbacks(
+            self._onRemoteClipboardText,
+            self._getLocalClipboardText,
+        )
+
     def getWidget(self):
         """
         @return: widget use for render
         """
         return self._widget
+
+    def _onLocalClipboardChanged(self):
+        """Notify the RDP server that local clipboard content changed."""
+        self._controller.onLocalClipboardChanged()
+
+    def _onRemoteClipboardText(self, text):
+        """Update the local clipboard with text received from the RDP server."""
+        mimeData = QtCore.QMimeData()
+        mimeData.setText(text)
+        self._clipboard.setMimeData(mimeData)
+
+    def _getLocalClipboardText(self):
+        """Return current local clipboard text for sending to the RDP server."""
+        mimeData = self._clipboard.mimeData()
+        if mimeData and mimeData.hasText():
+            return mimeData.text()
+        return ""
 
     def sendMouseEvent(self, e, isPressed):
         """

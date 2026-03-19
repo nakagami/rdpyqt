@@ -25,7 +25,7 @@ from rdpy.core import layer
 from rdpy.core.error import CallPureVirtualFuntion, InvalidValue
 from . import pdu
 import rdpy.core.log as log
-from . import tpkt, x224, sec, drdynvc, rdpsnd
+from . import tpkt, x224, sec, drdynvc, rdpsnd, cliprdr
 from .t125 import mcs, gcc
 from .nla import cssp, ntlm
 
@@ -60,6 +60,8 @@ class RDPClientController(pdu.layer.PDUClientListener):
         #audio output virtual channel layer
         self._rdpsndLayer = rdpsnd.RdpsndLayer()
         self._drdynvcLayer.setRdpsndLayer(self._rdpsndLayer)
+        #clipboard virtual channel layer
+        self._cliprdrLayer = cliprdr.CliprdrLayer()
         #PDU layer
         self._pduLayer = pdu.layer.Client(self)
         #secure layer
@@ -68,7 +70,7 @@ class RDPClientController(pdu.layer.PDUClientListener):
         self._mcsLayer = mcs.Client(self._secLayer, [
             (gcc.ChannelDef(b"rdpdr", gcc.ChannelOptions.CHANNEL_OPTION_INITIALIZED | gcc.ChannelOptions.CHANNEL_OPTION_ENCRYPT_RDP | gcc.ChannelOptions.CHANNEL_OPTION_COMPRESS_RDP), _StubVChannel()),
             (gcc.ChannelDef(b"rdpsnd", gcc.ChannelOptions.CHANNEL_OPTION_INITIALIZED | gcc.ChannelOptions.CHANNEL_OPTION_ENCRYPT_RDP), self._rdpsndLayer),
-            (gcc.ChannelDef(b"cliprdr", gcc.ChannelOptions.CHANNEL_OPTION_INITIALIZED | gcc.ChannelOptions.CHANNEL_OPTION_ENCRYPT_RDP | gcc.ChannelOptions.CHANNEL_OPTION_COMPRESS_RDP), _StubVChannel()),
+            (gcc.ChannelDef(b"cliprdr", gcc.ChannelOptions.CHANNEL_OPTION_INITIALIZED | gcc.ChannelOptions.CHANNEL_OPTION_ENCRYPT_RDP | gcc.ChannelOptions.CHANNEL_OPTION_COMPRESS_RDP), self._cliprdrLayer),
             (gcc.ChannelDef(b"drdynvc", gcc.ChannelOptions.CHANNEL_OPTION_INITIALIZED | gcc.ChannelOptions.CHANNEL_OPTION_ENCRYPT_RDP), self._drdynvcLayer),
         ])
         #transport pdu layer
@@ -86,6 +88,21 @@ class RDPClientController(pdu.layer.PDUClientListener):
         #routing token for server redirection
         self._redirectRoutingToken = None
         
+    def setClipboardCallbacks(self, onRemoteChanged, getLocalText):
+        """
+        @summary: Wire up clipboard callbacks between UI and CLIPRDR layer
+        @param onRemoteChanged: callback(text: str) when server clipboard changes
+        @param getLocalText: callback() -> str returning current local clipboard text
+        """
+        self._cliprdrLayer.setRemoteClipboardCallback(onRemoteChanged)
+        self._cliprdrLayer.setLocalClipboardGetter(getLocalText)
+
+    def onLocalClipboardChanged(self):
+        """
+        @summary: Notify the server that the local clipboard has changed
+        """
+        self._cliprdrLayer.onLocalClipboardChanged()
+
     def getProtocol(self):
         """
         @return: return Protocol layer for twisted
