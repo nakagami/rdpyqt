@@ -204,6 +204,7 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
 
         # Clipboard integration
         self._clipboard = QtWidgets.QApplication.clipboard()
+        self._clipboardConnected = True
         self._clipboard.dataChanged.connect(self._onLocalClipboardChanged)
         controller.setClipboardCallbacks(
             self._onRemoteClipboardText,
@@ -216,12 +217,23 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
         """
         return self._widget
 
+    def disconnectClipboard(self):
+        """Disconnect QClipboard signal to prevent stale sends after reconnection."""
+        if self._clipboardConnected:
+            try:
+                self._clipboard.dataChanged.disconnect(self._onLocalClipboardChanged)
+            except TypeError:
+                pass
+            self._clipboardConnected = False
+
     def _onLocalClipboardChanged(self):
         """Notify the RDP server that local clipboard content changed."""
+        log.info("CLIPRDR DEBUG [Qt]: _onLocalClipboardChanged() fired")
         self._controller.onLocalClipboardChanged()
 
     def _onRemoteClipboardText(self, text):
         """Update the local clipboard with text received from the RDP server."""
+        log.info("CLIPRDR DEBUG [Qt]: _onRemoteClipboardText() len=%d" % len(text))
         mimeData = QtCore.QMimeData()
         mimeData.setText(text)
         self._clipboard.setMimeData(mimeData)
@@ -229,9 +241,11 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
     def _getLocalClipboardText(self):
         """Return current local clipboard text for sending to the RDP server."""
         mimeData = self._clipboard.mimeData()
+        text = ""
         if mimeData and mimeData.hasText():
-            return mimeData.text()
-        return ""
+            text = mimeData.text()
+        log.info("CLIPRDR DEBUG [Qt]: _getLocalClipboardText() -> %d chars" % len(text))
+        return text
 
     def sendMouseEvent(self, e, isPressed):
         """

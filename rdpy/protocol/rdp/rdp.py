@@ -70,7 +70,7 @@ class RDPClientController(pdu.layer.PDUClientListener):
         self._mcsLayer = mcs.Client(self._secLayer, [
             (gcc.ChannelDef(b"rdpdr", gcc.ChannelOptions.CHANNEL_OPTION_INITIALIZED | gcc.ChannelOptions.CHANNEL_OPTION_ENCRYPT_RDP | gcc.ChannelOptions.CHANNEL_OPTION_COMPRESS_RDP), _StubVChannel()),
             (gcc.ChannelDef(b"rdpsnd", gcc.ChannelOptions.CHANNEL_OPTION_INITIALIZED | gcc.ChannelOptions.CHANNEL_OPTION_ENCRYPT_RDP), self._rdpsndLayer),
-            (gcc.ChannelDef(b"cliprdr", gcc.ChannelOptions.CHANNEL_OPTION_INITIALIZED | gcc.ChannelOptions.CHANNEL_OPTION_ENCRYPT_RDP | gcc.ChannelOptions.CHANNEL_OPTION_COMPRESS_RDP), self._cliprdrLayer),
+            (gcc.ChannelDef(b"cliprdr", gcc.ChannelOptions.CHANNEL_OPTION_INITIALIZED | gcc.ChannelOptions.CHANNEL_OPTION_ENCRYPT_RDP | gcc.ChannelOptions.CHANNEL_OPTION_COMPRESS_RDP | gcc.ChannelOptions.CHANNEL_OPTION_SHOW_PROTOCOL), self._cliprdrLayer),
             (gcc.ChannelDef(b"drdynvc", gcc.ChannelOptions.CHANNEL_OPTION_INITIALIZED | gcc.ChannelOptions.CHANNEL_OPTION_ENCRYPT_RDP), self._drdynvcLayer),
         ])
         #transport pdu layer

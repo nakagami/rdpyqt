@@ -126,6 +126,10 @@ class RDPClientQtFactory(rdp.ClientFactory):
         @param addr: destination address
         @return: RDPClientQt
         """
+        # Disconnect old clipboard signal before creating new observer
+        if hasattr(self, '_client') and self._client is not None:
+            self._client.disconnectClipboard()
+
         if self._w is not None:
             self._client = RDPClientQt(controller, self._width, self._height, self._swap_alt_meta, widget=self._w)
         else:
