@@ -30,6 +30,7 @@ from rdpy.core.layer import LayerAutomata
 import rdpy.core.log as log
 from rdpy.protocol.rdp.rfx_progressive import RfxProgressiveDecoder
 from rdpy.protocol.rdp.zgfx import ZgfxDecompressor
+from rdpy.protocol.rdp import avc as avc_module
 
 
 RDPGFX_CHANNEL_NAME = "Microsoft::Windows::RDS::Graphics"
@@ -147,6 +148,8 @@ class DrdynvcLayer(LayerAutomata):
         self._rfxDecoder = RfxProgressiveDecoder()
         # ZGFX decompressor (stateful, persistent history across segments)
         self._zgfx = ZgfxDecompressor()
+        # H.264/AVC decoder (lazy init)
+        self._avcDecoder = None
         # Bitmap cache: cacheSlot -> (width, height, bytearray BGRA data)
         self._gfxCache = {}
         # ClearCodec VBAR caches (persistent across decode calls, matching grdp)
@@ -621,6 +624,10 @@ class DrdynvcLayer(LayerAutomata):
                                    pixelFormat, bitmapData)
         elif codecId == RDPGFX_CODECID_ALPHA:
             log.debug("RDPGFX: Alpha codec not yet supported, %d bytes" % len(bitmapData))
+        elif codecId == RDPGFX_CODECID_AVC420:
+            self._renderAvc420(surfaceId, left, top, width, height, bitmapData)
+        elif codecId in (RDPGFX_CODECID_AVC444, RDPGFX_CODECID_AVC444v2):
+            self._renderAvc444(surfaceId, left, top, width, height, bitmapData)
         else:
             log.debug("RDPGFX: unsupported codec 0x%04x, %d bytes" % (codecId, len(bitmapData)))
 
@@ -650,6 +657,20 @@ class DrdynvcLayer(LayerAutomata):
                 self._deliverSurfaceBitmap(surfaceId, rects)
             except Exception as e:
                 log.warning("RDPGFX: Progressive decode error: %s" % str(e))
+        elif codecId == RDPGFX_CODECID_AVC420:
+            surfInfo = self._surfaces.get(surfaceId)
+            if surfInfo is None:
+                log.warning("RDPGFX: WTS2 unknown surface %d" % surfaceId)
+                return
+            w, h, _ = surfInfo
+            self._renderAvc420(surfaceId, 0, 0, w, h, bitmapData)
+        elif codecId in (RDPGFX_CODECID_AVC444, RDPGFX_CODECID_AVC444v2):
+            surfInfo = self._surfaces.get(surfaceId)
+            if surfInfo is None:
+                log.warning("RDPGFX: WTS2 unknown surface %d" % surfaceId)
+                return
+            w, h, _ = surfInfo
+            self._renderAvc444(surfaceId, 0, 0, w, h, bitmapData)
         else:
             log.debug("RDPGFX: WTS2 unsupported codec 0x%04x" % codecId)
 
@@ -693,6 +714,49 @@ class DrdynvcLayer(LayerAutomata):
             self._blitToSurface(surfaceId, left, top, w, h, bitmapData)
             ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
             self._deliverBitmap(ox + left, oy + top, w, h, 32, bitmapData)
+
+    def _getAvcDecoder(self):
+        """Lazy-initialize and return the H.264/AVC decoder."""
+        if self._avcDecoder is None:
+            if not avc_module.is_available():
+                log.warning("RDPGFX: AVC codec received but PyAV not available")
+                return None
+            try:
+                self._avcDecoder = avc_module.AvcDecoder()
+                log.info("RDPGFX: AVC decoder initialized (hardware=%s)" %
+                         self._avcDecoder.is_hardware)
+            except Exception as e:
+                log.warning("RDPGFX: failed to initialize AVC decoder: %s" % e)
+                return None
+        return self._avcDecoder
+
+    def _renderAvc420(self, surfaceId, left, top, width, height, data):
+        """Decode and render AVC420 (H.264 YUV420) bitmap data."""
+        decoder = self._getAvcDecoder()
+        if decoder is None:
+            return
+        try:
+            regions = decoder.decode_avc420(data, width, height)
+            for (rx, ry, rw, rh, bgra_bytes) in regions:
+                self._blitToSurface(surfaceId, left + rx, top + ry, rw, rh, bgra_bytes)
+                ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
+                self._deliverBitmap(ox + left + rx, oy + top + ry, rw, rh, 32, bgra_bytes)
+        except Exception as e:
+            log.warning("RDPGFX: AVC420 decode error: %s" % e)
+
+    def _renderAvc444(self, surfaceId, left, top, width, height, data):
+        """Decode and render AVC444/AVC444v2 (H.264 YUV444) bitmap data."""
+        decoder = self._getAvcDecoder()
+        if decoder is None:
+            return
+        try:
+            regions = decoder.decode_avc444(data, width, height)
+            for (rx, ry, rw, rh, bgra_bytes) in regions:
+                self._blitToSurface(surfaceId, left + rx, top + ry, rw, rh, bgra_bytes)
+                ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
+                self._deliverBitmap(ox + left + rx, oy + top + ry, rw, rh, 32, bgra_bytes)
+        except Exception as e:
+            log.warning("RDPGFX: AVC444 decode error: %s" % e)
 
     def _renderUncompressed(self, surfaceId, left, top, width, height, pixelFormat, data):
         """Render uncompressed XRGB_8888/ARGB_8888 bitmap data."""
@@ -1094,14 +1158,19 @@ class DrdynvcLayer(LayerAutomata):
 
     def _sendRdpgfxCapsAdvertise(self, channelId, cbId):
         """Send RDPGFX CAPS_ADVERTISE PDU (MS-RDPEGFX 2.2.3)
-        Advertise v8.0 only, matching the grdp reference implementation.
-        The server will use FastPath Surface Commands with NSCodec instead
-        of the complex RDPGFX DVC pipeline."""
+        Advertise v10.4 with AVC enabled (if PyAV available), and v8.0 as fallback.
+        Note: v10+ caps must NOT set THINCLIENT/SMALL_CACHE flags (MS-RDPEGFX 2.2.3.2)."""
+        capsSets = []
+
+        if avc_module.is_available():
+            # v10.4: AVC enabled, no thin-client flags per spec
+            capsFlags104 = 0
+            capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_104, 4, capsFlags104))
+
+        # v8.0 fallback: AVC disabled, thin-client flags OK for v8
         capsFlags8 = (RDPGFX_CAPS_FLAG_THINCLIENT |
                       RDPGFX_CAPS_FLAG_SMALL_CACHE |
                       RDPGFX_CAPS_FLAG_AVC_DISABLED)
-
-        capsSets = []
         capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_8, 4, capsFlags8))
 
         capsPayload = struct.pack('<H', len(capsSets))
@@ -1113,7 +1182,10 @@ class DrdynvcLayer(LayerAutomata):
         gfxPdu += capsPayload
 
         self._sendDvcData(channelId, cbId, gfxPdu)
-        log.info("RDPGFX: sent CAPS_ADVERTISE (v8.0, THINCLIENT|SMALLCACHE|AVC_DISABLED)")
+        if avc_module.is_available():
+            log.info("RDPGFX: sent CAPS_ADVERTISE (v10.4 AVC_ENABLED + v8.0 fallback)")
+        else:
+            log.info("RDPGFX: sent CAPS_ADVERTISE (v8.0, THINCLIENT|SMALLCACHE|AVC_DISABLED)")
 
     # ---------------------------------------------------------------
     # DVC transport
