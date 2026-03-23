@@ -361,10 +361,8 @@ def _decode_component_store(data, quant):
 # YCbCr → BGRA color conversion and tile placement
 # ---------------------------------------------------------------
 
-def _place_tile(y_coeffs, cb_coeffs, cr_coeffs, x_idx, y_idx, output, out_w, out_h):
-    """Convert YCbCr tile to BGRA and write into output buffer."""
-    tile_x = x_idx * RFX_TILE_SIZE
-    tile_y = y_idx * RFX_TILE_SIZE
+def _place_tile_abs(y_coeffs, cb_coeffs, cr_coeffs, tile_x, tile_y, output, out_w, out_h):
+    """Convert YCbCr tile to BGRA at absolute pixel coordinates (tile_x, tile_y)."""
     tile_w = min(RFX_TILE_SIZE, out_w - tile_x)
     tile_h = min(RFX_TILE_SIZE, out_h - tile_y)
     if tile_w <= 0 or tile_h <= 0:
@@ -404,6 +402,13 @@ def _place_tile(y_coeffs, cb_coeffs, cr_coeffs, x_idx, y_idx, output, out_w, out
         out_start = ((tile_y + row) * out_w + tile_x) * 4
         if out_start + stride <= len(output):
             output[out_start:out_start + stride] = bgra_bytes[row * stride:(row + 1) * stride]
+
+
+def _place_tile(y_coeffs, cb_coeffs, cr_coeffs, x_idx, y_idx, output, out_w, out_h):
+    """Convert YCbCr tile to BGRA using tile grid indices."""
+    _place_tile_abs(y_coeffs, cb_coeffs, cr_coeffs,
+                    x_idx * RFX_TILE_SIZE, y_idx * RFX_TILE_SIZE,
+                    output, out_w, out_h)
 
 
 # ---------------------------------------------------------------
