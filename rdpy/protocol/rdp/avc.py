@@ -120,38 +120,17 @@ class AvcDecoder:
     def decode_avc420(self, data, dest_width, dest_height):
         """Decode AVC420 bitmap stream.
 
-        Returns list of (left, top, width, height, bgra_bytes) tuples,
-        one per region rectangle.
+        Returns BGRA bytes (dest_width * dest_height * 4) or None.
         """
-        regions, h264_data = self._parse_avc420_stream(data)
+        _regions, h264_data = self._parse_avc420_stream(data)
         if h264_data is None or len(h264_data) == 0:
-            return []
+            return None
 
         frame = self._decode_h264(h264_data)
         if frame is None:
-            return []
+            return None
 
-        # Convert full frame to BGRA
-        bgra = self._frame_to_bgra(frame)
-        frame_h, frame_w = bgra.shape[:2]
-
-        results = []
-        for (left, top, right, bottom, _qp, _qualityMode) in regions:
-            rw = right - left
-            rh = bottom - top
-            if rw <= 0 or rh <= 0:
-                continue
-            # Clamp to frame boundaries
-            r = min(right, frame_w)
-            b = min(bottom, frame_h)
-            rw = r - left
-            rh = b - top
-            if rw <= 0 or rh <= 0:
-                continue
-            region_bgra = np.ascontiguousarray(bgra[top:b, left:r]).tobytes()
-            results.append((left, top, rw, rh, region_bgra))
-
-        return results
+        return self._frame_to_bgra_bytes(frame, dest_width, dest_height)
 
     def _parse_avc420_stream(self, data):
         """Parse AVC420 bitmap stream per MS-RDPEGFX 2.2.4.4.
@@ -206,67 +185,68 @@ class AvcDecoder:
     def decode_avc444(self, data, dest_width, dest_height):
         """Decode AVC444/AVC444v2 bitmap stream.
 
-        The wire format has:
-          cbAvc420EncodedBitstream1(4) - top 2 bits are LC field
-          avc420EncodedBitstream1 (cbAvc420... & 0x3FFFFFFF bytes)
-          avc420EncodedBitstream2 (remaining, optional)
-
         LC values:
           0 = both luma (YUV420) and chroma streams present
           1 = luma stream only
-          2 = chroma stream only
+          2 = chroma stream only (skipped)
 
-        Returns list of (left, top, width, height, bgra_bytes) tuples.
+        Returns BGRA bytes (dest_width * dest_height * 4) or None.
         """
         if len(data) < 4:
-            return []
+            return None
 
         cbField = struct.unpack_from('<I', data, 0)[0]
         lc = (cbField >> 30) & 0x03
         cbAvc420Stream1 = cbField & 0x3FFFFFFF
-        off = 4
+        rest = data[4:]
 
-        stream1 = data[off:off + cbAvc420Stream1] if cbAvc420Stream1 > 0 else b''
-        off += cbAvc420Stream1
-        stream2 = data[off:] if off < len(data) else b''
-
-        log.debug("AVC444: LC=%d stream1=%d bytes stream2=%d bytes" %
-                  (lc, len(stream1), len(stream2)))
+        log.debug("AVC444: LC=%d cbStream1=%d restLen=%d" %
+                  (lc, cbAvc420Stream1, len(rest)))
 
         if lc == 0:
-            # Both luma and chroma: decode luma (main picture)
-            return self.decode_avc420(stream1, dest_width, dest_height)
+            if cbAvc420Stream1 > len(rest):
+                log.warning("AVC444: stream1 size %d exceeds data %d" %
+                            (cbAvc420Stream1, len(rest)))
+                return None
+            return self.decode_avc420(rest[:cbAvc420Stream1], dest_width, dest_height)
         elif lc == 1:
-            # Luma only
-            return self.decode_avc420(stream1, dest_width, dest_height)
+            # Main stream only; use cbAvc420Stream1 if valid, otherwise all of rest
+            stream_data = rest
+            if cbAvc420Stream1 > 0 and cbAvc420Stream1 <= len(rest):
+                stream_data = rest[:cbAvc420Stream1]
+            return self.decode_avc420(stream_data, dest_width, dest_height)
         elif lc == 2:
-            # Chroma only (refinement); decode as standalone
-            if len(stream2) > 0:
-                return self.decode_avc420(stream2, dest_width, dest_height)
-            return []
+            # Chroma-only refinement stream — skip
+            log.debug("AVC444: LC=2 chroma-only, skipping")
+            return None
         else:
             log.warning("AVC444: unexpected LC value %d" % lc)
-            return []
+            return None
 
     # -----------------------------------------------------------------
     # H.264 decoding core
     # -----------------------------------------------------------------
 
     def _decode_h264(self, h264_data):
-        """Decode H.264 bitstream and return the decoded frame (av.VideoFrame) or None."""
+        """Decode H.264 bitstream and return the decoded frame (av.VideoFrame) or None.
+
+        The decoder may buffer frames internally (B-frame reordering etc.),
+        so a single send_packet can produce multiple frames.  We drain them
+        all and return the *last* (most recent) frame — matching grdp's
+        ffmpegDecoder.Decode behaviour.
+        """
         if self._ctx is None:
             return None
 
         try:
             packet = av.Packet(h264_data)
-            frames = self._ctx.decode(packet)
-            for frame in frames:
+            result = None
+            for frame in self._ctx.decode(packet):
                 # If hardware decoded, transfer to system memory
                 if frame.format.name in ('videotoolbox_vld', 'vaapi', 'cuda', 'dxva2_vld', 'd3d11'):
-                    frame = frame.to_ndarray()
-                    # Already numpy, handle below
-                    return frame
-                return frame
+                    frame = frame.to_cpu()
+                result = frame
+            return result
         except av.error.InvalidDataError as e:
             log.debug("AVC: H.264 decode error (invalid data): %s" % e)
         except Exception as e:
@@ -279,27 +259,26 @@ class AvcDecoder:
 
         return None
 
-    def _frame_to_bgra(self, frame):
-        """Convert av.VideoFrame or numpy array to BGRA numpy array (H, W, 4)."""
-        if isinstance(frame, np.ndarray):
-            # Already a numpy array from hardware decoder transfer
-            # Assume YUV420p layout; use av to convert properly
-            h, w = frame.shape[:2]
-            bgra = np.empty((h, w, 4), dtype=np.uint8)
-            bgra[:, :, 0] = frame[:, :, 0] if frame.ndim == 3 else frame
-            bgra[:, :, 1] = bgra[:, :, 0]
-            bgra[:, :, 2] = bgra[:, :, 0]
-            bgra[:, :, 3] = 0xFF
-            return bgra
+    def _frame_to_bgra_bytes(self, frame, dest_width, dest_height):
+        """Convert av.VideoFrame to BGRA bytes cropped/padded to dest_width x dest_height.
 
-        # av.VideoFrame -> convert to BGR24 then add alpha
-        bgr_frame = frame.reformat(format='bgr24')
-        bgr = bgr_frame.to_ndarray()
-        h, w = bgr.shape[:2]
-        bgra = np.empty((h, w, 4), dtype=np.uint8)
-        bgra[:, :, :3] = bgr
-        bgra[:, :, 3] = 0xFF
-        return bgra
+        Matches grdp's convertFrame + cropBGRA: convert directly to BGRA via
+        sws_scale (PyAV reformat), then crop/pad to destination dimensions.
+        """
+        bgra_frame = frame.reformat(format='bgra')
+        bgra = bgra_frame.to_ndarray()  # shape (H, W, 4), BGRA order
+        src_h, src_w = bgra.shape[:2]
+
+        if src_w == dest_width and src_h == dest_height:
+            return bgra.tobytes()
+
+        copy_w = min(src_w, dest_width)
+        copy_h = min(src_h, dest_height)
+
+        out = np.zeros((dest_height, dest_width, 4), dtype=np.uint8)
+        out[:copy_h, :copy_w] = bgra[:copy_h, :copy_w]
+
+        return out.tobytes()
 
 
 def is_available():
