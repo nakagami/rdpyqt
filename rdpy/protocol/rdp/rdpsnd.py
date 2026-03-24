@@ -276,6 +276,11 @@ class RdpsndLayer(LayerAutomata):
         log.info("RDPSND: sent Client Formats version=%d numFormats=%d" %
                  (version, len(self._clientFormatIndices)))
 
+        # FreeRDP sends Quality Mode PDU right after Client Formats
+        # when server version >= 6 (CHANNEL_VERSION_WIN_7).
+        if version >= RDPSND_VERSION_MAJOR:
+            self._sendQualityMode()
+
     # ---------------------------------------------------------------
     # Training (MS-RDPEA 2.2.2.3)
     # ---------------------------------------------------------------
@@ -397,6 +402,19 @@ class RdpsndLayer(LayerAutomata):
         self._stopAudio()
 
     # ---------------------------------------------------------------
+    # Quality Mode (MS-RDPEA 2.2.2.13)
+    # ---------------------------------------------------------------
+
+    def _sendQualityMode(self):
+        """Send Quality Mode PDU (MS-RDPEA 2.2.2.13).
+        FreeRDP sends this after Client Formats when version >= 6.
+        DYNAMIC_QUALITY lets the server choose the best mode."""
+        body = struct.pack('<HH', DYNAMIC_QUALITY, 0)  # wQualityMode + Reserved
+        pdu = struct.pack('<BBH', SNDC_QUALITYMODE, 0, len(body)) + body
+        self._send(pdu)
+        log.info("RDPSND: sent Quality Mode (DYNAMIC)")
+
+    # ---------------------------------------------------------------
     # Audio playback via QAudioSink
     # ---------------------------------------------------------------
 
@@ -433,15 +451,24 @@ class RdpsndLayer(LayerAutomata):
             return
 
         self._audioSink = QAudioSink(device, audioFmt)
-        self._audioSink.setBufferSize(fmt.avg_bytes_per_sec)  # ~1 second buffer
+        # 2-second buffer to reduce underruns
+        self._audioSink.setBufferSize(fmt.avg_bytes_per_sec * 2)
         self._audioIO = self._audioSink.start()
         self._audioInitialized = True
-        log.info("RDPSND: audio output configured: %s" % fmt)
+        log.info("RDPSND: audio output configured: %s (bufSize=%d)" %
+                 (fmt, fmt.avg_bytes_per_sec * 2))
 
     def _playAudio(self, data):
-        """Write PCM data to the audio output device."""
+        """Write PCM data to the audio output device.
+
+        We write as much data as the sink can accept immediately without
+        blocking.  Blocking with time.sleep() would stall the Twisted
+        reactor and delay RDPGFX frame processing / ACKs, causing both
+        visual stuttering and audio artefacts.  If the sink cannot accept
+        all data we drop the remainder — a brief silence is less
+        objectionable than blocking the entire event loop.
+        """
         if not self._audioInitialized or self._audioIO is None:
-            log.debug("RDPSND: _playAudio skipped (not initialized)")
             return
         try:
             from PyQt6.QtMultimedia import QAudio
@@ -454,7 +481,8 @@ class RdpsndLayer(LayerAutomata):
                     log.warning("RDPSND: failed to restart audio sink")
                     return
             written = self._audioIO.write(data)
-            log.debug("RDPSND: audio write %d/%d bytes" % (written, len(data)))
+            if written < len(data):
+                log.debug("RDPSND: audio wrote %d/%d bytes" % (written, len(data)))
         except Exception as e:
             log.warning("RDPSND: audio write error: %s" % e)
 
@@ -477,10 +505,14 @@ class RdpsndLayer(LayerAutomata):
         """Send data back to server via static VChannel or DVC."""
         if self._dvcSendCallback is not None:
             # DVC path: send raw rdpsnd PDU (no VChannel header)
+            log.debug("RDPSND: _send via DVC callback, len=%d" % len(data))
             self._dvcSendCallback(data)
         elif self._transport is not None:
             # Static VChannel path: wrap with VChannel header
+            log.debug("RDPSND: _send via static VChannel, len=%d" % len(data))
             from rdpy.core.type import String
             flags = CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST
             header = struct.pack('<II', len(data), flags)
             self._transport.send(String(header + data))
+        else:
+            log.warning("RDPSND: _send failed: no transport or DVC callback")
