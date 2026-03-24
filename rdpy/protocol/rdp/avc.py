@@ -50,6 +50,10 @@ _ANNEX_B_START = b'\x00\x00\x00\x01'
 def _try_open_hw_decoder():
     """Try to open a hardware-accelerated H.264 decoder.
     Returns (CodecContext, hw_name) or (None, None).
+
+    Hardware decoders (VideoToolbox on macOS, VAAPI on Linux) do not
+    perform B-frame reorder buffering, so every packet produces
+    immediate output — matching grdp's behaviour.
     """
     hw_configs = []
     if sys.platform == 'darwin':
@@ -60,14 +64,12 @@ def _try_open_hw_decoder():
     codec = av.codec.Codec('h264', 'r')
     for hw_name in hw_configs:
         try:
-            ctx = av.codec.CodecContext.create(codec)
-            for hw_config in ctx.codec.hardware_configs:
-                if hw_config.device_type.name == hw_name:
-                    device = av.codec.HWDeviceContext.create(hw_config.device_type)
-                    ctx.hw_device_ctx = device
-                    ctx.open()
-                    log.info("AVC: opened hardware decoder: %s" % hw_name)
-                    return ctx, hw_name
+            from av.codec.hwaccel import HWAccel
+            accel = HWAccel(hw_name)
+            ctx = av.codec.CodecContext.create(codec, hwaccel=accel)
+            ctx.open()
+            log.info("AVC: opened hardware decoder: %s" % hw_name)
+            return ctx, hw_name
         except Exception as e:
             log.debug("AVC: hardware decoder '%s' unavailable: %s" % (hw_name, e))
 
@@ -77,35 +79,20 @@ def _try_open_hw_decoder():
 def _open_sw_decoder():
     """Open a software H.264 decoder.
 
-    Prefer libopenh264 over FFmpeg's built-in h264 decoder.
-    FFmpeg's h264 decoder buffers frames for B-frame reordering
-    when the SPS indicates B-frame capability, even though RDP
-    streams never contain actual B-frames.  This causes long runs
-    of null output after mid-stream SPS changes (e.g. when the
-    server switches from desktop to video content).
+    Use FFmpeg's built-in h264 decoder with LOW_DELAY and FAST flags.
+    LOW_DELAY minimises frame reordering, and FAST skips some post-
+    processing.  thread_count=1 avoids multi-threaded reorder buffering.
 
-    libopenh264 does not perform reorder buffering, so every
-    packet produces immediate output — matching the behaviour of
-    grdp's direct FFmpeg C API usage.
+    libopenh264 was tried as an alternative (no reorder buffering at
+    all) but it returns AVERROR_UNKNOWN on certain High-profile streams
+    that RDP servers commonly send, making it unsuitable.
     """
-    # Try libopenh264 first (no reorder buffering)
-    try:
-        codec = av.codec.Codec('libopenh264', 'r')
-        ctx = av.codec.CodecContext.create(codec)
-        ctx.thread_count = 1
-        ctx.open()
-        log.info("AVC: using libopenh264 software decoder (thread_count=1)")
-        return ctx
-    except Exception as e:
-        log.debug("AVC: libopenh264 unavailable: %s" % e)
-
-    # Fallback to FFmpeg h264 with LOW_DELAY flags
     codec = av.codec.Codec('h264', 'r')
     ctx = av.codec.CodecContext.create(codec)
     ctx.thread_count = 1
     ctx.options = {'flags': '+low_delay', 'flags2': '+fast'}
     ctx.open()
-    log.info("AVC: using FFmpeg h264 software decoder (thread_count=1, low_delay)")
+    log.info("AVC: using software H.264 decoder (thread_count=1, low_delay)")
     return ctx
 
 
@@ -332,11 +319,13 @@ class AvcDecoder:
         except av.error.InvalidDataError as e:
             log.debug("AVC: H.264 decode error (invalid data): %s" % e)
         except Exception as e:
+            # Log but do NOT recreate the decoder or flush buffers.
+            # The context (SPS/PPS, reference frames) must survive so
+            # subsequent P-frames can still be decoded.  Recreating or
+            # flushing wipes all state, causing every following P-frame
+            # to fail until the next IDR (which may never come).
+            # grdp also keeps the decoder alive after errors.
             log.warning("AVC: H.264 decode error: %s" % e)
-            try:
-                self._init_decoder()
-            except Exception:
-                pass
 
         return None
 
@@ -344,8 +333,6 @@ class AvcDecoder:
         """Send *packet* to the decoder and return the last decoded frame, or None."""
         result = None
         for frame in self._ctx.decode(packet):
-            if frame.format.name in ('videotoolbox_vld', 'vaapi', 'cuda', 'dxva2_vld', 'd3d11'):
-                frame = frame.to_cpu()
             result = frame
         return result
 
