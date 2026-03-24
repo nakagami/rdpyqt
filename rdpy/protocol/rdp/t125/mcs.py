@@ -24,6 +24,7 @@ Each channel have a particular role.
 The main channel is the graphical channel.
 It exist channel for file system order, audio channel, clipboard etc...
 """
+import binascii
 from rdpy.core.layer import LayerAutomata, IStreamSender, Layer
 from rdpy.core.type import sizeof, Stream, UInt8, UInt16Le, String
 from rdpy.core.error import InvalidExpectedDataException, InvalidValue, InvalidSize, CallPureVirtualFuntion
@@ -119,7 +120,6 @@ class MCSLayer(LayerAutomata):
             send function of MCS layer
             @param data: {type.Type | Tuple}
             """
-            log.debug(f"mcs.MCSLayer.MCSProxySender.send({data}) {self._channelId=}")
             self._mcs.send(self._channelId, data)
             
         def close(self):
@@ -473,7 +473,6 @@ class Client(MCSLayer):
         log.debug("Client.sendConnectInitial()")
         ccReqStream = Stream()
         ccReqStream.writeType(ccReq)
-        import binascii
         data = ccReqStream.getvalue()
         log.debug(f"ccReq {binascii.hexlify(data).decode('utf-8')} {len(data)}")
 
