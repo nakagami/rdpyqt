@@ -28,8 +28,63 @@ https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpea/
 """
 
 import struct
+import threading
 from rdpy.core.layer import LayerAutomata
 import rdpy.core.log as log
+
+
+# ---------------------------------------------------------------------------
+# Audio ring buffer (QIODevice subclass for QAudioSink pull mode)
+# ---------------------------------------------------------------------------
+
+class _AudioRingBuffer:
+    """Thread-safe ring buffer that acts as a QIODevice for QAudioSink pull mode.
+
+    Lazily imports PyQt6 so the module can be loaded without Qt installed.
+    """
+
+    _cls = None  # will hold the real QIODevice subclass
+
+    def __new__(cls):
+        if cls._cls is None:
+            from PyQt6.QtCore import QIODevice
+
+            class _Impl(QIODevice):
+                _MAX_BUF = 1 << 20  # 1 MB ≈ 6s PCM 44100/stereo/16-bit
+
+                def __init__(self):
+                    super().__init__()
+                    self._lock = threading.Lock()
+                    self._buf = bytearray()
+
+                def append(self, data):
+                    with self._lock:
+                        self._buf.extend(data)
+                        if len(self._buf) > self._MAX_BUF:
+                            self._buf = self._buf[-self._MAX_BUF:]
+
+                def readData(self, maxSize):
+                    with self._lock:
+                        n = min(maxSize, len(self._buf))
+                        if n > 0:
+                            chunk = bytes(self._buf[:n])
+                            del self._buf[:n]
+                            return chunk
+                    # Return silence when buffer is empty
+                    return bytes(maxSize)
+
+                def writeData(self, data):
+                    return -1  # read-only
+
+                def bytesAvailable(self):
+                    with self._lock:
+                        return len(self._buf) + super().bytesAvailable()
+
+                def isSequential(self):
+                    return True
+
+            cls._cls = _Impl
+        return cls._cls()
 
 # Virtual Channel PDU flags (same as drdynvc.py)
 CHANNEL_FLAG_FIRST = 0x00000001
@@ -145,6 +200,7 @@ class RdpsndLayer(LayerAutomata):
         self._expectingWaveData = False
         # Audio playback
         self._audioSink = None
+        self._audioBuffer = None  # _AudioRingBuffer (pull mode)
         self._audioIO = None
         self._audioInitialized = False
         # DVC send callback (set when audio arrives via DVC)
@@ -415,11 +471,17 @@ class RdpsndLayer(LayerAutomata):
         log.info("RDPSND: sent Quality Mode (DYNAMIC)")
 
     # ---------------------------------------------------------------
-    # Audio playback via QAudioSink
+    # Audio playback via QAudioSink (pull mode)
     # ---------------------------------------------------------------
 
     def _setupAudio(self, fmt):
-        """Configure QAudioSink for the given AudioFormat."""
+        """Configure QAudioSink in pull mode for the given AudioFormat.
+
+        Pull mode lets QAudioSink read data from our buffer at its own
+        pace, decoupling audio playback from the Twisted reactor thread.
+        This prevents clicks/pops caused by reactor stalls (e.g. when
+        the reactor is busy decoding RDPGFX video frames).
+        """
         if not fmt.is_pcm():
             log.warning("RDPSND: non-PCM format, audio playback not supported: %s" % fmt)
             return
@@ -428,6 +490,7 @@ class RdpsndLayer(LayerAutomata):
 
         try:
             from PyQt6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices
+            from PyQt6.QtCore import QIODevice
         except ImportError:
             log.warning("RDPSND: PyQt6.QtMultimedia not available, audio disabled")
             return
@@ -450,41 +513,25 @@ class RdpsndLayer(LayerAutomata):
             log.warning("RDPSND: no audio output device available")
             return
 
+        self._audioBuffer = _AudioRingBuffer()
+        self._audioBuffer.open(QIODevice.OpenModeFlag.ReadOnly)
+
         self._audioSink = QAudioSink(device, audioFmt)
-        # 2-second buffer to reduce underruns
         self._audioSink.setBufferSize(fmt.avg_bytes_per_sec * 2)
-        self._audioIO = self._audioSink.start()
+        self._audioSink.start(self._audioBuffer)
         self._audioInitialized = True
-        log.info("RDPSND: audio output configured: %s (bufSize=%d)" %
-                 (fmt, fmt.avg_bytes_per_sec * 2))
+        log.info("RDPSND: audio output configured (pull mode): %s" % fmt)
 
     def _playAudio(self, data):
-        """Write PCM data to the audio output device.
+        """Append PCM data to the audio ring buffer.
 
-        We write as much data as the sink can accept immediately without
-        blocking.  Blocking with time.sleep() would stall the Twisted
-        reactor and delay RDPGFX frame processing / ACKs, causing both
-        visual stuttering and audio artefacts.  If the sink cannot accept
-        all data we drop the remainder — a brief silence is less
-        objectionable than blocking the entire event loop.
+        QAudioSink reads from the buffer at its own pace (pull mode),
+        so this call never blocks and never drops data unless the buffer
+        overflows (~1 MB, about 6 seconds of audio).
         """
-        if not self._audioInitialized or self._audioIO is None:
+        if not self._audioInitialized or self._audioBuffer is None:
             return
-        try:
-            from PyQt6.QtMultimedia import QAudio
-            state = self._audioSink.state()
-            if state == QAudio.State.StoppedState:
-                error = self._audioSink.error()
-                log.warning("RDPSND: audio sink stopped, error=%s, restarting" % error)
-                self._audioIO = self._audioSink.start()
-                if self._audioIO is None:
-                    log.warning("RDPSND: failed to restart audio sink")
-                    return
-            written = self._audioIO.write(data)
-            if written < len(data):
-                log.debug("RDPSND: audio wrote %d/%d bytes" % (written, len(data)))
-        except Exception as e:
-            log.warning("RDPSND: audio write error: %s" % e)
+        self._audioBuffer.append(data)
 
     def _stopAudio(self):
         """Stop and clean up audio output."""
@@ -494,8 +541,14 @@ class RdpsndLayer(LayerAutomata):
             except Exception:
                 pass
             self._audioSink = None
-            self._audioIO = None
-            self._audioInitialized = False
+        if hasattr(self, '_audioBuffer') and self._audioBuffer is not None:
+            try:
+                self._audioBuffer.close()
+            except Exception:
+                pass
+            self._audioBuffer = None
+        self._audioIO = None
+        self._audioInitialized = False
 
     # ---------------------------------------------------------------
     # Send helper
