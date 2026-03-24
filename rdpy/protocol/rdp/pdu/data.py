@@ -405,6 +405,7 @@ class ErrorInfo(object):
      ERRINFO_CACHECAPNOTSET : "The client sent a Persistent Key List PDU (section 2.2.1.17) without including the prerequisite Revision 2 Bitmap Cache Capability Set (section 2.2.7.1.4.2) in the Confirm Active PDU (section 2.2.1.13.2).",
      ERRINFO_BITMAPCACHEERRORPDUBADLENGTH2 : "The NumInfoBlocks field in the Bitmap Cache Error PDU Data is inconsistent with the amount of data in the Info field ([MS-RDPEGDI] section 2.2.2.3.1.1).",
      ERRINFO_OFFSCRCACHEERRORPDUBADLENGTH : "There is not enough data to process an Offscreen Bitmap Cache Error PDU ([MS-RDPEGDI] section 2.2.2.3.2).",
+     ERRINFO_DNGCACHEERRORPDUBADLENGTH : "There is not enough data to process a DrawNineGrid Cache Error PDU ([MS-RDPEGDI] section 2.2.2.3.3).",
      ERRINFO_GDIPLUSPDUBADLENGTH : "There is not enough data to process a GDI+ Error PDU ([MS-RDPEGDI] section 2.2.2.3.4).",
      ERRINFO_SECURITYDATATOOSHORT2 : "There is not enough data to read a Basic Security Header (section 2.2.8.1.1.2.1).",
      ERRINFO_SECURITYDATATOOSHORT3 : "There is not enough data to read a Non-FIPS Security Header (section 2.2.8.1.1.2.2) or FIPS Security Header (section 2.2.8.1.1.2.3).",
@@ -431,6 +432,19 @@ class ErrorInfo(object):
      ERRINFO_BADMONITORDATA : "The monitorCount field in the Client Monitor Data (section 2.2.1.3.6) is invalid.",
      ERRINFO_VCDECOMPRESSEDREASSEMBLEFAILED : "The server-side decompression buffer is invalid, or the size of the decompressed VC data exceeds the chunking size specified in the Virtual Channel Capability Set (section 2.2.7.1.10).",
      ERRINFO_VCDATATOOLONG : "The size of a received Virtual Channel PDU (section 2.2.6.1) exceeds the chunking size specified in the Virtual Channel Capability Set (section 2.2.7.1.10).",
+     ERRINFO_BAD_FRAME_ACK_DATA : "The graphics frame acknowledgment data is invalid.",
+     ERRINFO_GRAPHICSMODENOTSUPPORTED : "The graphics mode requested by the client is not supported by the server.",
+     ERRINFO_GRAPHICSSUBSYSTEMRESETFAILED : "The server-side graphics subsystem failed to reset.",
+     ERRINFO_GRAPHICSSUBSYSTEMFAILED : "The server-side graphics subsystem failed.",
+     ERRINFO_TIMEZONEKEYNAMELENGTHTOOSHORT : "The timezone key name length sent by the client is too short.",
+     ERRINFO_TIMEZONEKEYNAMELENGTHTOOLONG : "The timezone key name length sent by the client is too long.",
+     ERRINFO_DYNAMICDSTDISABLEDFIELDMISSING : "The dynamic DST disabled field is missing from the Extended Info Packet.",
+     ERRINFO_VCDECODINGERROR : "An error occurred while decoding a Virtual Channel PDU.",
+     ERRINFO_UPDATESESSIONKEYFAILED : "An error was encountered while updating the session keys.",
+     ERRINFO_DECRYPTFAILED : "A decryption error occurred.",
+     ERRINFO_ENCRYPTFAILED : "An encryption error occurred.",
+     ERRINFO_ENCPKGMISMATCH : "The encryption package in use does not match the one negotiated.",
+     ERRINFO_DECRYPTFAILED2 : "A decryption error occurred (type 2).",
     }
     
 class ShareControlHeader(CompositeType):
