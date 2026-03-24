@@ -257,6 +257,20 @@ class DrdynvcLayer(LayerAutomata):
             return
         version = struct.unpack_from('<H', data, 2)[0]
         log.debug("DrdynvcLayer: server DRDYNVC version=%d" % version)
+
+        # Clear all DVC state from previous connection (reconnection case)
+        if self._dynamicChannels:
+            log.info("DrdynvcLayer: clearing stale DVC state (%d channels)" % len(self._dynamicChannels))
+        self._dynamicChannels.clear()
+        self._channelCbId.clear()
+        self._dvcReassembly.clear()
+        self._gfxChannelId = None
+        self._gfxConfirmed = False
+        self._rdpsndDvcChannelIds.clear()
+        self._rdpsndDvcPrimaryId = None
+        # Reset ZGFX decompressor (history is connection-scoped)
+        self._zgfx = ZgfxDecompressor()
+
         # Accept up to version 3 (Soft-Sync)
         self._version = min(version, 3)
 
