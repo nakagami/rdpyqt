@@ -50,6 +50,10 @@ _ANNEX_B_START = b'\x00\x00\x00\x01'
 def _try_open_hw_decoder():
     """Try to open a hardware-accelerated H.264 decoder.
     Returns (CodecContext, hw_name) or (None, None).
+
+    Hardware decoders (VideoToolbox on macOS, VAAPI on Linux) do not
+    perform B-frame reorder buffering, so every packet produces
+    immediate output — matching grdp's behaviour.
     """
     hw_configs = []
     if sys.platform == 'darwin':
@@ -60,14 +64,12 @@ def _try_open_hw_decoder():
     codec = av.codec.Codec('h264', 'r')
     for hw_name in hw_configs:
         try:
-            ctx = av.codec.CodecContext.create(codec)
-            for hw_config in ctx.codec.hardware_configs:
-                if hw_config.device_type.name == hw_name:
-                    device = av.codec.HWDeviceContext.create(hw_config.device_type)
-                    ctx.hw_device_ctx = device
-                    ctx.open()
-                    log.info("AVC: opened hardware decoder: %s" % hw_name)
-                    return ctx, hw_name
+            from av.codec.hwaccel import HWAccel
+            accel = HWAccel(hw_name)
+            ctx = av.codec.CodecContext.create(codec, hwaccel=accel)
+            ctx.open()
+            log.info("AVC: opened hardware decoder: %s" % hw_name)
+            return ctx, hw_name
         except Exception as e:
             log.debug("AVC: hardware decoder '%s' unavailable: %s" % (hw_name, e))
 
@@ -75,11 +77,22 @@ def _try_open_hw_decoder():
 
 
 def _open_sw_decoder():
-    """Open a software H.264 decoder."""
+    """Open a software H.264 decoder.
+
+    Use FFmpeg's built-in h264 decoder with LOW_DELAY and FAST flags.
+    LOW_DELAY minimises frame reordering, and FAST skips some post-
+    processing.  thread_count=1 avoids multi-threaded reorder buffering.
+
+    libopenh264 was tried as an alternative (no reorder buffering at
+    all) but it returns AVERROR_UNKNOWN on certain High-profile streams
+    that RDP servers commonly send, making it unsuitable.
+    """
     codec = av.codec.Codec('h264', 'r')
     ctx = av.codec.CodecContext.create(codec)
+    ctx.thread_count = 1
+    ctx.options = {'flags': '+low_delay', 'flags2': '+fast'}
     ctx.open()
-    log.info("AVC: using software H.264 decoder")
+    log.info("AVC: using software H.264 decoder (thread_count=1, low_delay)")
     return ctx
 
 
@@ -92,10 +105,14 @@ class AvcDecoder:
 
         self._ctx = None
         self._hw_name = None
+        self._decode_count = 0
+        self._null_count = 0
         self._init_decoder()
 
     def _init_decoder(self):
         """Initialize H.264 decoder, trying hardware first."""
+        self._decode_count = 0
+        self._null_count = 0
         ctx, hw_name = _try_open_hw_decoder()
         if ctx is not None:
             self._ctx = ctx
@@ -110,7 +127,6 @@ class AvcDecoder:
 
     def close(self):
         if self._ctx is not None:
-            self._ctx.close()
             self._ctx = None
 
     # -----------------------------------------------------------------
@@ -227,6 +243,25 @@ class AvcDecoder:
     # H.264 decoding core
     # -----------------------------------------------------------------
 
+    _NAL_NAMES = {1: 'P', 5: 'IDR', 6: 'SEI', 7: 'SPS', 8: 'PPS', 9: 'AUD'}
+
+    @staticmethod
+    def _parse_nal_types(h264_data):
+        """Extract NAL unit type numbers from an Annex-B bitstream."""
+        nal_types = []
+        i = 0
+        end = len(h264_data) - 4
+        while i < end:
+            if h264_data[i:i+3] == b'\x00\x00\x01':
+                nal_types.append(h264_data[i+3] & 0x1F)
+                i += 4
+            elif h264_data[i:i+4] == b'\x00\x00\x00\x01':
+                nal_types.append(h264_data[i+4] & 0x1F)
+                i += 5
+            else:
+                i += 1
+        return nal_types
+
     def _decode_h264(self, h264_data):
         """Decode H.264 bitstream and return the decoded frame (av.VideoFrame) or None.
 
@@ -234,30 +269,72 @@ class AvcDecoder:
         so a single send_packet can produce multiple frames.  We drain them
         all and return the *last* (most recent) frame — matching grdp's
         ffmpegDecoder.Decode behaviour.
+
+        When the decoder returns no frame for a packet that contains an IDR
+        slice (NAL type 5), we flush the decoder's internal buffers and
+        retry.  This handles the case where a new SPS triggers internal
+        reinitialization that causes the decoder to buffer the IDR instead
+        of outputting it immediately — even with LOW_DELAY set.  Flushing
+        discards reference frames, but IDR slices are self-contained so the
+        retry always succeeds.
         """
         if self._ctx is None:
             return None
 
+        self._decode_count += 1
+
+        nal_types = self._parse_nal_types(h264_data)
+        has_idr = 5 in nal_types
+
+        # Log NAL types for early frames and every IDR
+        if self._decode_count <= 5 or has_idr:
+            names = [self._NAL_NAMES.get(t, str(t)) for t in nal_types]
+            log.info("AVC: decode #%d NAL types: %s (h264Len=%d)" %
+                     (self._decode_count, ','.join(names), len(h264_data)))
+
         try:
             packet = av.Packet(h264_data)
-            result = None
-            for frame in self._ctx.decode(packet):
-                # If hardware decoded, transfer to system memory
-                if frame.format.name in ('videotoolbox_vld', 'vaapi', 'cuda', 'dxva2_vld', 'd3d11'):
-                    frame = frame.to_cpu()
-                result = frame
+            result = self._receive_frame(packet)
+
+            if result is None and has_idr:
+                # New SPS caused the decoder to buffer instead of output.
+                # Flush internal state and retry — IDR is self-contained.
+                log.info("AVC: decode #%d null on IDR, flushing and retrying" %
+                         self._decode_count)
+                self._ctx.flush_buffers()
+                result = self._receive_frame(packet)
+                if result is not None:
+                    log.info("AVC: decode #%d retry OK %dx%d" %
+                             (self._decode_count, result.width, result.height))
+
+            if result is None:
+                self._null_count += 1
+                log.info("AVC: decode #%d returned no frame (null_count=%d, h264Len=%d)" %
+                         (self._decode_count, self._null_count, len(h264_data)))
+            elif self._decode_count <= 3:
+                log.info("AVC: decode #%d OK frame=%dx%d fmt=%s h264Len=%d" %
+                         (self._decode_count, result.width, result.height,
+                          result.format.name, len(h264_data)))
             return result
         except av.error.InvalidDataError as e:
             log.debug("AVC: H.264 decode error (invalid data): %s" % e)
         except Exception as e:
+            # Log but do NOT recreate the decoder or flush buffers.
+            # The context (SPS/PPS, reference frames) must survive so
+            # subsequent P-frames can still be decoded.  Recreating or
+            # flushing wipes all state, causing every following P-frame
+            # to fail until the next IDR (which may never come).
+            # grdp also keeps the decoder alive after errors.
             log.warning("AVC: H.264 decode error: %s" % e)
-            # Try reinitializing decoder on unexpected errors
-            try:
-                self._init_decoder()
-            except Exception:
-                pass
 
         return None
+
+    def _receive_frame(self, packet):
+        """Send *packet* to the decoder and return the last decoded frame, or None."""
+        result = None
+        for frame in self._ctx.decode(packet):
+            result = frame
+        return result
 
     def _frame_to_bgra_bytes(self, frame, dest_width, dest_height):
         """Convert av.VideoFrame to BGRA bytes cropped/padded to dest_width x dest_height.
@@ -269,8 +346,19 @@ class AvcDecoder:
         bgra = bgra_frame.to_ndarray()  # shape (H, W, 4), BGRA order
         src_h, src_w = bgra.shape[:2]
 
+        # Log stride info for first few frames to detect padding issues
+        if self._decode_count <= 3:
+            plane = bgra_frame.planes[0]
+            log.info("AVC: frame_to_bgra #%d src=%dx%d dest=%dx%d linesize=%d expected=%d" %
+                     (self._decode_count, src_w, src_h, dest_width, dest_height,
+                      plane.line_size, dest_width * 4))
+
         if src_w == dest_width and src_h == dest_height:
-            return bgra.tobytes()
+            raw = bgra.tobytes()
+            # Save first frame as PNG for visual diagnostic
+            if self._decode_count <= 1:
+                self._save_debug_frame(bgra, dest_width, dest_height)
+            return raw
 
         copy_w = min(src_w, dest_width)
         copy_h = min(src_h, dest_height)
@@ -278,7 +366,24 @@ class AvcDecoder:
         out = np.zeros((dest_height, dest_width, 4), dtype=np.uint8)
         out[:copy_h, :copy_w] = bgra[:copy_h, :copy_w]
 
+        # Save first frame as PNG for visual diagnostic
+        if self._decode_count <= 1:
+            self._save_debug_frame(out, dest_width, dest_height)
         return out.tobytes()
+
+    def _save_debug_frame(self, bgra_array, width, height):
+        """Save a BGRA numpy array as PNG for diagnostic inspection."""
+        try:
+            from PIL import Image
+            # BGRA → RGBA for PIL
+            rgba = bgra_array.copy()
+            rgba[:, :, 0], rgba[:, :, 2] = bgra_array[:, :, 2].copy(), bgra_array[:, :, 0].copy()
+            img = Image.fromarray(rgba[:height, :width], 'RGBA')
+            path = '/tmp/rdpyqt_frame_%d.png' % self._decode_count
+            img.save(path)
+            log.info("AVC: saved diagnostic frame to %s" % path)
+        except Exception as e:
+            log.debug("AVC: could not save diagnostic frame: %s" % e)
 
 
 def is_available():

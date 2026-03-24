@@ -257,6 +257,20 @@ class DrdynvcLayer(LayerAutomata):
             return
         version = struct.unpack_from('<H', data, 2)[0]
         log.debug("DrdynvcLayer: server DRDYNVC version=%d" % version)
+
+        # Clear all DVC state from previous connection (reconnection case)
+        if self._dynamicChannels:
+            log.info("DrdynvcLayer: clearing stale DVC state (%d channels)" % len(self._dynamicChannels))
+        self._dynamicChannels.clear()
+        self._channelCbId.clear()
+        self._dvcReassembly.clear()
+        self._gfxChannelId = None
+        self._gfxConfirmed = False
+        self._rdpsndDvcChannelIds.clear()
+        self._rdpsndDvcPrimaryId = None
+        # Reset ZGFX decompressor (history is connection-scoped)
+        self._zgfx = ZgfxDecompressor()
+
         # Accept up to version 3 (Soft-Sync)
         self._version = min(version, 3)
 
@@ -341,6 +355,8 @@ class DrdynvcLayer(LayerAutomata):
                 # Use the first audio channel as the primary for sending responses
                 self._rdpsndDvcPrimaryId = channelId
                 def dvcSendRdpsnd(data, _chId=channelId, _cbId=cbId):
+                    log.debug("DrdynvcLayer: dvcSendRdpsnd channelId=%d cbId=%d dataLen=%d" %
+                              (_chId, _cbId, len(data)))
                     header = (DrdynvcCmd.DATA << 4) | _cbId
                     pdu = bytearray([header])
                     if _cbId == 0:
@@ -361,7 +377,14 @@ class DrdynvcLayer(LayerAutomata):
         channelName = self._dynamicChannels.get(channelId, "unknown")
         log.debug("DrdynvcLayer: DATA_FIRST channelId=%d (%s) totalLen=%d fragLen=%d" %
                   (channelId, channelName, totalLen, len(fragment)))
-        self._dvcReassembly[channelId] = (totalLen, bytearray(fragment))
+        if len(fragment) >= totalLen:
+            # Complete message in first fragment — dispatch immediately
+            # (matching grdp behaviour; avoids losing the message if a
+            # subsequent DATA_FIRST overwrites the reassembly entry and
+            # desynchronising the ZGFX history buffer).
+            self._dispatchDvcData(channelId, bytes(fragment[:totalLen]))
+        else:
+            self._dvcReassembly[channelId] = (totalLen, bytearray(fragment))
 
     def _processDataPdu(self, data, cbId):
         """Handle DVC DATA: either a complete message or continuation of DATA_FIRST."""
@@ -388,7 +411,8 @@ class DrdynvcLayer(LayerAutomata):
         if channelId == self._gfxChannelId and len(payload) >= 8:
             self._processRdpgfxStream(payload)
         elif channelId in self._rdpsndDvcChannelIds and self._rdpsndLayer is not None:
-            log.info("DrdynvcLayer: routing DVC rdpsnd data len=%d to RdpsndLayer" % len(payload))
+            log.info("DrdynvcLayer: routing DVC rdpsnd data len=%d channelId=%d to RdpsndLayer" %
+                     (len(payload), channelId))
             self._rdpsndLayer._processData(payload)
         else:
             log.debug("DrdynvcLayer: data on channelId=%d (%s) len=%d" %
@@ -401,6 +425,12 @@ class DrdynvcLayer(LayerAutomata):
         self._dvcReassembly.pop(channelId, None)
         if channelId == self._gfxChannelId:
             self._gfxChannelId = None
+        if channelId in self._rdpsndDvcChannelIds:
+            self._rdpsndDvcChannelIds.discard(channelId)
+            if self._rdpsndDvcPrimaryId == channelId:
+                self._rdpsndDvcPrimaryId = None
+                if self._rdpsndLayer is not None:
+                    self._rdpsndLayer._dvcSendCallback = None
         log.info("DrdynvcLayer: CLOSE channelId=%d (%s)" % (channelId, channelName))
 
     # ---------------------------------------------------------------
@@ -554,6 +584,15 @@ class DrdynvcLayer(LayerAutomata):
         self._ccShortVBarStorage = [None] * 16384
         self._ccVBarCursor = 0
         self._ccShortVBarCursor = 0
+        # Reset H.264 decoder state (matches grdp's onResetGraphics)
+        if self._avcDecoder is not None:
+            try:
+                self._avcDecoder.close()
+            except Exception:
+                pass
+            self._avcDecoder = None
+        # Reset frame counter (matches grdp's framesDecoded.Store(0))
+        self._totalFramesDecoded = 0
         log.info("RDPGFX: RESET_GRAPHICS %dx%d monitors=%d" % (width, height, monitorCount))
 
     def _onCreateSurface(self, payload):
@@ -627,10 +666,8 @@ class DrdynvcLayer(LayerAutomata):
         width = right - left
         height = bottom - top
 
-        log.debug("RDPGFX: WIRE_TO_SURFACE_1 surf=%d codec=0x%04x fmt=0x%02x "
-                  "rect=(%d,%d,%d,%d) %dx%d dataLen=%d" %
-                  (surfaceId, codecId, pixelFormat, left, top, right, bottom,
-                   width, height, len(bitmapData)))
+        log.info("RDPGFX: WTS1 surfId=%d codecId=0x%04X %dx%d bmpLen=%d" %
+                 (surfaceId, codecId, width, height, len(bitmapData)))
 
         # CaVideo is heavy (RFX tile decode) — skip when under backpressure
         if codecId == RDPGFX_CODECID_CAVIDEO:
@@ -667,8 +704,10 @@ class DrdynvcLayer(LayerAutomata):
         bitmapDataLen = struct.unpack_from('<I', payload, 9)[0]
         bitmapData = payload[13:13 + bitmapDataLen]
 
-        log.debug("RDPGFX: WIRE_TO_SURFACE_2 surf=%d codec=0x%04x len=%d" %
-                  (surfaceId, codecId, len(bitmapData)))
+        surfInfo = self._surfaces.get(surfaceId)
+        w, h = (surfInfo[0], surfInfo[1]) if surfInfo else (0, 0)
+        log.info("RDPGFX: WTS2 surfId=%d codecId=0x%04X %dx%d bmpLen=%d" %
+                 (surfaceId, codecId, w, h, len(bitmapData)))
 
         # Skip heavy codecs (CaVideo, Progressive) when under backpressure
         if codecId in (RDPGFX_CODECID_CAVIDEO, RDPGFX_CODECID_CAPROGRESSIVE) and skip_heavy:
@@ -1181,24 +1220,21 @@ class DrdynvcLayer(LayerAutomata):
 
     def _deliverBitmap(self, x, y, width, height, bpp, data):
         """Deliver decoded bitmap to the observer via callback.
-        Data is top-down scanlines, so we flip vertically to match
-        the existing bottom-up onUpdate convention.
+        Data is top-down BGRA scanlines from RDPGFX codecs.
+        Pass isCompress='gfx' sentinel so the UI layer knows the data
+        is already top-down and does not need the bottom-up flip.
         """
         if self._gfxCallback is None:
             return
-        stride = width * (bpp // 8)
-        # Flip scanlines from top-down (RDPGFX) to bottom-up (traditional RDP)
-        arr = np.frombuffer(data[:stride * height], dtype=np.uint8).reshape(height, stride)
-        flipped = np.ascontiguousarray(arr[::-1]).tobytes()
         self._gfxCallback(x, y, x + width - 1, y + height - 1,
-                          width, height, bpp, False, flipped)
+                          width, height, bpp, 'gfx', data)
 
     def _sendFrameAcknowledge(self, frameId):
         """Send RDPGFX FRAME_ACKNOWLEDGE PDU."""
         if self._gfxChannelId is None:
             return
         # FRAME_ACKNOWLEDGE payload: queueDepth(4) + frameId(4) + totalFramesDecoded(4)
-        ackPayload = struct.pack('<III', 0xFFFFFFFF, frameId, self._totalFramesDecoded)
+        ackPayload = struct.pack('<III', 0, frameId, self._totalFramesDecoded)
         pduLen = 8 + len(ackPayload)
         gfxPdu = struct.pack('<HHI', RDPGFX_CMDID_FRAMEACKNOWLEDGE, 0, pduLen)
         gfxPdu += ackPayload
@@ -1214,15 +1250,25 @@ class DrdynvcLayer(LayerAutomata):
 
     def _sendRdpgfxCapsAdvertise(self, channelId, cbId):
         """Send RDPGFX CAPS_ADVERTISE PDU (MS-RDPEGFX 2.2.3)
-        Advertise v8.0 only, matching grdp reference implementation.
-        When PyAV is available, omit AVC_DISABLED flag to enable H.264."""
-        capsFlags8 = (RDPGFX_CAPS_FLAG_THINCLIENT |
-                      RDPGFX_CAPS_FLAG_SMALL_CACHE)
-        if not avc_module.is_available():
-            capsFlags8 |= RDPGFX_CAPS_FLAG_AVC_DISABLED
 
+        When PyAV is available, advertise v10 (AVC444) and v8.0 (AVC420)
+        capsets without THINCLIENT flag — the flag causes the server to
+        prefer RemoteFX over H.264 even when AVC is not disabled.
+        When PyAV is unavailable, fall back to a single v8.0 capset with
+        THINCLIENT | SMALL_CACHE | AVC_DISABLED."""
         capsSets = []
-        capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_8, 4, capsFlags8))
+        if avc_module.is_available():
+            # v10 capset — preferred; enables AVC444 + AVC420
+            capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_10, 4,
+                                        RDPGFX_CAPS_FLAG_SMALL_CACHE))
+            # v8.0 capset — fallback; enables AVC420
+            capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_8, 4,
+                                        RDPGFX_CAPS_FLAG_SMALL_CACHE))
+        else:
+            capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_8, 4,
+                                        RDPGFX_CAPS_FLAG_THINCLIENT |
+                                        RDPGFX_CAPS_FLAG_SMALL_CACHE |
+                                        RDPGFX_CAPS_FLAG_AVC_DISABLED))
 
         capsPayload = struct.pack('<H', len(capsSets))
         for cs in capsSets:
@@ -1234,7 +1280,7 @@ class DrdynvcLayer(LayerAutomata):
 
         self._sendDvcData(channelId, cbId, gfxPdu)
         if avc_module.is_available():
-            log.info("RDPGFX: sent CAPS_ADVERTISE (v8.0, AVC enabled)")
+            log.info("RDPGFX: sent CAPS_ADVERTISE (v10+v8.0, AVC enabled)")
         else:
             log.info("RDPGFX: sent CAPS_ADVERTISE (v8.0, AVC disabled)")
 

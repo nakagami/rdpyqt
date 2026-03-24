@@ -324,11 +324,22 @@ class CliprdrLayer(LayerAutomata):
         if self._getLocalClipboardText is not None:
             text = self._getLocalClipboardText() or ''
 
+        # Cap clipboard text to a reasonable maximum (1 MB) to avoid
+        # excessive memory use and network traffic.
+        _MAX_CLIP_BYTES = 1024 * 1024
+
         if requestedFormat == CF_UNICODETEXT:
             encoded = (text + '\0').encode('utf-16-le')
+            if len(encoded) > _MAX_CLIP_BYTES:
+                log.warning("CLIPRDR: clipboard text too large (%d bytes), truncating" % len(encoded))
+                # Truncate to an even byte boundary (UTF-16LE)
+                encoded = encoded[:_MAX_CLIP_BYTES & ~1]
             self._sendPDU(CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_OK, encoded)
         elif requestedFormat == CF_TEXT:
             encoded = (text + '\0').encode('ascii', errors='replace')
+            if len(encoded) > _MAX_CLIP_BYTES:
+                log.warning("CLIPRDR: clipboard text too large (%d bytes), truncating" % len(encoded))
+                encoded = encoded[:_MAX_CLIP_BYTES]
             self._sendPDU(CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_OK, encoded)
         else:
             self._sendPDU(CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_FAIL, b'')
@@ -389,14 +400,32 @@ class CliprdrLayer(LayerAutomata):
         cliprdrPdu = struct.pack('<HHI', msgType, msgFlags, len(body)) + body
         self._send(cliprdrPdu)
 
+    # VChannel chunk size negotiated in Virtual Channel Capability Set
+    _VC_CHUNK_SIZE = 1600
+
     def _send(self, data):
-        """Send data via the static virtual channel."""
+        """Send data via the static virtual channel, chunking if needed.
+
+        RDP virtual channel data must be sent in chunks no larger than
+        VCChunkSize (1600 bytes).  Each chunk carries a VChannel header
+        with totalLength and FIRST/LAST flags.
+        """
         log.info("CLIPRDR DEBUG: _send() transport=%s dataLen=%d" %
                  (type(self._transport).__name__ if self._transport else "None", len(data)))
-        if self._transport is not None:
-            from rdpy.core.type import String
-            flags = CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST | CHANNEL_FLAG_SHOW_PROTOCOL
-            header = struct.pack('<II', len(data), flags)
-            self._transport.send(String(header + data))
-        else:
+        if self._transport is None:
             log.warning("CLIPRDR DEBUG: _send() SKIPPED - transport is None!")
+            return
+
+        from rdpy.core.type import String
+        totalLen = len(data)
+        offset = 0
+        while offset < totalLen:
+            chunk = data[offset:offset + self._VC_CHUNK_SIZE]
+            flags = CHANNEL_FLAG_SHOW_PROTOCOL
+            if offset == 0:
+                flags |= CHANNEL_FLAG_FIRST
+            if offset + len(chunk) >= totalLen:
+                flags |= CHANNEL_FLAG_LAST
+            header = struct.pack('<II', totalLen, flags)
+            self._transport.send(String(header + chunk))
+            offset += len(chunk)
