@@ -75,10 +75,22 @@ class ZgfxDecompressor:
         if flags & PACKET_COMPRESSED:
             return self._decompress_compressed(payload)
         else:
-            # Uncompressed: copy to output and history
-            for b in payload:
-                self._history[self._hist_idx] = b
-                self._hist_idx = (self._hist_idx + 1) % ZGFX_HISTORY_SIZE
+            # Uncompressed: bulk-copy to history and return
+            n = len(payload)
+            if n > 0:
+                hist = self._history
+                idx = self._hist_idx
+                space = ZGFX_HISTORY_SIZE - idx
+                if n <= space:
+                    hist[idx:idx + n] = payload
+                    self._hist_idx = idx + n
+                else:
+                    hist[idx:idx + space] = payload[:space]
+                    rest = n - space
+                    hist[0:rest] = payload[space:]
+                    self._hist_idx = rest
+                if self._hist_idx >= ZGFX_HISTORY_SIZE:
+                    self._hist_idx %= ZGFX_HISTORY_SIZE
             return bytes(payload)
 
     def _decompress_compressed(self, data):
@@ -99,42 +111,16 @@ class ZgfxDecompressor:
 
         # Input data (excluding last byte which is padding count)
         input_data = data
-        input_pos = [0]
-        bits_current = [0]
-        n_bits_current = [0]
-        bits_remaining_ref = [bits_remaining]
+        input_pos = 0
+        bits_current = 0
+        n_bits_current = 0
         out = bytearray()
+        hist = self._history
+        hist_idx = self._hist_idx
+        hist_size = ZGFX_HISTORY_SIZE
 
-        def get_bits(nbits):
-            while n_bits_current[0] < nbits:
-                bits_current[0] <<= 8
-                if input_pos[0] < num_data_bytes:
-                    bits_current[0] += input_data[input_pos[0]]
-                    input_pos[0] += 1
-                n_bits_current[0] += 8
-            bits_remaining_ref[0] -= nbits
-            n_bits_current[0] -= nbits
-            result = (bits_current[0] >> n_bits_current[0]) & ((1 << nbits) - 1)
-            bits_current[0] &= (1 << n_bits_current[0]) - 1
-            return result
-
-        def output_literal(b):
-            self._history[self._hist_idx] = b
-            self._hist_idx = (self._hist_idx + 1) % ZGFX_HISTORY_SIZE
-            out.append(b)
-
-        def output_match(distance, count):
-            src_idx = (self._hist_idx + ZGFX_HISTORY_SIZE - distance) % ZGFX_HISTORY_SIZE
-            for _ in range(count):
-                b = self._history[src_idx % ZGFX_HISTORY_SIZE]
-                self._history[self._hist_idx] = b
-                self._hist_idx = (self._hist_idx + 1) % ZGFX_HISTORY_SIZE
-                out.append(b)
-                src_idx += 1
-
-        while bits_remaining_ref[0] > 0:
-            # Decode Huffman token by reading bits one at a time
-            # (matching FreeRDP's token table scanning approach)
+        while bits_remaining > 0:
+            # --- get_bits inlined for Huffman prefix decoding ---
             have_bits = 0
             in_prefix = 0
             matched = False
@@ -142,45 +128,159 @@ class ZgfxDecompressor:
             for entry in _TOKEN_TABLE:
                 plen, pcode, vbits, ttype, vbase = entry
                 while have_bits < plen:
-                    in_prefix = (in_prefix << 1) + get_bits(1)
+                    # inline get_bits(1)
+                    while n_bits_current < 1:
+                        bits_current <<= 8
+                        if input_pos < num_data_bytes:
+                            bits_current += input_data[input_pos]
+                            input_pos += 1
+                        n_bits_current += 8
+                    bits_remaining -= 1
+                    n_bits_current -= 1
+                    in_prefix = (in_prefix << 1) | ((bits_current >> n_bits_current) & 1)
+                    bits_current &= (1 << n_bits_current) - 1
                     have_bits += 1
                 if in_prefix == pcode:
                     if ttype == 0:
                         # Literal
-                        value = (vbase + get_bits(vbits)) & 0xFF if vbits > 0 else vbase
-                        output_literal(value)
+                        if vbits > 0:
+                            # inline get_bits(vbits)
+                            while n_bits_current < vbits:
+                                bits_current <<= 8
+                                if input_pos < num_data_bytes:
+                                    bits_current += input_data[input_pos]
+                                    input_pos += 1
+                                n_bits_current += 8
+                            bits_remaining -= vbits
+                            n_bits_current -= vbits
+                            value = (vbase + ((bits_current >> n_bits_current) & ((1 << vbits) - 1))) & 0xFF
+                            bits_current &= (1 << n_bits_current) - 1
+                        else:
+                            value = vbase
+                        hist[hist_idx] = value
+                        hist_idx += 1
+                        if hist_idx >= hist_size:
+                            hist_idx = 0
+                        out.append(value)
                     else:
                         # Match or Unencoded
-                        distance = vbase + get_bits(vbits)
+                        # inline get_bits(vbits)
+                        if vbits > 0:
+                            while n_bits_current < vbits:
+                                bits_current <<= 8
+                                if input_pos < num_data_bytes:
+                                    bits_current += input_data[input_pos]
+                                    input_pos += 1
+                                n_bits_current += 8
+                            bits_remaining -= vbits
+                            n_bits_current -= vbits
+                            distance = vbase + ((bits_current >> n_bits_current) & ((1 << vbits) - 1))
+                            bits_current &= (1 << n_bits_current) - 1
+                        else:
+                            distance = vbase
                         if distance != 0:
-                            # Match: decode length (FreeRDP scheme)
-                            if get_bits(1) == 0:
+                            # Decode match length
+                            while n_bits_current < 1:
+                                bits_current <<= 8
+                                if input_pos < num_data_bytes:
+                                    bits_current += input_data[input_pos]
+                                    input_pos += 1
+                                n_bits_current += 8
+                            bits_remaining -= 1
+                            n_bits_current -= 1
+                            bit = (bits_current >> n_bits_current) & 1
+                            bits_current &= (1 << n_bits_current) - 1
+                            if bit == 0:
                                 count = 3
                             else:
                                 count = 4
                                 extra = 2
-                                while get_bits(1) == 1:
+                                while True:
+                                    while n_bits_current < 1:
+                                        bits_current <<= 8
+                                        if input_pos < num_data_bytes:
+                                            bits_current += input_data[input_pos]
+                                            input_pos += 1
+                                        n_bits_current += 8
+                                    bits_remaining -= 1
+                                    n_bits_current -= 1
+                                    bit = (bits_current >> n_bits_current) & 1
+                                    bits_current &= (1 << n_bits_current) - 1
+                                    if bit != 1:
+                                        break
                                     count *= 2
                                     extra += 1
-                                count += get_bits(extra)
-                            output_match(distance, count)
+                                # inline get_bits(extra)
+                                while n_bits_current < extra:
+                                    bits_current <<= 8
+                                    if input_pos < num_data_bytes:
+                                        bits_current += input_data[input_pos]
+                                        input_pos += 1
+                                    n_bits_current += 8
+                                bits_remaining -= extra
+                                n_bits_current -= extra
+                                count += (bits_current >> n_bits_current) & ((1 << extra) - 1)
+                                bits_current &= (1 << n_bits_current) - 1
+
+                            # output_match — batch copy from history
+                            src_idx = (hist_idx + hist_size - distance) % hist_size
+                            if distance >= count and src_idx + count <= hist_size and hist_idx + count <= hist_size:
+                                # Non-overlapping: safe to batch
+                                chunk = bytes(hist[src_idx:src_idx + count])
+                                out.extend(chunk)
+                                hist[hist_idx:hist_idx + count] = chunk
+                                hist_idx += count
+                            else:
+                                for _ in range(count):
+                                    b = hist[src_idx % hist_size]
+                                    hist[hist_idx] = b
+                                    hist_idx += 1
+                                    if hist_idx >= hist_size:
+                                        hist_idx = 0
+                                    out.append(b)
+                                    src_idx += 1
                         else:
                             # Unencoded: 15-bit count + flush bits + raw bytes
-                            count = get_bits(15)
-                            bits_remaining_ref[0] -= n_bits_current[0]
-                            n_bits_current[0] = 0
-                            bits_current[0] = 0
-                            for _ in range(count):
-                                if input_pos[0] < num_data_bytes:
-                                    output_literal(input_data[input_pos[0]])
-                                    input_pos[0] += 1
-                                    bits_remaining_ref[0] -= 8
+                            # inline get_bits(15)
+                            while n_bits_current < 15:
+                                bits_current <<= 8
+                                if input_pos < num_data_bytes:
+                                    bits_current += input_data[input_pos]
+                                    input_pos += 1
+                                n_bits_current += 8
+                            bits_remaining -= 15
+                            n_bits_current -= 15
+                            count = (bits_current >> n_bits_current) & ((1 << 15) - 1)
+                            bits_current &= (1 << n_bits_current) - 1
+                            bits_remaining -= n_bits_current
+                            n_bits_current = 0
+                            bits_current = 0
+                            # Bulk copy raw bytes
+                            end_pos = min(input_pos + count, num_data_bytes)
+                            chunk = input_data[input_pos:end_pos]
+                            actual = len(chunk)
+                            out.extend(chunk)
+                            # Copy to history in bulk
+                            space = hist_size - hist_idx
+                            if actual <= space:
+                                hist[hist_idx:hist_idx + actual] = chunk
+                                hist_idx += actual
+                            else:
+                                hist[hist_idx:hist_idx + space] = chunk[:space]
+                                rest = actual - space
+                                hist[0:rest] = chunk[space:]
+                                hist_idx = rest
+                            if hist_idx >= hist_size:
+                                hist_idx %= hist_size
+                            input_pos = end_pos
+                            bits_remaining -= actual * 8
                     matched = True
                     break
 
             if not matched:
                 log.warning("ZGFX: no token matched at input_pos=%d have_bits=%d prefix=0x%x outLen=%d" %
-                            (input_pos[0], have_bits, in_prefix, len(out)))
+                            (input_pos, have_bits, in_prefix, len(out)))
                 break
 
+        self._hist_idx = hist_idx
         return bytes(out)

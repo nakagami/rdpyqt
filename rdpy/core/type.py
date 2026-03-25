@@ -30,6 +30,18 @@ from io import BytesIO
 from rdpy.core.error import InvalidExpectedDataException, InvalidSize, CallPureVirtualFuntion, InvalidValue
 import rdpy.core.log as log
 
+# Pre-compiled struct cache — avoids re-parsing format strings on every pack/unpack
+_STRUCT_CACHE = {}
+
+def _get_struct(fmt):
+    """Return a cached struct.Struct for the given format string."""
+    try:
+        return _STRUCT_CACHE[fmt]
+    except KeyError:
+        s = struct.Struct(fmt)
+        _STRUCT_CACHE[fmt] = s
+        return s
+
 def sizeof(element):
     """
     @summary:  Size in Byte of element.
@@ -205,6 +217,7 @@ class SimpleType(Type, CallableValue):
         self._signed = signed
         self._typeSize = typeSize
         self._structFormat = structFormat
+        self._struct = _get_struct(structFormat)
         #pre-compute mask to avoid per-access overhead
         mask = 0xff
         for _ in range(1, typeSize):
@@ -255,7 +268,7 @@ class SimpleType(Type, CallableValue):
                     In accordance of structFormat field
         @param s: Stream that will be written
         """
-        s.write(struct.pack(self._structFormat, self.value))
+        s.write(self._struct.pack(self.value))
         
     def __read__(self, s):
         """
@@ -267,7 +280,7 @@ class SimpleType(Type, CallableValue):
         """
         if s.dataLen() < self._typeSize:
             raise InvalidSize("Stream is too small to read expected SimpleType")
-        self.value = struct.unpack(self._structFormat, s.read(self._typeSize))[0]
+        self.value = self._struct.unpack(s.read(self._typeSize))[0]
       
     def mask(self):
         """
@@ -826,14 +839,15 @@ class String(Type, CallableValue):
             if self._until is None:
                 self.value = s.getvalue()[s.pos:]
             else:
-                parts = []
-                until_len = len(self._until)
-                while s.dataLen() != 0:
-                    chunk = s.read(1)
-                    parts.append(chunk)
-                    if len(parts) >= until_len and b"".join(parts[-until_len:]) == self._until:
-                        break
-                self.value = b"".join(parts)
+                remaining = s.getvalue()[s.pos:]
+                idx = remaining.find(self._until)
+                if idx >= 0:
+                    end = idx + len(self._until)
+                    self.value = remaining[:end]
+                    s.pos += end
+                else:
+                    self.value = remaining
+                    s.pos += len(remaining)
         else:
             self.value = s.read(self._readLen.value)
 

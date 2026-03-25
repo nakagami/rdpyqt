@@ -227,6 +227,8 @@ def _decompress2(output, width, height, input_data):
 
     # Internal buffer of uint16 pixel values (pixel-indexed)
     pixels = array.array('H', bytes(width * height * 2))
+    # Pre-allocated zero row for Fill/Black ops
+    _zero_row = array.array('H', bytes(width * 2))
 
     def read_pixel():
         nonlocal pos
@@ -279,7 +281,7 @@ def _decompress2(output, width, height, input_data):
                     continue
                 n_pix = min(count, width - x)
                 if prevline == 0:
-                    pixels[line + x : line + x + n_pix] = array.array('H', bytes(n_pix * 2))
+                    pixels[line + x : line + x + n_pix] = _zero_row[:n_pix]
                 else:
                     pixels[line + x : line + x + n_pix] = pixels[prevline + x : prevline + x + n_pix]
                 count -= n_pix
@@ -348,7 +350,7 @@ def _decompress2(output, width, height, input_data):
 
             elif opcode == 0xe:  # Black
                 n_pix = min(count, width - x)
-                pixels[line + x : line + x + n_pix] = array.array('H', bytes(n_pix * 2))
+                pixels[line + x : line + x + n_pix] = _zero_row[:n_pix]
                 count -= n_pix
                 x += n_pix
 
@@ -430,7 +432,9 @@ def _decompress3(output, width, height, input_data):
                         output[off : off + 3] = mix
                     else:
                         poff = prevline + 3 * x
-                        output[off : off + 3] = bytes(a ^ b for a, b in zip(output[poff : poff + 3], mix))
+                        output[off] = (output[poff] ^ mix[0]) & 0xff
+                        output[off + 1] = (output[poff + 1] ^ mix[1]) & 0xff
+                        output[off + 2] = (output[poff + 2] ^ mix[2]) & 0xff
                     insertmix = False
                     count -= 1
                     x += 1
@@ -453,8 +457,12 @@ def _decompress3(output, width, height, input_data):
                     output[off : off + 3 * n_pix] = mix_bytes * n_pix
                 else:
                     poff = prevline + 3 * x
-                    src = output[poff : poff + 3 * n_pix]
-                    output[off : off + 3 * n_pix] = bytes(a ^ b for a, b in zip(src, mix_bytes * n_pix))
+                    nbytes = 3 * n_pix
+                    src = output[poff : poff + nbytes]
+                    pat = mix_bytes * n_pix
+                    output[off : off + nbytes] = bytes(src).translate(
+                        bytes(i ^ mix[0] for i in range(256))
+                    ) if len(mix_bytes) == 1 else bytes(a ^ b for a, b in zip(src, pat))
                 count -= n_pix
                 x += n_pix
 
@@ -586,7 +594,8 @@ def process_plane(input_data, width, height, output, j):
                     indexw += 1
                     collen -= 1
                 if replen > 0:
-                    output[i : i + replen * 4 : 4] = bytes([color & 0xFF]) * replen
+                    c = color & 0xFF
+                    output[i : i + replen * 4 : 4] = bytes([c]) * replen
                     i += replen * 4
                     indexw += replen
         else:
@@ -610,7 +619,12 @@ def process_plane(input_data, width, height, output, j):
                     indexw += 1
                     collen -= 1
                 if replen > 0:
-                    vals = bytes((output[(indexw + k) * 4 + lastline] + color) & 0xFF for k in range(replen))
+                    # Batch read previous-line values and apply delta
+                    base = indexw * 4 + lastline
+                    step4 = 4
+                    vals = bytearray(replen)
+                    for k in range(replen):
+                        vals[k] = (output[base + k * step4] + color) & 0xFF
                     output[i : i + replen * 4 : 4] = vals
                     i += replen * 4
                     indexw += replen
