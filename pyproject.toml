@@ -26,8 +26,10 @@ dependencies = [
     "PyQt6",
     "qt-reactor",
     "numpy",
-    "av",
 ]
+
+[project.optional-dependencies]
+h264 = ["av"]
 
 [project.scripts]
 rdpyqt6     = "rdpy.scripts.rdpyqt6:main"
