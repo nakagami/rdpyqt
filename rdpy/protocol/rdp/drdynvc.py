@@ -329,10 +329,18 @@ class DrdynvcLayer(LayerAutomata):
         channelId, offset = self._readChannelId(data, 1, cbId)
         channelName = data[offset:].split(b'\x00')[0].decode('utf-8', errors='replace')
         log.info("DrdynvcLayer: CREATE channelId=%d name=%s" % (channelId, channelName))
+
+        # Only accept channels we actually implement; reject others so the
+        # server doesn't expect functionality we cannot provide (matching grdp).
+        _SUPPORTED_CHANNELS = {
+            RDPGFX_CHANNEL_NAME,
+            "rdpsnd", "AUDIO_PLAYBACK_DVC", "AUDIO_PLAYBACK_LOSSY_DVC",
+        }
+        accepted = channelName in _SUPPORTED_CHANNELS
+
         self._dynamicChannels[channelId] = channelName
         self._channelCbId[channelId] = cbId
 
-        # Send create response (success = 0)
         header = (DrdynvcCmd.CREATE << 4) | cbId
         response = bytearray([header])
         if cbId == 0:
@@ -341,9 +349,16 @@ class DrdynvcLayer(LayerAutomata):
             response += struct.pack('<H', channelId)
         elif cbId == 2:
             response += struct.pack('<I', channelId)
-        response += struct.pack('<I', 0)  # CHANNEL_RC_OK
-        self._send(bytes(response))
-        log.debug("DrdynvcLayer: sent create response (OK) for channelId=%d" % channelId)
+
+        if accepted:
+            response += struct.pack('<I', 0)  # CHANNEL_RC_OK
+            self._send(bytes(response))
+            log.debug("DrdynvcLayer: sent create response (OK) for channelId=%d" % channelId)
+        else:
+            response += struct.pack('<i', -1)  # reject
+            self._send(bytes(response))
+            log.info("DrdynvcLayer: rejected channel %s (id=%d) — no handler" % (channelName, channelId))
+            return
 
         if channelName == RDPGFX_CHANNEL_NAME:
             self._gfxChannelId = channelId

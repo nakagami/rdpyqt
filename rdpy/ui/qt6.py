@@ -648,6 +648,7 @@ class QRemoteDesktop(QtWidgets.QWidget):
         self._updateSignal.connect(self._doNotifyImage)
         #resize debounce
         self._programmaticResize = False
+        self._sessionReady = False  # suppress resize-reconnect until first frame
         self._resizeTimer = QtCore.QTimer()
         self._resizeTimer.setSingleShot(True)
         self._resizeTimer.timeout.connect(self._handleResizeTimeout)
@@ -664,6 +665,8 @@ class QRemoteDesktop(QtWidgets.QWidget):
         @param width: width of the image region
         @param height: height of the image region
         """
+        if not self._sessionReady:
+            self._sessionReady = True
         self._updateSignal.emit(x, y, qimage, width, height)
 
     def _doNotifyImage(self, x, y, qimage, width, height):
@@ -707,6 +710,11 @@ class QRemoteDesktop(QtWidgets.QWidget):
         self._buffer = QtGui.QImage(w, h, QtGui.QImage.Format.Format_RGB32)
         if self._programmaticResize:
             self._programmaticResize = False
+            return
+        # Don't trigger reconnection until the session is fully established;
+        # window manager adjustments during startup would otherwise cause a
+        # disruptive disconnect/reconnect cycle.
+        if not self._sessionReady:
             return
         if w > 0 and h > 0:
             self._pendingSize = (w, h)
