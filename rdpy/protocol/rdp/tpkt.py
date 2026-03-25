@@ -193,8 +193,12 @@ class TPKT(RawLayer, IFastPathSender):
         @param data: {Stream} from twisted layer
         """
         log.debug(f"TPKT.recvFastPath({data}) _secFlag={self._secFlag}")
-        self._fastPathListener.recvFastPath(self._secFlag, data)
-        self.expect(2, self.readHeader)
+        try:
+            self._fastPathListener.recvFastPath(self._secFlag, data)
+        except Exception as e:
+            log.warning("FastPath processing error: %s" % e)
+        finally:
+            self.expect(2, self.readHeader)
     
     def readData(self, data):
         """
@@ -202,9 +206,12 @@ class TPKT(RawLayer, IFastPathSender):
         @param data: {Stream} with correct size
         """
         log.debug("TPKT.readData()")
-        #next state is pass to 
-        self._presentation.recv(data)
-        self.expect(2, self.readHeader)
+        try:
+            self._presentation.recv(data)
+        except Exception as e:
+            log.warning("SlowPath processing error: %s" % e)
+        finally:
+            self.expect(2, self.readHeader)
         
     def send(self, message):
         """

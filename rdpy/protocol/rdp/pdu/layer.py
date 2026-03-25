@@ -470,7 +470,10 @@ class Client(PDULayer):
             except Exception as e:
                 log.warning("Failed to parse pointer update: %s" % e)
         elif updateCode == data.FastPathUpdateType.FASTPATH_UPDATETYPE_SURFCMDS:
-            self._handleSurfaceCommands(payload)
+            try:
+                self._handleSurfaceCommands(payload)
+            except Exception as e:
+                log.warning("Failed to handle surface commands: %s" % e)
         
     def readDataPDU(self, dataPDU):
         """
