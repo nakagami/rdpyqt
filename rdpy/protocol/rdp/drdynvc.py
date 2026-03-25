@@ -347,7 +347,10 @@ class DrdynvcLayer(LayerAutomata):
 
         if channelName == RDPGFX_CHANNEL_NAME:
             self._gfxChannelId = channelId
-            self._sendRdpgfxCapsAdvertise(channelId, cbId)
+            if not self._gfxConfirmed:
+                self._sendRdpgfxCapsAdvertise(channelId, cbId)
+            else:
+                log.info("RDPGFX: channel re-created without close, skipping duplicate CAPS_ADVERTISE")
         elif channelName in ("rdpsnd", "AUDIO_PLAYBACK_DVC", "AUDIO_PLAYBACK_LOSSY_DVC"):
             self._rdpsndDvcChannelIds.add(channelId)
             log.info("DrdynvcLayer: RDPSND DVC channel mapped to channelId=%d (%s)" % (channelId, channelName))
@@ -425,6 +428,7 @@ class DrdynvcLayer(LayerAutomata):
         self._dvcReassembly.pop(channelId, None)
         if channelId == self._gfxChannelId:
             self._gfxChannelId = None
+            self._gfxConfirmed = False
         if channelId in self._rdpsndDvcChannelIds:
             self._rdpsndDvcChannelIds.discard(channelId)
             if self._rdpsndDvcPrimaryId == channelId:
