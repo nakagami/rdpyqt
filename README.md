@@ -11,7 +11,7 @@ While rdpy has various commands, this project only includes the RDP client.
 pip install rdpyqt
 ```
 
-H.264 デコード機能を使用する場合は、以下のようにインストールしてください:
+To use the H.264 decoding feature, please install it as follows.
 
 ```sh
 pip install "rdpyqt[h264]"
