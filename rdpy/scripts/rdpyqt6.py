@@ -211,7 +211,7 @@ def help():
     \t-p: password
     \t-d: domain
     \t-w: width of screen [default : 1280]
-    \t-l: height of screen [default : 1024]
+    \t-h: height of screen [default : 1024]
     \t-kt: keyboard type (e.g. IBM_101_102_KEYS) [default : IBM_101_102_KEYS]
     \t-kl: keyboard layout (e.g. US, FRENCH) [default : US]
     \t--swap-alt-meta: swap Alt and Meta (Windows/Super/Command) keys [default : False]
@@ -238,15 +238,12 @@ def main():
             argv.append(a)
 
     try:
-        opts, args = getopt.getopt(argv, "hfou:p:d:w:l:r:", ["kt=", "kl=", "swap-alt-meta"])
+        opts, args = getopt.getopt(argv, "fou:p:d:w:h:r:", ["kt=", "kl=", "swap-alt-meta"])
     except getopt.GetoptError:
         help()
         sys.exit(1)
     for opt, arg in opts:
-        if opt == "-h":
-            help()
-            sys.exit()
-        elif opt == "-u":
+        if opt == "-u":
             username = arg
         elif opt == "-p":
             password = arg
@@ -254,7 +251,7 @@ def main():
             domain = arg
         elif opt == "-w":
             width = int(arg)
-        elif opt == "-l":
+        elif opt == "-h":
             height = int(arg)
         elif opt == "--kt":
             keyboardType = arg
