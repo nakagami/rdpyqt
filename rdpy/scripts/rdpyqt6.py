@@ -21,6 +21,7 @@ example of use rdpy as rdp client
 """
 
 import sys, getopt, socket
+import getpass
 
 from PyQt6.QtWidgets import QApplication
 from rdpy.ui.qt6 import RDPClientQt
@@ -259,6 +260,11 @@ def main():
             keyboardLayout = arg
         elif opt == "--swap-alt-meta":
             swap_alt_meta = True
+
+    if not username:
+        username = input("User: ")
+    if not password:
+        password = getpass.getpass()
 
     if ':' in args[0]:
         ip, port = args[0].split(':')
