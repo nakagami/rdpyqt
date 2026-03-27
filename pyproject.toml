@@ -8,13 +8,13 @@ version = "2.1.0"
 description = "Remote Desktop Protocol client"
 readme = "README.md"
 license = { text = "GPL-3.0-or-later" }
+requires-python = ">=3.11"
 authors = [
     { name = "Sylvain Peyrefitte", email = "citronneur@gmail.com" },
 ]
 maintainers = [
     { name = "Hajime Nakagami", email = "nakagami@gmail.com" },
 ]
-urls = { homepage = "https://github.com/nakagami/rdpyqt" }
 dependencies = [
     "twisted",
     "pyopenssl",
@@ -27,6 +27,9 @@ dependencies = [
     "qt-reactor",
     "numpy",
 ]
+
+[project.urls]
+homepage = "https://github.com/nakagami/rdpyqt"
 
 [project.optional-dependencies]
 h264 = ["av"]
