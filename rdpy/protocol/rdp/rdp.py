@@ -309,7 +309,7 @@ class RDPClientController(pdu.layer.PDUClientListener):
 
     def _onGfxCapsConfirm(self):
         """Called by DrdynvcLayer when RDPGFX CAPS_CONFIRM is received."""
-        log.info("RDPClientController: GFX CAPS_CONFIRM received, enabling input")
+        log.debug("RDPClientController: GFX CAPS_CONFIRM received, enabling input")
         self._gfxPending = False
         if self._gfxTimer and self._gfxTimer.active():
             self._gfxTimer.cancel()
@@ -317,7 +317,7 @@ class RDPClientController(pdu.layer.PDUClientListener):
 
     def _onGfxTimeout(self):
         """Fallback: enable input after timeout even without CAPS_CONFIRM."""
-        log.info("RDPClientController: GFX timeout, enabling input")
+        log.debug("RDPClientController: GFX timeout, enabling input")
         self._gfxPending = False
         self._gfxTimer = None
             
@@ -349,10 +349,10 @@ class RDPClientController(pdu.layer.PDUClientListener):
         Extracts routing token and closes connection to trigger redirect reconnection.
         @param redirPDU: ServerRedirectionPDU object
         """
-        log.info("Server redirection received, flags=0x%x" % redirPDU.redirFlags.value)
+        log.debug("Server redirection received, flags=0x%x" % redirPDU.redirFlags.value)
         lbInfo = redirPDU.getLoadBalanceInfo()
         if lbInfo:
-            log.info("Load balance info: %s" % repr(lbInfo))
+            log.debug("Load balance info: %s" % repr(lbInfo))
             self._redirectRoutingToken = lbInfo
             self.close()
         else:
@@ -402,7 +402,7 @@ class RDPClientController(pdu.layer.PDUClientListener):
             self._pduLayer.sendInputEvents([event])
             
         except InvalidValue:
-            log.info("try send pointer event with incorrect position")
+            log.debug("try send pointer event with incorrect position")
     
     def sendWheelEvent(self, x, y, scroll, isHorizontal=False):
         """
@@ -438,7 +438,7 @@ class RDPClientController(pdu.layer.PDUClientListener):
             self._pduLayer.sendInputEvents([event])
 
         except InvalidValue:
-            log.info("try send wheel event with incorrect position")
+            log.debug("try send wheel event with incorrect position")
             
     def sendKeyEventScancode(self, code, isPressed, extended = False):
         """
@@ -463,7 +463,7 @@ class RDPClientController(pdu.layer.PDUClientListener):
             self._pduLayer.sendInputEvents([event])
             
         except InvalidValue:
-            log.info("try send bad key event")
+            log.debug("try send bad key event")
             
     def sendKeyEventUnicode(self, code, isPressed):
         """
@@ -484,7 +484,7 @@ class RDPClientController(pdu.layer.PDUClientListener):
             self._pduLayer.sendInputEvents([event])
             
         except InvalidValue:
-            log.info("try send bad key event")
+            log.debug("try send bad key event")
             
     def sendRefreshOrder(self, left, top, right, bottom):
         """

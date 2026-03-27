@@ -260,7 +260,7 @@ class DrdynvcLayer(LayerAutomata):
 
         # Clear all DVC state from previous connection (reconnection case)
         if self._dynamicChannels:
-            log.info("DrdynvcLayer: clearing stale DVC state (%d channels)" % len(self._dynamicChannels))
+            log.debug("DrdynvcLayer: clearing stale DVC state (%d channels)" % len(self._dynamicChannels))
         self._dynamicChannels.clear()
         self._channelCbId.clear()
         self._dvcReassembly.clear()
@@ -289,7 +289,7 @@ class DrdynvcLayer(LayerAutomata):
         length = struct.unpack_from('<I', data, offset)[0]; offset += 4
         flags = struct.unpack_from('<H', data, offset)[0]; offset += 2
         numTunnels = struct.unpack_from('<H', data, offset)[0]; offset += 2
-        log.info("DrdynvcLayer: Soft-Sync Request flags=0x%04x numTunnels=%d" % (flags, numTunnels))
+        log.debug("DrdynvcLayer: Soft-Sync Request flags=0x%04x numTunnels=%d" % (flags, numTunnels))
 
         tunnelTypes = []
         for i in range(numTunnels):
@@ -297,7 +297,7 @@ class DrdynvcLayer(LayerAutomata):
                 break
             tt = struct.unpack_from('<I', data, offset)[0]; offset += 4
             tunnelTypes.append(tt)
-            log.info("DrdynvcLayer: Soft-Sync tunnel[%d] type=0x%08x" % (i, tt))
+            log.debug("DrdynvcLayer: Soft-Sync tunnel[%d] type=0x%08x" % (i, tt))
 
         SOFT_SYNC_CHANNEL_LIST_PRESENT = 0x0002
         if flags & SOFT_SYNC_CHANNEL_LIST_PRESENT:
@@ -308,7 +308,7 @@ class DrdynvcLayer(LayerAutomata):
                         break
                     dvcChId = struct.unpack_from('<I', data, offset)[0]; offset += 4
                     chTunnelType = struct.unpack_from('<I', data, offset)[0]; offset += 4
-                    log.info("DrdynvcLayer: Soft-Sync channel[%d] dvcId=%d tunnelType=0x%08x" %
+                    log.debug("DrdynvcLayer: Soft-Sync channel[%d] dvcId=%d tunnelType=0x%08x" %
                              (i, dvcChId, chTunnelType))
 
         # Send Soft-Sync Response
@@ -323,12 +323,12 @@ class DrdynvcLayer(LayerAutomata):
         resp += struct.pack('<I', len(respPayload))  # length
         resp += respPayload
         self._send(bytes(resp))
-        log.info("DrdynvcLayer: sent Soft-Sync Response")
+        log.debug("DrdynvcLayer: sent Soft-Sync Response")
 
     def _processCreateRequest(self, data, cbId):
         channelId, offset = self._readChannelId(data, 1, cbId)
         channelName = data[offset:].split(b'\x00')[0].decode('utf-8', errors='replace')
-        log.info("DrdynvcLayer: CREATE channelId=%d name=%s" % (channelId, channelName))
+        log.debug("DrdynvcLayer: CREATE channelId=%d name=%s" % (channelId, channelName))
 
         # Only accept channels we actually implement; reject others so the
         # server doesn't expect functionality we cannot provide (matching grdp).
@@ -357,7 +357,7 @@ class DrdynvcLayer(LayerAutomata):
         else:
             response += struct.pack('<i', -1)  # reject
             self._send(bytes(response))
-            log.info("DrdynvcLayer: rejected channel %s (id=%d) — no handler" % (channelName, channelId))
+            log.debug("DrdynvcLayer: rejected channel %s (id=%d) — no handler" % (channelName, channelId))
             return
 
         if channelName == RDPGFX_CHANNEL_NAME:
@@ -365,10 +365,10 @@ class DrdynvcLayer(LayerAutomata):
             if not self._gfxConfirmed:
                 self._sendRdpgfxCapsAdvertise(channelId, cbId)
             else:
-                log.info("RDPGFX: channel re-created without close, skipping duplicate CAPS_ADVERTISE")
+                log.debug("RDPGFX: channel re-created without close, skipping duplicate CAPS_ADVERTISE")
         elif channelName in ("rdpsnd", "AUDIO_PLAYBACK_DVC", "AUDIO_PLAYBACK_LOSSY_DVC"):
             self._rdpsndDvcChannelIds.add(channelId)
-            log.info("DrdynvcLayer: RDPSND DVC channel mapped to channelId=%d (%s)" % (channelId, channelName))
+            log.debug("DrdynvcLayer: RDPSND DVC channel mapped to channelId=%d (%s)" % (channelId, channelName))
             if self._rdpsndLayer is not None and self._rdpsndDvcPrimaryId is None:
                 # Use the first audio channel as the primary for sending responses
                 self._rdpsndDvcPrimaryId = channelId
@@ -429,7 +429,7 @@ class DrdynvcLayer(LayerAutomata):
         if channelId == self._gfxChannelId and len(payload) >= 8:
             self._processRdpgfxStream(payload)
         elif channelId in self._rdpsndDvcChannelIds and self._rdpsndLayer is not None:
-            log.info("DrdynvcLayer: routing DVC rdpsnd data len=%d channelId=%d to RdpsndLayer" %
+            log.debug("DrdynvcLayer: routing DVC rdpsnd data len=%d channelId=%d to RdpsndLayer" %
                      (len(payload), channelId))
             self._rdpsndLayer._processData(payload)
         else:
@@ -450,7 +450,7 @@ class DrdynvcLayer(LayerAutomata):
                 self._rdpsndDvcPrimaryId = None
                 if self._rdpsndLayer is not None:
                     self._rdpsndLayer._dvcSendCallback = None
-        log.info("DrdynvcLayer: CLOSE channelId=%d (%s)" % (channelId, channelName))
+        log.debug("DrdynvcLayer: CLOSE channelId=%d (%s)" % (channelId, channelName))
 
     # ---------------------------------------------------------------
     # RDP_SEGMENTED_DATA unwrapping (MS-RDPEGFX 2.2.5)
@@ -605,10 +605,10 @@ class DrdynvcLayer(LayerAutomata):
             version = struct.unpack_from('<I', payload, 0)[0]
             dataLen = struct.unpack_from('<I', payload, 4)[0]
             flags = struct.unpack_from('<I', payload, 8)[0] if dataLen >= 4 else 0
-            log.info("RDPGFX: CAPS_CONFIRM version=0x%08x flags=0x%08x" % (version, flags))
+            log.debug("RDPGFX: CAPS_CONFIRM version=0x%08x flags=0x%08x" % (version, flags))
             self._gfxVersion = version
         else:
-            log.info("RDPGFX: CAPS_CONFIRM (short payload)")
+            log.debug("RDPGFX: CAPS_CONFIRM (short payload)")
         self._gfxConfirmed = True
         if self._capsConfirmCallback:
             self._capsConfirmCallback()
@@ -639,7 +639,7 @@ class DrdynvcLayer(LayerAutomata):
             self._avcDecoder = None
         # Reset frame counter (matches grdp's framesDecoded.Store(0))
         self._totalFramesDecoded = 0
-        log.info("RDPGFX: RESET_GRAPHICS %dx%d monitors=%d" % (width, height, monitorCount))
+        log.debug("RDPGFX: RESET_GRAPHICS %dx%d monitors=%d" % (width, height, monitorCount))
 
     def _onCreateSurface(self, payload):
         """CREATE_SURFACE: surfaceId(2) + width(2) + height(2) + pixelFormat(1)"""
@@ -651,7 +651,7 @@ class DrdynvcLayer(LayerAutomata):
         pixelFormat = payload[6]
         self._surfaces[surfaceId] = (width, height, pixelFormat)
         self._surfaceData[surfaceId] = bytearray(width * height * 4)
-        log.info("RDPGFX: CREATE_SURFACE id=%d %dx%d fmt=0x%02x" %
+        log.debug("RDPGFX: CREATE_SURFACE id=%d %dx%d fmt=0x%02x" %
                  (surfaceId, width, height, pixelFormat))
 
     def _onDeleteSurface(self, payload):
@@ -671,7 +671,7 @@ class DrdynvcLayer(LayerAutomata):
         outputOriginX = struct.unpack_from('<I', payload, 4)[0]
         outputOriginY = struct.unpack_from('<I', payload, 8)[0]
         self._surfaceOutputMap[surfaceId] = (outputOriginX, outputOriginY)
-        log.info("RDPGFX: MAP_SURFACE_TO_OUTPUT id=%d -> (%d,%d)" %
+        log.debug("RDPGFX: MAP_SURFACE_TO_OUTPUT id=%d -> (%d,%d)" %
                  (surfaceId, outputOriginX, outputOriginY))
 
     def _onStartFrame(self, payload):
@@ -712,7 +712,7 @@ class DrdynvcLayer(LayerAutomata):
         width = right - left
         height = bottom - top
 
-        log.info("RDPGFX: WTS1 surfId=%d codecId=0x%04X %dx%d bmpLen=%d" %
+        log.debug("RDPGFX: WTS1 surfId=%d codecId=0x%04X %dx%d bmpLen=%d" %
                  (surfaceId, codecId, width, height, len(bitmapData)))
 
         # CaVideo is heavy (RFX tile decode) — skip when under backpressure
@@ -752,7 +752,7 @@ class DrdynvcLayer(LayerAutomata):
 
         surfInfo = self._surfaces.get(surfaceId)
         w, h = (surfInfo[0], surfInfo[1]) if surfInfo else (0, 0)
-        log.info("RDPGFX: WTS2 surfId=%d codecId=0x%04X %dx%d bmpLen=%d" %
+        log.debug("RDPGFX: WTS2 surfId=%d codecId=0x%04X %dx%d bmpLen=%d" %
                  (surfaceId, codecId, w, h, len(bitmapData)))
 
         # Skip heavy codecs (CaVideo, Progressive) when under backpressure
@@ -876,7 +876,7 @@ class DrdynvcLayer(LayerAutomata):
                 return None
             try:
                 self._avcDecoder = avc_module.AvcDecoder()
-                log.info("RDPGFX: AVC decoder initialized (hardware=%s)" %
+                log.debug("RDPGFX: AVC decoder initialized (hardware=%s)" %
                          self._avcDecoder.is_hardware)
             except Exception as e:
                 log.warning("RDPGFX: failed to initialize AVC decoder: %s" % e)
@@ -1326,9 +1326,9 @@ class DrdynvcLayer(LayerAutomata):
 
         self._sendDvcData(channelId, cbId, gfxPdu)
         if avc_module.is_available():
-            log.info("RDPGFX: sent CAPS_ADVERTISE (v10+v8.0, AVC enabled)")
+            log.debug("RDPGFX: sent CAPS_ADVERTISE (v10+v8.0, AVC enabled)")
         else:
-            log.info("RDPGFX: sent CAPS_ADVERTISE (v8.0, AVC disabled)")
+            log.debug("RDPGFX: sent CAPS_ADVERTISE (v8.0, AVC disabled)")
 
     # ---------------------------------------------------------------
     # DVC transport

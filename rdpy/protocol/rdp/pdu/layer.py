@@ -220,12 +220,12 @@ class Client(PDULayer):
         s.readType(pdu)
         
         if pdu.shareControlHeader.pduType.value == data.PDUType.PDUTYPE_SERVER_REDIR_PKT:
-            log.info("Received server redirection PDU during connection sequence")
+            log.debug("Received server redirection PDU during connection sequence")
             self._handleServerRedirection(pdu.pduMessage)
             return
         
         if pdu.shareControlHeader.pduType.value == data.PDUType.PDUTYPE_DEACTIVATEALLPDU:
-            log.info("Received DeactivateAll PDU, waiting for new DemandActive")
+            log.debug("Received DeactivateAll PDU, waiting for new DemandActive")
             return
         
         if pdu.shareControlHeader.pduType.value != data.PDUType.PDUTYPE_DEMANDACTIVEPDU:
@@ -257,7 +257,7 @@ class Client(PDULayer):
         pdu = data.PDU()
         s.readType(pdu)
         if pdu.shareControlHeader.pduType.value == data.PDUType.PDUTYPE_DEACTIVATEALLPDU:
-            log.info("Received DeactivateAll during sync, restarting capability exchange")
+            log.debug("Received DeactivateAll during sync, restarting capability exchange")
             self.setNextState(self.recvDemandActivePDU)
             return
         if pdu.shareControlHeader.pduType.value != data.PDUType.PDUTYPE_DATAPDU or pdu.pduMessage.shareDataHeader.pduType2.value != data.PDUType2.PDUTYPE2_SYNCHRONIZE:
@@ -278,7 +278,7 @@ class Client(PDULayer):
         pdu = data.PDU()
         s.readType(pdu)
         if pdu.shareControlHeader.pduType.value == data.PDUType.PDUTYPE_DEACTIVATEALLPDU:
-            log.info("Received DeactivateAll during control cooperate, restarting capability exchange")
+            log.debug("Received DeactivateAll during control cooperate, restarting capability exchange")
             self.setNextState(self.recvDemandActivePDU)
             return
         if pdu.shareControlHeader.pduType.value != data.PDUType.PDUTYPE_DATAPDU or pdu.pduMessage.shareDataHeader.pduType2.value != data.PDUType2.PDUTYPE2_CONTROL or pdu.pduMessage.pduData.action.value != data.Action.CTRLACTION_COOPERATE:
@@ -299,7 +299,7 @@ class Client(PDULayer):
         pdu = data.PDU()
         s.readType(pdu)
         if pdu.shareControlHeader.pduType.value == data.PDUType.PDUTYPE_DEACTIVATEALLPDU:
-            log.info("Received DeactivateAll during control granted, restarting capability exchange")
+            log.debug("Received DeactivateAll during control granted, restarting capability exchange")
             self.setNextState(self.recvDemandActivePDU)
             return
         if pdu.shareControlHeader.pduType.value != data.PDUType.PDUTYPE_DATAPDU or pdu.pduMessage.shareDataHeader.pduType2.value != data.PDUType2.PDUTYPE2_CONTROL or pdu.pduMessage.pduData.action.value != data.Action.CTRLACTION_GRANTED_CONTROL:
@@ -320,7 +320,7 @@ class Client(PDULayer):
         pdu = data.PDU()
         s.readType(pdu)
         if pdu.shareControlHeader.pduType.value == data.PDUType.PDUTYPE_DEACTIVATEALLPDU:
-            log.info("Received DeactivateAll during font map, restarting capability exchange")
+            log.debug("Received DeactivateAll during font map, restarting capability exchange")
             self.setNextState(self.recvDemandActivePDU)
             return
         if pdu.shareControlHeader.pduType.value != data.PDUType.PDUTYPE_DATAPDU or pdu.pduMessage.shareDataHeader.pduType2.value != data.PDUType2.PDUTYPE2_FONTMAP:
@@ -354,7 +354,7 @@ class Client(PDULayer):
                 #http://msdn.microsoft.com/en-us/library/cc240454.aspx
                 self.setNextState(self.recvDemandActivePDU)
             elif pdu.shareControlHeader.pduType.value == data.PDUType.PDUTYPE_SERVER_REDIR_PKT:
-                log.info("Received server redirection PDU")
+                log.debug("Received server redirection PDU")
                 self._handleServerRedirection(pdu.pduMessage)
         
     def recvFastPath(self, secFlag, fastPathS):
@@ -769,7 +769,7 @@ class Client(PDULayer):
         @summary: Handle server redirection PDU
         @param redirPDU: ServerRedirectionPDU object
         """
-        log.info("Server redirection requested")
+        log.debug("Server redirection requested")
         if hasattr(self._listener, 'onRedirect'):
             self._listener.onRedirect(redirPDU)
         

@@ -235,17 +235,17 @@ class Client(X224Layer):
             self._presentation.connect()
             
         elif self._selectedProtocol ==  Protocols.PROTOCOL_SSL:
-            log.info("*" * 43)
-            log.info("*" + " " * 10  + "SSL Security selected" + " " * 10 + "*")
-            log.info("*" * 43)
+            log.debug("*" * 43)
+            log.debug("*" + " " * 10  + "SSL Security selected" + " " * 10 + "*")
+            log.debug("*" * 43)
             self._transport.startTLS(ClientTLSContext())
             #connection is done send to presentation
             self._presentation.connect()
     
         elif self._selectedProtocol == Protocols.PROTOCOL_HYBRID:
-            log.info("*" * 43)
-            log.info("*" + " " * 10  + "NLA Security selected" + " " * 10 + "*")
-            log.info("*" * 43)
+            log.debug("*" * 43)
+            log.debug("*" + " " * 10  + "NLA Security selected" + " " * 10 + "*")
+            log.debug("*" * 43)
             self._transport.startNLA(ClientTLSContext(), lambda:self._presentation.connect())
 
 class Server(X224Layer):

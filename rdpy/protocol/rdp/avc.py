@@ -68,7 +68,7 @@ def _try_open_hw_decoder():
             accel = HWAccel(hw_name)
             ctx = av.codec.CodecContext.create(codec, hwaccel=accel)
             ctx.open()
-            log.info("AVC: opened hardware decoder: %s" % hw_name)
+            log.debug("AVC: opened hardware decoder: %s" % hw_name)
             return ctx, hw_name
         except Exception as e:
             log.debug("AVC: hardware decoder '%s' unavailable: %s" % (hw_name, e))
@@ -92,7 +92,7 @@ def _open_sw_decoder():
     ctx.thread_count = 1
     ctx.options = {'flags': '+low_delay', 'flags2': '+fast'}
     ctx.open()
-    log.info("AVC: using software H.264 decoder (thread_count=1, low_delay)")
+    log.debug("AVC: using software H.264 decoder (thread_count=1, low_delay)")
     return ctx
 
 
@@ -289,7 +289,7 @@ class AvcDecoder:
         # Log NAL types for early frames and every IDR
         if self._decode_count <= 5 or has_idr:
             names = [self._NAL_NAMES.get(t, str(t)) for t in nal_types]
-            log.info("AVC: decode #%d NAL types: %s (h264Len=%d)" %
+            log.debug("AVC: decode #%d NAL types: %s (h264Len=%d)" %
                      (self._decode_count, ','.join(names), len(h264_data)))
 
         try:
@@ -299,20 +299,20 @@ class AvcDecoder:
             if result is None and has_idr:
                 # New SPS caused the decoder to buffer instead of output.
                 # Flush internal state and retry — IDR is self-contained.
-                log.info("AVC: decode #%d null on IDR, flushing and retrying" %
+                log.debug("AVC: decode #%d null on IDR, flushing and retrying" %
                          self._decode_count)
                 self._ctx.flush_buffers()
                 result = self._receive_frame(packet)
                 if result is not None:
-                    log.info("AVC: decode #%d retry OK %dx%d" %
+                    log.debug("AVC: decode #%d retry OK %dx%d" %
                              (self._decode_count, result.width, result.height))
 
             if result is None:
                 self._null_count += 1
-                log.info("AVC: decode #%d returned no frame (null_count=%d, h264Len=%d)" %
+                log.debug("AVC: decode #%d returned no frame (null_count=%d, h264Len=%d)" %
                          (self._decode_count, self._null_count, len(h264_data)))
             elif self._decode_count <= 3:
-                log.info("AVC: decode #%d OK frame=%dx%d fmt=%s h264Len=%d" %
+                log.debug("AVC: decode #%d OK frame=%dx%d fmt=%s h264Len=%d" %
                          (self._decode_count, result.width, result.height,
                           result.format.name, len(h264_data)))
             return result
@@ -349,7 +349,7 @@ class AvcDecoder:
         # Log stride info for first few frames to detect padding issues
         if self._decode_count <= 3:
             plane = bgra_frame.planes[0]
-            log.info("AVC: frame_to_bgra #%d src=%dx%d dest=%dx%d linesize=%d expected=%d" %
+            log.debug("AVC: frame_to_bgra #%d src=%dx%d dest=%dx%d linesize=%d expected=%d" %
                      (self._decode_count, src_w, src_h, dest_width, dest_height,
                       plane.line_size, dest_width * 4))
 
@@ -381,7 +381,7 @@ class AvcDecoder:
             img = Image.fromarray(rgba[:height, :width], 'RGBA')
             path = '/tmp/rdpyqt_frame_%d.png' % self._decode_count
             img.save(path)
-            log.info("AVC: saved diagnostic frame to %s" % path)
+            log.debug("AVC: saved diagnostic frame to %s" % path)
         except Exception as e:
             log.debug("AVC: could not save diagnostic frame: %s" % e)
 

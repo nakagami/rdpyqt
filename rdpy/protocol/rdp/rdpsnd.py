@@ -212,7 +212,7 @@ class RdpsndLayer(LayerAutomata):
     def recv(self, s):
         """Receive data on the rdpsnd static virtual channel with VChannel reassembly."""
         data = s.read()
-        log.info("RDPSND: recv raw %d bytes" % len(data))
+        log.debug("RDPSND: recv raw %d bytes" % len(data))
         if len(data) < 8:
             log.warning("RDPSND: recv data too short (%d bytes), skipping" % len(data))
             return
@@ -247,7 +247,7 @@ class RdpsndLayer(LayerAutomata):
         _names = {SNDC_FORMATS: "FORMATS", SNDC_TRAINING: "TRAINING",
                   SNDC_WAVE: "WAVE", SNDC_WAVE2: "WAVE2", SNDC_CLOSE: "CLOSE",
                   SNDC_SETVOLUME: "SETVOLUME", SNDC_QUALITYMODE: "QUALITYMODE"}
-        log.info("RDPSND: recv msgType=%s(0x%02x) bodySize=%d" %
+        log.debug("RDPSND: recv msgType=%s(0x%02x) bodySize=%d" %
                  (_names.get(msgType, "?"), msgType, bodySize))
 
         if msgType == SNDC_FORMATS:
@@ -265,7 +265,7 @@ class RdpsndLayer(LayerAutomata):
         elif msgType == SNDC_QUALITYMODE:
             pass
         else:
-            log.info("RDPSND: unknown msgType=0x%02x len=%d" % (msgType, len(data)))
+            log.debug("RDPSND: unknown msgType=0x%02x len=%d" % (msgType, len(data)))
 
     # ---------------------------------------------------------------
     # Server Audio Formats and Version (MS-RDPEA 2.2.2.1)
@@ -284,7 +284,7 @@ class RdpsndLayer(LayerAutomata):
         wVersion = struct.unpack_from('<H', body, 17)[0]
         # body[19] = bPad (1 byte)
 
-        log.info("RDPSND: Server Formats version=%d numFormats=%d flags=0x%x" %
+        log.debug("RDPSND: Server Formats version=%d numFormats=%d flags=0x%x" %
                  (wVersion, wNumberOfFormats, dwFlags))
 
         offset = 20
@@ -329,7 +329,7 @@ class RdpsndLayer(LayerAutomata):
 
         pdu = struct.pack('<BBH', SNDC_FORMATS, 0, len(body)) + body
         self._send(pdu)
-        log.info("RDPSND: sent Client Formats version=%d numFormats=%d" %
+        log.debug("RDPSND: sent Client Formats version=%d numFormats=%d" %
                  (version, len(self._clientFormatIndices)))
 
         # FreeRDP sends Quality Mode PDU right after Client Formats
@@ -454,7 +454,7 @@ class RdpsndLayer(LayerAutomata):
 
     def _processClose(self):
         """Handle Close PDU from server."""
-        log.info("RDPSND: server closed audio channel")
+        log.debug("RDPSND: server closed audio channel")
         self._stopAudio()
 
     # ---------------------------------------------------------------
@@ -468,7 +468,7 @@ class RdpsndLayer(LayerAutomata):
         body = struct.pack('<HH', DYNAMIC_QUALITY, 0)  # wQualityMode + Reserved
         pdu = struct.pack('<BBH', SNDC_QUALITYMODE, 0, len(body)) + body
         self._send(pdu)
-        log.info("RDPSND: sent Quality Mode (DYNAMIC)")
+        log.debug("RDPSND: sent Quality Mode (DYNAMIC)")
 
     # ---------------------------------------------------------------
     # Audio playback via QAudioSink (pull mode)
@@ -520,7 +520,7 @@ class RdpsndLayer(LayerAutomata):
         self._audioSink.setBufferSize(fmt.avg_bytes_per_sec * 2)
         self._audioSink.start(self._audioBuffer)
         self._audioInitialized = True
-        log.info("RDPSND: audio output configured (pull mode): %s" % fmt)
+        log.debug("RDPSND: audio output configured (pull mode): %s" % fmt)
 
     def _playAudio(self, data):
         """Append PCM data to the audio ring buffer.

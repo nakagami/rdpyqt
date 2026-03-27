@@ -222,7 +222,7 @@ class MCSLayer(LayerAutomata):
         data.readType(opcode)
         
         if self.readMCSPDUHeader(opcode.value, DomainMCSPDU.DISCONNECT_PROVIDER_ULTIMATUM):
-            log.info("MCS DISCONNECT_PROVIDER_ULTIMATUM")
+            log.debug("MCS DISCONNECT_PROVIDER_ULTIMATUM")
             self._transport.close()
             return
         
@@ -244,7 +244,7 @@ class MCSLayer(LayerAutomata):
             return
 
         if channelId != Channel.MCS_GLOBAL_CHANNEL:
-            log.info("MCS recvData channelId=%d -> %s" % (channelId, self._channels[channelId].__class__.__name__))
+            log.debug("MCS recvData channelId=%d -> %s" % (channelId, self._channels[channelId].__class__.__name__))
 
         self._channels[channelId].recv(data) 
     
@@ -393,12 +393,12 @@ class Client(MCSLayer):
         serverNet = self._serverSettings.getBlock(gcc.MessageType.SC_NET)
         if serverNet is not None:
             channelIds = [serverNet.channelIdArray[i].value for i in range(serverNet.channelCount.value)]
-            log.info("SC_NET MCSChannelId=%d channelCount=%d channelIds=%s" %
+            log.debug("SC_NET MCSChannelId=%d channelCount=%d channelIds=%s" %
                      (serverNet.MCSChannelId.value, serverNet.channelCount.value, channelIds))
             for i, vc in enumerate(self._virtualChannels):
                 chName = vc[0].name.value.rstrip(b'\x00').decode('utf-8', errors='replace')
                 assignedId = channelIds[i] if i < len(channelIds) else 'N/A'
-                log.info("  virtualChannel[%d] name=%s -> channelId=%s" % (i, chName, assignedId))
+                log.debug("  virtualChannel[%d] name=%s -> channelId=%s" % (i, chName, assignedId))
         else:
             log.warning("SC_NET block not found in server response!")
 
@@ -449,7 +449,7 @@ class Client(MCSLayer):
             raise InvalidExpectedDataException("Invalid MCS User Id")
         
         channelId = per.readInteger16(data)
-        log.info(f"MCS ChannelJoinConfirm channelId={channelId} confirm={confirm}")
+        log.debug(f"MCS ChannelJoinConfirm channelId={channelId} confirm={confirm}")
         #must confirm global channel and user channel
         if (confirm != 0) and (channelId == Channel.MCS_GLOBAL_CHANNEL or channelId == self._userId):
             raise InvalidExpectedDataException("Server must confirm static channel")
@@ -459,7 +459,7 @@ class Client(MCSLayer):
             for i in range(0, serverNet.channelCount.value):
                 if channelId == serverNet.channelIdArray[i].value:
                     self._channels[channelId] = self._virtualChannels[i][1]
-                    log.info(f"MCS channel {channelId} mapped to virtualChannel[{i}] ({self._virtualChannels[i][1].__class__.__name__})")
+                    log.debug(f"MCS channel {channelId} mapped to virtualChannel[{i}] ({self._virtualChannels[i][1].__class__.__name__})")
         
         self.connectNextChannel()
         

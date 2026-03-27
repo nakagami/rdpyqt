@@ -121,14 +121,14 @@ class CliprdrLayer(LayerAutomata):
     def recv(self, s):
         """Receive data on the cliprdr static virtual channel with VChannel reassembly."""
         data = s.read()
-        log.info("CLIPRDR DEBUG: recv() called, data length=%d" % len(data))
+        log.debug("CLIPRDR DEBUG: recv() called, data length=%d" % len(data))
         if len(data) < 8:
             log.warning("CLIPRDR: recv data too short (%d bytes)" % len(data))
             return
         totalLen = struct.unpack_from('<I', data, 0)[0]
         flags = struct.unpack_from('<I', data, 4)[0]
         payload = data[8:]
-        log.info("CLIPRDR DEBUG: recv totalLen=%d flags=0x%08x payloadLen=%d" % (totalLen, flags, len(payload)))
+        log.debug("CLIPRDR DEBUG: recv totalLen=%d flags=0x%08x payloadLen=%d" % (totalLen, flags, len(payload)))
 
         if flags & CHANNEL_FLAG_FIRST:
             self._vchanBuf = payload
@@ -136,7 +136,7 @@ class CliprdrLayer(LayerAutomata):
             self._vchanBuf += payload
 
         if flags & CHANNEL_FLAG_LAST:
-            log.info("CLIPRDR DEBUG: reassembled %d bytes, processing" % len(self._vchanBuf))
+            log.debug("CLIPRDR DEBUG: reassembled %d bytes, processing" % len(self._vchanBuf))
             if len(self._vchanBuf) >= 1:
                 self._processData(bytes(self._vchanBuf))
             self._vchanBuf = b''
@@ -152,7 +152,7 @@ class CliprdrLayer(LayerAutomata):
         dataLen = struct.unpack_from('<I', data, 4)[0]
         body = data[8:8 + dataLen]
 
-        log.info("CLIPRDR: recv %s(0x%04x) flags=0x%04x dataLen=%d" %
+        log.debug("CLIPRDR: recv %s(0x%04x) flags=0x%04x dataLen=%d" %
                  (_MSG_NAMES.get(msgType, "?"), msgType, msgFlags, dataLen))
 
         if msgType == CB_CLIP_CAPS:
@@ -195,7 +195,7 @@ class CliprdrLayer(LayerAutomata):
                 self._serverGeneralFlags = struct.unpack_from('<I', body, offset + 8)[0]
                 self._useLongFormatNames = bool(
                     self._serverGeneralFlags & CB_USE_LONG_FORMAT_NAMES)
-                log.info("CLIPRDR: server generalFlags=0x%08x longNames=%s" %
+                log.debug("CLIPRDR: server generalFlags=0x%08x longNames=%s" %
                          (self._serverGeneralFlags, self._useLongFormatNames))
             offset += capLen
 
@@ -210,7 +210,7 @@ class CliprdrLayer(LayerAutomata):
         # cCapabilitySets(2) + pad1(2) + capabilitySet
         body = struct.pack('<HH', 1, 0) + capSet
         self._sendPDU(CB_CLIP_CAPS, 0, body)
-        log.info("CLIPRDR: sent Clip Caps")
+        log.debug("CLIPRDR: sent Clip Caps")
 
     # -------------------------------------------------------------------
     # Monitor Ready (MS-RDPECLIP 2.2.2.2)
@@ -218,7 +218,7 @@ class CliprdrLayer(LayerAutomata):
 
     def _processMonitorReady(self, body):
         """Handle Monitor Ready PDU: server is ready for clipboard exchange."""
-        log.info("CLIPRDR: server Monitor Ready")
+        log.debug("CLIPRDR: server Monitor Ready")
         # Respond with our capabilities and an initial format list
         self._sendClipCaps()
         self._sendFormatList()
@@ -238,13 +238,13 @@ class CliprdrLayer(LayerAutomata):
             body = struct.pack('<I', CF_UNICODETEXT)
             body += b'\x00' * 32
         self._sendPDU(CB_FORMAT_LIST, 0, body)
-        log.info("CLIPRDR: sent Format List (CF_UNICODETEXT)")
+        log.debug("CLIPRDR: sent Format List (CF_UNICODETEXT)")
 
     def _processFormatList(self, body, msgFlags):
         """Handle Format List PDU from server (server clipboard changed)."""
         # Parse formats offered by the server
         formats = self._parseFormatList(body, msgFlags)
-        log.info("CLIPRDR: server Format List: %s" % formats)
+        log.debug("CLIPRDR: server Format List: %s" % formats)
 
         # Always respond with OK
         self._sendPDU(CB_FORMAT_LIST_RESPONSE, CB_RESPONSE_OK, b'')
@@ -309,7 +309,7 @@ class CliprdrLayer(LayerAutomata):
         """Send Format Data Request to server."""
         body = struct.pack('<I', formatId)
         self._sendPDU(CB_FORMAT_DATA_REQUEST, 0, body)
-        log.info("CLIPRDR: sent Format Data Request formatId=%d" % formatId)
+        log.debug("CLIPRDR: sent Format Data Request formatId=%d" % formatId)
 
     def _processFormatDataRequest(self, body):
         """Handle Format Data Request from server (server wants our clipboard)."""
@@ -318,7 +318,7 @@ class CliprdrLayer(LayerAutomata):
             return
 
         requestedFormat = struct.unpack_from('<I', body, 0)[0]
-        log.info("CLIPRDR: server requests format %d" % requestedFormat)
+        log.debug("CLIPRDR: server requests format %d" % requestedFormat)
 
         text = ''
         if self._getLocalClipboardText is not None:
@@ -364,7 +364,7 @@ class CliprdrLayer(LayerAutomata):
         text = text.rstrip('\x00')
 
         if text and self._onRemoteClipboardChanged is not None:
-            log.info("CLIPRDR: received text (%d chars)" % len(text))
+            log.debug("CLIPRDR: received text (%d chars)" % len(text))
             self._suppressNextLocalChange = True
             self._onRemoteClipboardChanged(text)
 
@@ -375,16 +375,16 @@ class CliprdrLayer(LayerAutomata):
     def onLocalClipboardChanged(self):
         """Called when the local clipboard content changes.
         Sends a Format List to the server to advertise new content."""
-        log.info("CLIPRDR DEBUG: onLocalClipboardChanged() suppress=%s transport=%s" %
+        log.debug("CLIPRDR DEBUG: onLocalClipboardChanged() suppress=%s transport=%s" %
                  (self._suppressNextLocalChange,
                   type(self._transport).__name__ if self._transport else "None"))
         if self._suppressNextLocalChange:
             self._suppressNextLocalChange = False
-            log.info("CLIPRDR DEBUG: suppressed (echo prevention)")
+            log.debug("CLIPRDR DEBUG: suppressed (echo prevention)")
             return
         if self._transport is not None:
             self._sendFormatList()
-            log.info("CLIPRDR: local clipboard changed, sent Format List")
+            log.debug("CLIPRDR: local clipboard changed, sent Format List")
         else:
             log.warning("CLIPRDR DEBUG: local clipboard changed but transport is None!")
 
@@ -394,7 +394,7 @@ class CliprdrLayer(LayerAutomata):
 
     def _sendPDU(self, msgType, msgFlags, body):
         """Send a CLIPRDR PDU wrapped in VChannel header."""
-        log.info("CLIPRDR DEBUG: _sendPDU type=%s(0x%04x) flags=0x%04x bodyLen=%d" %
+        log.debug("CLIPRDR DEBUG: _sendPDU type=%s(0x%04x) flags=0x%04x bodyLen=%d" %
                  (_MSG_NAMES.get(msgType, "?"), msgType, msgFlags, len(body)))
         # CLIPRDR_HEADER: msgType(2) + msgFlags(2) + dataLen(4) + body
         cliprdrPdu = struct.pack('<HHI', msgType, msgFlags, len(body)) + body
@@ -410,7 +410,7 @@ class CliprdrLayer(LayerAutomata):
         VCChunkSize (1600 bytes).  Each chunk carries a VChannel header
         with totalLength and FIRST/LAST flags.
         """
-        log.info("CLIPRDR DEBUG: _send() transport=%s dataLen=%d" %
+        log.debug("CLIPRDR DEBUG: _send() transport=%s dataLen=%d" %
                  (type(self._transport).__name__ if self._transport else "None", len(data)))
         if self._transport is None:
             log.warning("CLIPRDR DEBUG: _send() SKIPPED - transport is None!")
