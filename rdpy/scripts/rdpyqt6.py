@@ -28,7 +28,7 @@ from rdpy.ui.qt6 import RDPClientQt
 from rdpy.protocol.rdp import rdp
 from rdpy.core.error import RDPSecurityNegoFail
 import rdpy.core.log as log
-log._LOG_LEVEL = log.Level.DEBUG
+log._LOG_LEVEL = log.Level.INFO
 
 
 class RDPClientQtRecorder(RDPClientQt):
