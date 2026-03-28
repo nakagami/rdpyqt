@@ -208,6 +208,7 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
         self._resizeCallback = None
         #set widget screen to RDP stack
         controller.setScreen(width, height)
+        controller.setPerformanceSession()
 
         # Clipboard integration
         self._clipboard = QtWidgets.QApplication.clipboard()
