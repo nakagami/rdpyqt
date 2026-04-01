@@ -625,6 +625,17 @@ class RfxProgressiveDecoder:
             if len(tile_positions) > 10:
                 log.debug("RFX:   ... and %d more tiles" % (len(tile_positions) - 10))
 
+        # MS-RDPEGFX: numRects==0 means the tile data represents a full-surface
+        # refresh — compute dirty bounds from decoded tile positions.
+        if num_rects == 0 and tile_positions:
+            min_x = min(tx * 64 for (tx, ty) in tile_positions)
+            min_y = min(ty * 64 for (tx, ty) in tile_positions)
+            max_x = min(max(tx * 64 + 64 for (tx, ty) in tile_positions), width)
+            max_y = min(max(ty * 64 + 64 for (tx, ty) in tile_positions), height)
+            rects = [(min_x, min_y, max_x - min_x, max_y - min_y)]
+        elif num_rects == 0:
+            rects = [(0, 0, width, height)]
+
         return rects
 
     def _get_quant(self, quants, idx):
