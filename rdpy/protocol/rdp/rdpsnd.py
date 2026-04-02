@@ -305,8 +305,6 @@ class RdpsndLayer(LayerAutomata):
         self._wavDumpFile = None
         self._wavDumpFmt = None
         self._wavDumpPath = None
-        # gnome-remote-desktop sample rate workaround
-        self._serverNativeRate = 0
         self._audioGain = 1.0
         self._lastPlayTime = 0.0
         # Auto-enable WAV dump from environment variable
@@ -412,22 +410,6 @@ class RdpsndLayer(LayerAutomata):
         for i, fmt in enumerate(self._serverFormats):
             if fmt.is_pcm() and fmt.bits_per_sample in (8, 16) and fmt.channels in (1, 2):
                 self._clientFormatIndices.append(i)
-
-        # Detect gnome-remote-desktop sample rate bug:
-        # grd offers Opus 48kHz + PCM 44100Hz, but sends PCM data at 48kHz
-        # without resampling.  Detect this and override the PCM sample rate.
-        self._serverNativeRate = 0
-        opus_rates = [f.samples_per_sec for f in self._serverFormats
-                      if f.tag == WAVE_FORMAT_OPUS]
-        if opus_rates:
-            native = max(opus_rates)
-            for i in self._clientFormatIndices:
-                fmt = self._serverFormats[i]
-                if fmt.samples_per_sec != native:
-                    log.info("RDPSND: server has Opus %dHz; PCM declared %dHz "
-                             "— overriding to %dHz (gnome-remote-desktop workaround)"
-                             % (native, fmt.samples_per_sec, native))
-                    self._serverNativeRate = native
 
         if not self._clientFormatIndices:
             log.warning("RDPSND: no supported PCM format found among server formats")
@@ -647,20 +629,13 @@ class RdpsndLayer(LayerAutomata):
         self._audioBuffer.open(QIODevice.OpenModeFlag.ReadOnly)
 
         self._audioSink = QAudioSink(device, audioFmt)
-        self._audioSink.setBufferSize(fmt.avg_bytes_per_sec * 4)
-        # gnome-remote-desktop: GFX decompression blocks the reactor for
-        # up to ~700ms, starving audio.  Use a larger pre-buffer (4s) so
-        # the ring buffer can survive these gaps.  Windows has meaningful
-        # timestamps and smaller GFX, so 0.5s is fine for A/V sync.
-        if self._serverNativeRate:
-            self._audioPrebufBytes = fmt.avg_bytes_per_sec * 4  # 4.0 seconds
-        else:
-            self._audioPrebufBytes = fmt.avg_bytes_per_sec // 2  # 0.5 seconds
+        self._audioSink.setBufferSize(fmt.avg_bytes_per_sec // 5)  # 200ms
+        self._audioPrebufBytes = fmt.avg_bytes_per_sec // 5        # 200ms
         self._audioSinkStarted = False
         self._audioInitialized = True
         # gnome-remote-desktop sends very quiet audio (~-34dB peak).
         # Amplify to bring it closer to Windows levels.
-        self._audioGain = 4.0 if self._serverNativeRate else 1.0
+        self._audioGain = 1.0
         self._wavDumpFmt = fmt
         # Open deferred WAV dump if enableWavDump() was called before format negotiation
         if hasattr(self, '_wavDumpPath') and self._wavDumpPath:
