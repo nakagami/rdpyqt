@@ -266,7 +266,7 @@ class ClientCoreData(CompositeType):
         self.serialNumber = UInt32Le(0, optional = True)
         self.highColorDepth = UInt16Le(HighColor.HIGH_COLOR_24BPP, optional = True)
         self.supportedColorDepths = UInt16Le(Support.RNS_UD_15BPP_SUPPORT | Support.RNS_UD_16BPP_SUPPORT | Support.RNS_UD_24BPP_SUPPORT | Support.RNS_UD_32BPP_SUPPORT, optional = True)
-        self.earlyCapabilityFlags = UInt16Le(CapabilityFlags.RNS_UD_CS_SUPPORT_ERRINFO_PDU | CapabilityFlags.RNS_UD_CS_WANT_32BPP_SESSION | CapabilityFlags.RNS_UD_CS_VALID_CONNECTION_TYPE | CapabilityFlags.RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL, optional = True)
+        self.earlyCapabilityFlags = UInt16Le(CapabilityFlags.RNS_UD_CS_SUPPORT_ERRINFO_PDU | CapabilityFlags.RNS_UD_CS_WANT_32BPP_SESSION | CapabilityFlags.RNS_UD_CS_VALID_CONNECTION_TYPE | CapabilityFlags.RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT | CapabilityFlags.RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL, optional = True)
         self.clientDigProductId = String(b"\x00" * 64, readLen = CallableValue(64), optional = True)
         self.connectionType = UInt8(ConnectionType.CONNECTION_TYPE_LAN, optional = True)
         self.pad1octet = UInt8(optional = True)
