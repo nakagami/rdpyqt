@@ -27,8 +27,8 @@ Protocol reference: [MS-RDPEA]
 https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpea/
 """
 
-import array
 import struct
+import numpy as np
 import time
 import threading
 from rdpy.core.layer import LayerAutomata
@@ -47,30 +47,42 @@ _FADE_FRAMES = 128
 
 
 def _build_fade_table(n):
-    """Return a list of n floats from 0.0 to 1.0 (inclusive)."""
+    """Return a contiguous float32 numpy array of n values from 0.0 to 1.0."""
     if n <= 1:
-        return [1.0]
-    return [i / (n - 1) for i in range(n)]
+        return np.ones(1, dtype=np.float32)
+    return np.linspace(0.0, 1.0, n, dtype=np.float32)
 
 
-# Pre-computed fade tables (avoids per-call allocation)
-_FADE_IN = _build_fade_table(_FADE_FRAMES)   # 0→1
-_FADE_OUT = _FADE_IN[::-1]                    # 1→0
+# Per-frame fade curves (contiguous float32)
+_FADE_IN = _build_fade_table(_FADE_FRAMES)            # 0→1
+_FADE_OUT = np.ascontiguousarray(_FADE_IN[::-1])      # 1→0, contiguous copy
+
+# Pre-interleaved stereo gains (L0,R0,L1,R1,...).
+# Computed once here so _apply_fade never calls np.repeat per invocation.
+_FADE_IN_STEREO = np.ascontiguousarray(np.repeat(_FADE_IN, 2))
+_FADE_OUT_STEREO = np.ascontiguousarray(np.repeat(_FADE_OUT, 2))
 
 
-def _apply_fade(data, table):
-    """Apply a gain curve *table* to the first len(table) stereo frames
-    of *data* (bytearray, modified in-place).  Assumes 16-bit signed LE
-    stereo (4 bytes per frame)."""
-    frame_sz = 4
-    n_frames = min(len(table), len(data) // frame_sz)
-    samples = array.array('h')
-    samples.frombytes(bytes(data[:n_frames * frame_sz]))
-    for i in range(n_frames):
-        g = table[i]
-        samples[i * 2]     = int(samples[i * 2]     * g)
-        samples[i * 2 + 1] = int(samples[i * 2 + 1] * g)
-    data[:n_frames * frame_sz] = samples.tobytes()
+def _apply_fade(data, stereo_gains):
+    """Apply a pre-interleaved stereo gain array to the leading samples of
+    *data* (bytearray or writable memoryview), modified in-place.
+
+    *stereo_gains* must be a contiguous float32 array with shape (2*n_frames,)
+    where gains are interleaved as [g_L0, g_R0, g_L1, g_R1, ...].
+    Assumes 16-bit signed LE stereo (4 bytes per frame).
+    """
+    n_samples = min(len(stereo_gains), len(data) // 2)
+    # np.frombuffer with count= avoids creating a slice copy of data
+    arr = np.frombuffer(data, dtype='<i2', count=n_samples)
+    work = arr.astype(np.float32)       # int16 → float32 working copy
+    work *= stereo_gains[:n_samples]    # in-place gain application
+    np.clip(work, -32768, 32767, out=work)
+    if arr.flags.writeable:
+        # arr is a writable view into data (bytearray / writable memoryview):
+        # write back without tobytes() – no extra allocation or copy.
+        arr[:] = work
+    else:
+        data[:n_samples * 2] = work.astype('<i2').tobytes()
 
 
 def _amplify_pcm16_stereo(data, gain):
@@ -80,16 +92,10 @@ def _amplify_pcm16_stereo(data, gain):
     """
     if gain == 1.0:
         return data
-    samples = array.array('h')
-    samples.frombytes(data)
-    for i in range(len(samples)):
-        v = int(samples[i] * gain)
-        if v > 32767:
-            v = 32767
-        elif v < -32768:
-            v = -32768
-        samples[i] = v
-    return samples.tobytes()
+    samples = np.frombuffer(data, dtype='<i2').astype(np.float32)
+    samples *= gain                             # in-place multiply
+    np.clip(samples, -32768, 32767, out=samples)
+    return samples.astype('<i2').tobytes()
 
 
 class _AudioRingBuffer:
@@ -116,31 +122,42 @@ class _AudioRingBuffer:
                     super().__init__()
                     self._lock = threading.Lock()
                     self._buf = bytearray()
+                    self._read_pos = 0      # amortised-O(1) front-deletion
                     self._was_underrun = False
+
+                def _available(self):
+                    return len(self._buf) - self._read_pos
 
                 def append(self, data):
                     with self._lock:
                         self._buf.extend(data)
-                        if len(self._buf) > self._MAX_BUF:
-                            self._buf = self._buf[-self._MAX_BUF:]
+                        # Compact when the dead prefix exceeds half of MAX_BUF,
+                        # amortising the cost of memmove across many reads.
+                        if self._read_pos >= (self._MAX_BUF >> 1):
+                            del self._buf[:self._read_pos]
+                            self._read_pos = 0
+                        if self._available() > self._MAX_BUF:
+                            excess = self._available() - self._MAX_BUF
+                            self._read_pos += excess
 
                 def readData(self, maxSize):
                     with self._lock:
-                        n = min(maxSize, len(self._buf))
+                        n = min(maxSize, self._available())
                         if n > 0:
-                            chunk = bytearray(self._buf[:n])
-                            del self._buf[:n]
+                            end = self._read_pos + n
+                            chunk = bytearray(self._buf[self._read_pos:end])
+                            self._read_pos = end    # O(1) – no memmove
 
                             if self._was_underrun:
-                                _apply_fade(chunk, _FADE_IN)
+                                _apply_fade(chunk, _FADE_IN_STEREO)
                                 self._was_underrun = False
 
-                            if len(self._buf) == 0:
+                            if self._available() == 0:
                                 _apply_fade(
                                     # fade applies to the START of data,
                                     # so pass a view of the TAIL
                                     memoryview(chunk)[-_FADE_FRAMES * 4:],
-                                    _FADE_OUT,
+                                    _FADE_OUT_STEREO,
                                 )
 
                             return bytes(chunk)
@@ -154,7 +171,7 @@ class _AudioRingBuffer:
 
                 def bytesAvailable(self):
                     with self._lock:
-                        return len(self._buf) + super().bytesAvailable()
+                        return self._available() + super().bytesAvailable()
 
                 def isSequential(self):
                     return True
@@ -670,7 +687,7 @@ class RdpsndLayer(LayerAutomata):
         if self._lastPlayTime > 0:
             gap = now - self._lastPlayTime
             if gap > 0.050:  # >50ms gap = potential underrun
-                log.info("RDPSND: audio gap %.0fms (buf %d bytes)" %
+                log.debug("RDPSND: audio gap %.0fms (buf %d bytes)" %
                          (gap * 1000, self._audioBuffer.bytesAvailable()))
         self._lastPlayTime = now
         if self._audioGain != 1.0:
