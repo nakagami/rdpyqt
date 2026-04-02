@@ -334,7 +334,9 @@ class DrdynvcLayer(LayerAutomata):
         # server doesn't expect functionality we cannot provide (matching grdp).
         _SUPPORTED_CHANNELS = {
             RDPGFX_CHANNEL_NAME,
-            "rdpsnd", "AUDIO_PLAYBACK_DVC", "AUDIO_PLAYBACK_LOSSY_DVC",
+            "rdpsnd", "AUDIO_PLAYBACK_DVC",
+            # AUDIO_PLAYBACK_LOSSY_DVC (AAC/Opus) is not supported; reject it so
+            # gnome-remote-desktop falls back to lossless AUDIO_PLAYBACK_DVC (PCM).
         }
         accepted = channelName in _SUPPORTED_CHANNELS
 
@@ -366,7 +368,7 @@ class DrdynvcLayer(LayerAutomata):
                 self._sendRdpgfxCapsAdvertise(channelId, cbId)
             else:
                 log.debug("RDPGFX: channel re-created without close, skipping duplicate CAPS_ADVERTISE")
-        elif channelName in ("rdpsnd", "AUDIO_PLAYBACK_DVC", "AUDIO_PLAYBACK_LOSSY_DVC"):
+        elif channelName in ("rdpsnd", "AUDIO_PLAYBACK_DVC"):
             self._rdpsndDvcChannelIds.add(channelId)
             log.debug("DrdynvcLayer: RDPSND DVC channel mapped to channelId=%d (%s)" % (channelId, channelName))
             if self._rdpsndLayer is not None and self._rdpsndDvcPrimaryId is None:
