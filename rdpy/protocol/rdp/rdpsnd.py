@@ -106,7 +106,9 @@ SNDC_QUALITYMODE = 0x0C
 SNDC_WAVE2 = 0x0D
 
 # RDPSND version
-RDPSND_VERSION_MAJOR = 0x06
+# gnome-remote-desktop (grd-rdp-dvc-audio-playback.c) requires clientVersion >= 8
+# (CHANNEL_VERSION_WIN_8). FreeRDP defines WIN_7=6, WIN_8=8, WIN_MAX=8.
+RDPSND_VERSION_MAJOR = 0x08
 RDPSND_VERSION_MINOR = 0x00
 
 # Audio format tags (subset of WAVE format tags)

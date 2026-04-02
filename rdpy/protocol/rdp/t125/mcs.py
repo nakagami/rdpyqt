@@ -26,7 +26,7 @@ It exist channel for file system order, audio channel, clipboard etc...
 """
 import binascii
 from rdpy.core.layer import LayerAutomata, IStreamSender, Layer
-from rdpy.core.type import sizeof, Stream, UInt8, UInt16Le, String
+from rdpy.core.type import sizeof, Stream, UInt8, UInt16Le, UInt32Le, String
 from rdpy.core.error import InvalidExpectedDataException, InvalidValue, InvalidSize, CallPureVirtualFuntion
 from .ber import writeLength
 import rdpy.core.log as log
@@ -177,6 +177,8 @@ class MCSLayer(LayerAutomata):
         self._sendOpcode = sendOpcode
         #receive opcode
         self._receiveOpcode = receiveOpcode
+        #message channel id for auto-detect / heartbeat (0 means not negotiated)
+        self._messageChannelId = 0
         
     def close(self):
         """
@@ -240,14 +242,89 @@ class MCSLayer(LayerAutomata):
         
         #channel id doesn't match a requested layer
         if channelId not in self._channels:
-            log.error("receive data for an unconnected layer channelId=%d" % channelId)
+            if self._messageChannelId != 0 and channelId == self._messageChannelId:
+                self._handleAutoDetect(data)
+            elif channelId == 0:
+                # Fallback: server sent on channelId=0 (messageChannelId was not negotiated)
+                self._handleAutoDetect(data)
+            else:
+                log.error("receive data for an unconnected layer channelId=%d" % channelId)
             return
 
         if channelId != Channel.MCS_GLOBAL_CHANNEL:
             log.debug("MCS recvData channelId=%d -> %s" % (channelId, self._channels[channelId].__class__.__name__))
 
         self._channels[channelId].recv(data) 
-    
+
+    # SEC_AUTODETECT_REQ/RSP flags used in message channel PDUs
+    _SEC_AUTODETECT_REQ = 0x1000
+    _SEC_AUTODETECT_RSP = 0x2000
+
+    # FreeRDP 3.x connect-time auto-detect request types (differ from old MS-RDPBCGR values)
+    _RDP_RTT_REQUEST_CONNECTTIME = 0x1001
+    _RDP_BW_START_CONNECTTIME = 0x1014
+    _RDP_BW_PAYLOAD = 0x0002
+    _RDP_BW_STOP_CONNECTTIME = 0x002B
+
+    # Response types
+    _TYPE_ID_AUTODETECT_RESPONSE = 0x01
+    _RDP_RTT_RESPONSE_TYPE = 0x0000
+    _RDP_BW_RESULTS_CONNECTTIME = 0x0003
+
+    def _handleAutoDetect(self, data):
+        """
+        @summary: Handle connect-time auto-detect requests from the server
+                  on message channel (channelId=0). Responds to RTT and BW requests
+                  so that FreeRDP/gnome-remote-desktop enables audio output redirection.
+        @param data: {Stream} remaining payload after MCS header
+        """
+        secFlag = UInt16Le()
+        secFlagHi = UInt16Le()
+        data.readType((secFlag, secFlagHi))
+
+        if not (secFlag.value & self._SEC_AUTODETECT_REQ):
+            return
+
+        headerLength = UInt8()
+        headerTypeId = UInt8()
+        sequenceNumber = UInt16Le()
+        requestType = UInt16Le()
+        data.readType((headerLength, headerTypeId, sequenceNumber, requestType))
+
+        req = requestType.value
+        seq = sequenceNumber.value
+        log.debug("AutoDetect request: requestType=0x%04x sequenceNumber=%d" % (req, seq))
+
+        if req == self._RDP_RTT_REQUEST_CONNECTTIME:
+            # RTT Measure Response: headerLength=6, responseType=0x0000
+            self._sendAutoDetectResponse(seq, self._RDP_RTT_RESPONSE_TYPE)
+        elif req == self._RDP_BW_STOP_CONNECTTIME:
+            # BW Results (connect-time): headerLength=14, responseType=0x0003 + timeDelta + byteCount
+            self._sendAutoDetectResponse(seq, self._RDP_BW_RESULTS_CONNECTTIME, include_bw=True)
+        # BW_START (0x1014) and BW_PAYLOAD (0x0002) require no response
+
+    def _sendAutoDetectResponse(self, sequenceNumber, responseType, include_bw=False):
+        """
+        @summary: Send an auto-detect response on message channel (channelId=0).
+        @param sequenceNumber: {int} sequence number from the request
+        @param responseType: {int} response type to send
+        @param include_bw: {bool} True to include timeDelta and byteCount fields (BW results)
+        """
+        headerLength = 14 if include_bw else 6
+        respBody = (
+            UInt8(headerLength),
+            UInt8(self._TYPE_ID_AUTODETECT_RESPONSE),
+            UInt16Le(sequenceNumber),
+            UInt16Le(responseType),
+        )
+        if include_bw:
+            respBody += (UInt32Le(0), UInt32Le(0))
+
+        payload = (UInt16Le(self._SEC_AUTODETECT_RSP), UInt16Le(0)) + respBody
+        log.debug("AutoDetect response: responseType=0x%04x sequenceNumber=%d" % (responseType, sequenceNumber))
+        self.send(self._messageChannelId, payload)
+
+
     def writeDomainParams(self, maxChannels, maxUsers, maxTokens, maxPduSize):
         """
         @summary: Write a special domain parameter structure
@@ -314,6 +391,7 @@ class Client(MCSLayer):
         #use to know state of static channel
         self._isGlobalChannelRequested = False
         self._isUserChannelRequested = False
+        self._isMessageChannelRequested = False
         #nb channel requested
         self._nbChannelRequested = 0
     
@@ -356,7 +434,16 @@ class Client(MCSLayer):
             self.sendChannelJoinRequest(self._userId)
             self._isUserChannelRequested = True
             return
-        
+
+        #message channel (for auto-detect / heartbeat)
+        if not self._isMessageChannelRequested and self._messageChannelId != 0:
+            log.debug(f"message channel {self._messageChannelId}")
+            self.sendChannelJoinRequest(self._messageChannelId)
+            self._isMessageChannelRequested = True
+            return
+        elif not self._isMessageChannelRequested:
+            self._isMessageChannelRequested = True  # no message channel, skip
+
         #static virtual channel
         if self._nbChannelRequested < self._serverSettings.getBlock(gcc.MessageType.SC_NET).channelCount.value:
             channelId = self._serverSettings.getBlock(gcc.MessageType.SC_NET).channelIdArray[self._nbChannelRequested].value
@@ -401,6 +488,15 @@ class Client(MCSLayer):
                 log.debug("  virtualChannel[%d] name=%s -> channelId=%s" % (i, chName, assignedId))
         else:
             log.warning("SC_NET block not found in server response!")
+
+        # Extract message channel ID from SC_MCS_MSGCHANNEL if present
+        serverMsgCh = self._serverSettings.getBlock(gcc.MessageType.SC_MCS_MSGCHANNEL)
+        if serverMsgCh is not None:
+            self._messageChannelId = serverMsgCh.mcsChannelId.value
+            log.debug("SC_MCS_MSGCHANNEL: messageChannelId=%d" % self._messageChannelId)
+        else:
+            self._messageChannelId = 0
+            log.debug("SC_MCS_MSGCHANNEL not present, auto-detect will not use message channel")
 
         #send domain request
         self.sendErectDomainRequest()
