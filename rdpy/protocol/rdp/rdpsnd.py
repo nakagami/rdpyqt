@@ -70,8 +70,13 @@ class _AudioRingBuffer:
                             chunk = bytes(self._buf[:n])
                             del self._buf[:n]
                             return chunk
-                    # Return silence when buffer is empty
-                    return bytes(maxSize)
+                    # Return empty bytes when buffer has no data.
+                    # Previously this returned bytes(maxSize) (silence/zeros),
+                    # which injected audible silence into the audio stream
+                    # whenever the buffer was momentarily empty — causing
+                    # scratchy playback especially with small-block servers
+                    # like gnome-remote-desktop (4096 bytes/block = 23ms).
+                    return b''
 
                 def writeData(self, data):
                     return -1  # read-only
@@ -205,6 +210,8 @@ class RdpsndLayer(LayerAutomata):
         self._audioBuffer = None  # _AudioRingBuffer (pull mode)
         self._audioIO = None
         self._audioInitialized = False
+        self._audioSinkStarted = False  # True after QAudioSink.start()
+        self._audioPrebufBytes = 0      # bytes to accumulate before starting
         # DVC send callback (set when audio arrives via DVC)
         self._dvcSendCallback = None
 
@@ -481,8 +488,11 @@ class RdpsndLayer(LayerAutomata):
 
         Pull mode lets QAudioSink read data from our buffer at its own
         pace, decoupling audio playback from the Twisted reactor thread.
-        This prevents clicks/pops caused by reactor stalls (e.g. when
-        the reactor is busy decoding RDPGFX video frames).
+        QAudioSink.start() is deferred until the ring buffer has accumulated
+        0.5 seconds of audio (pre-buffer).  This prevents the buffer from
+        emptying during early playback — especially important for servers
+        that send small blocks (e.g. gnome-remote-desktop sends 4096
+        bytes = 23ms per block).
         """
         if not fmt.is_pcm():
             log.warning("RDPSND: non-PCM format, audio playback not supported: %s" % fmt)
@@ -520,9 +530,12 @@ class RdpsndLayer(LayerAutomata):
 
         self._audioSink = QAudioSink(device, audioFmt)
         self._audioSink.setBufferSize(fmt.avg_bytes_per_sec * 2)
-        self._audioSink.start(self._audioBuffer)
+        # Don't start() yet — defer until ring buffer has 0.5s of data.
+        self._audioPrebufBytes = fmt.avg_bytes_per_sec // 2  # 0.5 seconds
+        self._audioSinkStarted = False
         self._audioInitialized = True
-        log.debug("RDPSND: audio output configured (pull mode): %s" % fmt)
+        log.debug("RDPSND: audio output prepared (pull mode, prebuf=%d bytes): %s" % (
+            self._audioPrebufBytes, fmt))
 
     def _playAudio(self, data):
         """Append PCM data to the audio ring buffer.
@@ -530,10 +543,21 @@ class RdpsndLayer(LayerAutomata):
         QAudioSink reads from the buffer at its own pace (pull mode),
         so this call never blocks and never drops data unless the buffer
         overflows (~1 MB, about 6 seconds of audio).
+
+        On the first call(s), data is accumulated in the ring buffer
+        without starting playback.  Once 0.5 seconds of audio has been
+        buffered, QAudioSink.start() is called so playback begins with
+        a comfortable head start.
         """
         if not self._audioInitialized or self._audioBuffer is None:
             return
         self._audioBuffer.append(data)
+        if not self._audioSinkStarted and self._audioSink is not None:
+            if self._audioBuffer.bytesAvailable() >= self._audioPrebufBytes:
+                self._audioSink.start(self._audioBuffer)
+                self._audioSinkStarted = True
+                log.debug("RDPSND: playback started (prebuf %d bytes ready)" %
+                          self._audioBuffer.bytesAvailable())
 
     def _stopAudio(self):
         """Stop and clean up audio output."""
@@ -551,6 +575,7 @@ class RdpsndLayer(LayerAutomata):
             self._audioBuffer = None
         self._audioIO = None
         self._audioInitialized = False
+        self._audioSinkStarted = False
 
     # ---------------------------------------------------------------
     # Send helper
