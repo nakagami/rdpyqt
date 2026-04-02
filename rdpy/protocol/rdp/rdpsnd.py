@@ -27,7 +27,9 @@ Protocol reference: [MS-RDPEA]
 https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpea/
 """
 
+import array
 import struct
+import time
 import threading
 from rdpy.core.layer import LayerAutomata
 import rdpy.core.log as log
@@ -37,8 +39,66 @@ import rdpy.core.log as log
 # Audio ring buffer (QIODevice subclass for QAudioSink pull mode)
 # ---------------------------------------------------------------------------
 
+# Crossfade length in sample frames.  At 44100 Hz stereo 16-bit
+# (frame = 4 bytes), 128 frames ≈ 2.9 ms — short enough to be
+# inaudible as a fade but long enough to eliminate the "click" that
+# occurs when Core Audio transitions between audio data and silence.
+_FADE_FRAMES = 128
+
+
+def _build_fade_table(n):
+    """Return a list of n floats from 0.0 to 1.0 (inclusive)."""
+    if n <= 1:
+        return [1.0]
+    return [i / (n - 1) for i in range(n)]
+
+
+# Pre-computed fade tables (avoids per-call allocation)
+_FADE_IN = _build_fade_table(_FADE_FRAMES)   # 0→1
+_FADE_OUT = _FADE_IN[::-1]                    # 1→0
+
+
+def _apply_fade(data, table):
+    """Apply a gain curve *table* to the first len(table) stereo frames
+    of *data* (bytearray, modified in-place).  Assumes 16-bit signed LE
+    stereo (4 bytes per frame)."""
+    frame_sz = 4
+    n_frames = min(len(table), len(data) // frame_sz)
+    samples = array.array('h')
+    samples.frombytes(bytes(data[:n_frames * frame_sz]))
+    for i in range(n_frames):
+        g = table[i]
+        samples[i * 2]     = int(samples[i * 2]     * g)
+        samples[i * 2 + 1] = int(samples[i * 2 + 1] * g)
+    data[:n_frames * frame_sz] = samples.tobytes()
+
+
+def _amplify_pcm16_stereo(data, gain):
+    """Amplify 16-bit signed LE stereo PCM *data* by *gain* (float).
+
+    Returns a new bytes object.  Samples are clamped to [-32768, 32767].
+    """
+    if gain == 1.0:
+        return data
+    samples = array.array('h')
+    samples.frombytes(data)
+    for i in range(len(samples)):
+        v = int(samples[i] * gain)
+        if v > 32767:
+            v = 32767
+        elif v < -32768:
+            v = -32768
+        samples[i] = v
+    return samples.tobytes()
+
+
 class _AudioRingBuffer:
     """Thread-safe ring buffer that acts as a QIODevice for QAudioSink pull mode.
+
+    Includes crossfade logic: when the buffer empties the last chunk is
+    faded out, and when audio resumes after an underrun the first chunk
+    is faded in.  This prevents the audible "click" that Core Audio
+    produces at abrupt silence↔audio transitions.
 
     Lazily imports PyQt6 so the module can be loaded without Qt installed.
     """
@@ -56,6 +116,7 @@ class _AudioRingBuffer:
                     super().__init__()
                     self._lock = threading.Lock()
                     self._buf = bytearray()
+                    self._was_underrun = False
 
                 def append(self, data):
                     with self._lock:
@@ -67,15 +128,25 @@ class _AudioRingBuffer:
                     with self._lock:
                         n = min(maxSize, len(self._buf))
                         if n > 0:
-                            chunk = bytes(self._buf[:n])
+                            chunk = bytearray(self._buf[:n])
                             del self._buf[:n]
-                            return chunk
-                    # Return empty bytes when buffer has no data.
-                    # Previously this returned bytes(maxSize) (silence/zeros),
-                    # which injected audible silence into the audio stream
-                    # whenever the buffer was momentarily empty — causing
-                    # scratchy playback especially with small-block servers
-                    # like gnome-remote-desktop (4096 bytes/block = 23ms).
+
+                            if self._was_underrun:
+                                _apply_fade(chunk, _FADE_IN)
+                                self._was_underrun = False
+
+                            if len(self._buf) == 0:
+                                _apply_fade(
+                                    # fade applies to the START of data,
+                                    # so pass a view of the TAIL
+                                    memoryview(chunk)[-_FADE_FRAMES * 4:],
+                                    _FADE_OUT,
+                                )
+
+                            return bytes(chunk)
+
+                        self._was_underrun = True
+
                     return b''
 
                 def writeData(self, data):
@@ -121,6 +192,7 @@ WAVE_FORMAT_PCM = 0x0001
 WAVE_FORMAT_ADPCM = 0x0002
 WAVE_FORMAT_ALAW = 0x0006
 WAVE_FORMAT_MULAW = 0x0007
+WAVE_FORMAT_OPUS = 0x704F
 
 # RDPSND flags
 TSSNDCAPS_ALIVE = 0x00000001
@@ -212,6 +284,19 @@ class RdpsndLayer(LayerAutomata):
         self._audioInitialized = False
         self._audioSinkStarted = False  # True after QAudioSink.start()
         self._audioPrebufBytes = 0      # bytes to accumulate before starting
+        # Debug WAV dump (set to a path to write raw PCM to a WAV file)
+        self._wavDumpFile = None
+        self._wavDumpFmt = None
+        self._wavDumpPath = None
+        # gnome-remote-desktop sample rate workaround
+        self._serverNativeRate = 0
+        self._audioGain = 1.0
+        self._lastPlayTime = 0.0
+        # Auto-enable WAV dump from environment variable
+        import os
+        wav_path = os.environ.get('RDPSND_WAV_DUMP')
+        if wav_path:
+            self._wavDumpPath = wav_path
         # DVC send callback (set when audio arrives via DVC)
         self._dvcSendCallback = None
 
@@ -310,6 +395,22 @@ class RdpsndLayer(LayerAutomata):
         for i, fmt in enumerate(self._serverFormats):
             if fmt.is_pcm() and fmt.bits_per_sample in (8, 16) and fmt.channels in (1, 2):
                 self._clientFormatIndices.append(i)
+
+        # Detect gnome-remote-desktop sample rate bug:
+        # grd offers Opus 48kHz + PCM 44100Hz, but sends PCM data at 48kHz
+        # without resampling.  Detect this and override the PCM sample rate.
+        self._serverNativeRate = 0
+        opus_rates = [f.samples_per_sec for f in self._serverFormats
+                      if f.tag == WAVE_FORMAT_OPUS]
+        if opus_rates:
+            native = max(opus_rates)
+            for i in self._clientFormatIndices:
+                fmt = self._serverFormats[i]
+                if fmt.samples_per_sec != native:
+                    log.info("RDPSND: server has Opus %dHz; PCM declared %dHz "
+                             "— overriding to %dHz (gnome-remote-desktop workaround)"
+                             % (native, fmt.samples_per_sec, native))
+                    self._serverNativeRate = native
 
         if not self._clientFormatIndices:
             log.warning("RDPSND: no supported PCM format found among server formats")
@@ -529,13 +630,27 @@ class RdpsndLayer(LayerAutomata):
         self._audioBuffer.open(QIODevice.OpenModeFlag.ReadOnly)
 
         self._audioSink = QAudioSink(device, audioFmt)
-        self._audioSink.setBufferSize(fmt.avg_bytes_per_sec * 2)
-        # Don't start() yet — defer until ring buffer has 0.5s of data.
-        self._audioPrebufBytes = fmt.avg_bytes_per_sec // 2  # 0.5 seconds
+        self._audioSink.setBufferSize(fmt.avg_bytes_per_sec * 4)
+        # gnome-remote-desktop: GFX decompression blocks the reactor for
+        # up to ~700ms, starving audio.  Use a larger pre-buffer (2s) so
+        # the ring buffer can survive these gaps.  Windows has meaningful
+        # timestamps and smaller GFX, so 0.5s is fine for A/V sync.
+        if self._serverNativeRate:
+            self._audioPrebufBytes = fmt.avg_bytes_per_sec * 2  # 2.0 seconds
+        else:
+            self._audioPrebufBytes = fmt.avg_bytes_per_sec // 2  # 0.5 seconds
         self._audioSinkStarted = False
         self._audioInitialized = True
-        log.debug("RDPSND: audio output prepared (pull mode, prebuf=%d bytes): %s" % (
-            self._audioPrebufBytes, fmt))
+        # gnome-remote-desktop sends very quiet audio (~-34dB peak).
+        # Amplify to bring it closer to Windows levels.
+        self._audioGain = 4.0 if self._serverNativeRate else 1.0
+        self._wavDumpFmt = fmt
+        # Open deferred WAV dump if enableWavDump() was called before format negotiation
+        if hasattr(self, '_wavDumpPath') and self._wavDumpPath:
+            self.enableWavDump(self._wavDumpPath)
+            self._wavDumpPath = None
+        log.debug("RDPSND: audio output prepared (pull mode, rate=%dHz, gain=%.1f, prebuf=%d bytes): %s" % (
+            fmt.samples_per_sec, self._audioGain, self._audioPrebufBytes, fmt))
 
     def _playAudio(self, data):
         """Append PCM data to the audio ring buffer.
@@ -551,7 +666,21 @@ class RdpsndLayer(LayerAutomata):
         """
         if not self._audioInitialized or self._audioBuffer is None:
             return
+        now = time.monotonic()
+        if self._lastPlayTime > 0:
+            gap = now - self._lastPlayTime
+            if gap > 0.050:  # >50ms gap = potential underrun
+                log.info("RDPSND: audio gap %.0fms (buf %d bytes)" %
+                         (gap * 1000, self._audioBuffer.bytesAvailable()))
+        self._lastPlayTime = now
+        if self._audioGain != 1.0:
+            data = _amplify_pcm16_stereo(data, self._audioGain)
         self._audioBuffer.append(data)
+        if self._wavDumpFile is not None:
+            try:
+                self._wavDumpFile.writeframesraw(data)
+            except Exception:
+                pass
         if not self._audioSinkStarted and self._audioSink is not None:
             if self._audioBuffer.bytesAvailable() >= self._audioPrebufBytes:
                 self._audioSink.start(self._audioBuffer)
@@ -561,6 +690,7 @@ class RdpsndLayer(LayerAutomata):
 
     def _stopAudio(self):
         """Stop and clean up audio output."""
+        self._closeWavDump()
         if self._audioSink is not None:
             try:
                 self._audioSink.stop()
@@ -576,6 +706,38 @@ class RdpsndLayer(LayerAutomata):
         self._audioIO = None
         self._audioInitialized = False
         self._audioSinkStarted = False
+
+    def enableWavDump(self, path):
+        """Start dumping raw PCM audio to *path* (WAV format).
+
+        Call before connecting, or at any time — the file is opened when
+        the first audio format is negotiated.  The dump captures the
+        exact bytes received from the server, BEFORE any crossfade or
+        buffering.  Play the resulting file locally to verify whether
+        scratchiness originates from the server or from client playback.
+        """
+        import wave
+        if self._wavDumpFmt is None:
+            # Format not yet known; store path and open later
+            self._wavDumpPath = path
+            return
+        self._closeWavDump()
+        fmt = self._wavDumpFmt
+        wf = wave.open(path, 'wb')
+        wf.setnchannels(fmt.channels)
+        wf.setsampwidth(fmt.bits_per_sample // 8)
+        wf.setframerate(fmt.samples_per_sec)
+        self._wavDumpFile = wf
+        log.info("RDPSND: WAV dump started: %s" % path)
+
+    def _closeWavDump(self):
+        if self._wavDumpFile is not None:
+            try:
+                self._wavDumpFile.close()
+                log.info("RDPSND: WAV dump closed")
+            except Exception:
+                pass
+            self._wavDumpFile = None
 
     # ---------------------------------------------------------------
     # Send helper
