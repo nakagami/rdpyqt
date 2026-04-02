@@ -632,11 +632,11 @@ class RdpsndLayer(LayerAutomata):
         self._audioSink = QAudioSink(device, audioFmt)
         self._audioSink.setBufferSize(fmt.avg_bytes_per_sec * 4)
         # gnome-remote-desktop: GFX decompression blocks the reactor for
-        # up to ~700ms, starving audio.  Use a larger pre-buffer (2s) so
+        # up to ~700ms, starving audio.  Use a larger pre-buffer (4s) so
         # the ring buffer can survive these gaps.  Windows has meaningful
         # timestamps and smaller GFX, so 0.5s is fine for A/V sync.
         if self._serverNativeRate:
-            self._audioPrebufBytes = fmt.avg_bytes_per_sec * 2  # 2.0 seconds
+            self._audioPrebufBytes = fmt.avg_bytes_per_sec * 4  # 4.0 seconds
         else:
             self._audioPrebufBytes = fmt.avg_bytes_per_sec // 2  # 0.5 seconds
         self._audioSinkStarted = False

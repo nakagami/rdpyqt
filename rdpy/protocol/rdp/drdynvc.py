@@ -510,10 +510,16 @@ class DrdynvcLayer(LayerAutomata):
         self._processRdpgfxStreamSync(data)
 
     def _processRdpgfxStreamSync(self, data):
-        """Synchronous GFX processing (decompress + parse + dispatch inline)."""
+        """Synchronous GFX processing (decompress + parse + dispatch inline).
+
+        PDUs are dispatched one at a time via callLater(0, ...) so the
+        Twisted reactor can process audio DVC packets between heavy
+        codec decodes (Progressive RFX can block for 100-300ms per tile).
+        """
         raw = self._unwrapSegmentedData(data)
         if raw is None:
             return
+        pdus = []
         offset = 0
         while offset + 8 <= len(raw):
             cmdId = struct.unpack_from('<H', raw, offset)[0]
@@ -522,8 +528,21 @@ class DrdynvcLayer(LayerAutomata):
             if pduLen < 8 or offset + pduLen > len(raw):
                 break
             payload = bytes(raw[offset + 8:offset + pduLen])
-            self._processRdpgfxPdu(cmdId, flags, payload)
+            pdus.append((cmdId, flags, payload))
             offset += pduLen
+        if pdus:
+            self._processGfxPduQueue(pdus, 0)
+
+    def _processGfxPduQueue(self, pdus, idx):
+        """Process one GFX PDU, then yield to the reactor before the next."""
+        if idx >= len(pdus):
+            return
+        cmdId, flags, payload = pdus[idx]
+        self._processRdpgfxPdu(cmdId, flags, payload)
+        idx += 1
+        if idx < len(pdus):
+            from twisted.internet import reactor
+            reactor.callLater(0, self._processGfxPduQueue, pdus, idx)
 
     def _processRdpgfxPdu(self, cmdId, flags, payload):
         """Dispatch a single RDPGFX PDU."""
