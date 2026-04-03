@@ -28,6 +28,8 @@ https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpea/
 """
 
 import struct
+import numpy as np
+import time
 import threading
 from rdpy.core.layer import LayerAutomata
 import rdpy.core.log as log
@@ -37,8 +39,72 @@ import rdpy.core.log as log
 # Audio ring buffer (QIODevice subclass for QAudioSink pull mode)
 # ---------------------------------------------------------------------------
 
+# Crossfade length in sample frames.  At 44100 Hz stereo 16-bit
+# (frame = 4 bytes), 128 frames ≈ 2.9 ms — short enough to be
+# inaudible as a fade but long enough to eliminate the "click" that
+# occurs when Core Audio transitions between audio data and silence.
+_FADE_FRAMES = 128
+
+
+def _build_fade_table(n):
+    """Return a contiguous float32 numpy array of n values from 0.0 to 1.0."""
+    if n <= 1:
+        return np.ones(1, dtype=np.float32)
+    return np.linspace(0.0, 1.0, n, dtype=np.float32)
+
+
+# Per-frame fade curves (contiguous float32)
+_FADE_IN = _build_fade_table(_FADE_FRAMES)            # 0→1
+_FADE_OUT = np.ascontiguousarray(_FADE_IN[::-1])      # 1→0, contiguous copy
+
+# Pre-interleaved stereo gains (L0,R0,L1,R1,...).
+# Computed once here so _apply_fade never calls np.repeat per invocation.
+_FADE_IN_STEREO = np.ascontiguousarray(np.repeat(_FADE_IN, 2))
+_FADE_OUT_STEREO = np.ascontiguousarray(np.repeat(_FADE_OUT, 2))
+
+
+def _apply_fade(data, stereo_gains):
+    """Apply a pre-interleaved stereo gain array to the leading samples of
+    *data* (bytearray or writable memoryview), modified in-place.
+
+    *stereo_gains* must be a contiguous float32 array with shape (2*n_frames,)
+    where gains are interleaved as [g_L0, g_R0, g_L1, g_R1, ...].
+    Assumes 16-bit signed LE stereo (4 bytes per frame).
+    """
+    n_samples = min(len(stereo_gains), len(data) // 2)
+    # np.frombuffer with count= avoids creating a slice copy of data
+    arr = np.frombuffer(data, dtype='<i2', count=n_samples)
+    work = arr.astype(np.float32)       # int16 → float32 working copy
+    work *= stereo_gains[:n_samples]    # in-place gain application
+    np.clip(work, -32768, 32767, out=work)
+    if arr.flags.writeable:
+        # arr is a writable view into data (bytearray / writable memoryview):
+        # write back without tobytes() – no extra allocation or copy.
+        arr[:] = work
+    else:
+        data[:n_samples * 2] = work.astype('<i2').tobytes()
+
+
+def _amplify_pcm16_stereo(data, gain):
+    """Amplify 16-bit signed LE stereo PCM *data* by *gain* (float).
+
+    Returns a new bytes object.  Samples are clamped to [-32768, 32767].
+    """
+    if gain == 1.0:
+        return data
+    samples = np.frombuffer(data, dtype='<i2').astype(np.float32)
+    samples *= gain                             # in-place multiply
+    np.clip(samples, -32768, 32767, out=samples)
+    return samples.astype('<i2').tobytes()
+
+
 class _AudioRingBuffer:
     """Thread-safe ring buffer that acts as a QIODevice for QAudioSink pull mode.
+
+    Includes crossfade logic: when the buffer empties the last chunk is
+    faded out, and when audio resumes after an underrun the first chunk
+    is faded in.  This prevents the audible "click" that Core Audio
+    produces at abrupt silence↔audio transitions.
 
     Lazily imports PyQt6 so the module can be loaded without Qt installed.
     """
@@ -56,29 +122,56 @@ class _AudioRingBuffer:
                     super().__init__()
                     self._lock = threading.Lock()
                     self._buf = bytearray()
+                    self._read_pos = 0      # amortised-O(1) front-deletion
+                    self._was_underrun = False
+
+                def _available(self):
+                    return len(self._buf) - self._read_pos
 
                 def append(self, data):
                     with self._lock:
                         self._buf.extend(data)
-                        if len(self._buf) > self._MAX_BUF:
-                            self._buf = self._buf[-self._MAX_BUF:]
+                        # Compact when the dead prefix exceeds half of MAX_BUF,
+                        # amortising the cost of memmove across many reads.
+                        if self._read_pos >= (self._MAX_BUF >> 1):
+                            del self._buf[:self._read_pos]
+                            self._read_pos = 0
+                        if self._available() > self._MAX_BUF:
+                            excess = self._available() - self._MAX_BUF
+                            self._read_pos += excess
 
                 def readData(self, maxSize):
                     with self._lock:
-                        n = min(maxSize, len(self._buf))
+                        n = min(maxSize, self._available())
                         if n > 0:
-                            chunk = bytes(self._buf[:n])
-                            del self._buf[:n]
-                            return chunk
-                    # Return silence when buffer is empty
-                    return bytes(maxSize)
+                            end = self._read_pos + n
+                            chunk = bytearray(self._buf[self._read_pos:end])
+                            self._read_pos = end    # O(1) – no memmove
+
+                            if self._was_underrun:
+                                _apply_fade(chunk, _FADE_IN_STEREO)
+                                self._was_underrun = False
+
+                            if self._available() == 0:
+                                _apply_fade(
+                                    # fade applies to the START of data,
+                                    # so pass a view of the TAIL
+                                    memoryview(chunk)[-_FADE_FRAMES * 4:],
+                                    _FADE_OUT_STEREO,
+                                )
+
+                            return bytes(chunk)
+
+                        self._was_underrun = True
+
+                    return b''
 
                 def writeData(self, data):
                     return -1  # read-only
 
                 def bytesAvailable(self):
                     with self._lock:
-                        return len(self._buf) + super().bytesAvailable()
+                        return self._available() + super().bytesAvailable()
 
                 def isSequential(self):
                     return True
@@ -106,7 +199,9 @@ SNDC_QUALITYMODE = 0x0C
 SNDC_WAVE2 = 0x0D
 
 # RDPSND version
-RDPSND_VERSION_MAJOR = 0x06
+# gnome-remote-desktop (grd-rdp-dvc-audio-playback.c) requires clientVersion >= 8
+# (CHANNEL_VERSION_WIN_8). FreeRDP defines WIN_7=6, WIN_8=8, WIN_MAX=8.
+RDPSND_VERSION_MAJOR = 0x08
 RDPSND_VERSION_MINOR = 0x00
 
 # Audio format tags (subset of WAVE format tags)
@@ -114,6 +209,7 @@ WAVE_FORMAT_PCM = 0x0001
 WAVE_FORMAT_ADPCM = 0x0002
 WAVE_FORMAT_ALAW = 0x0006
 WAVE_FORMAT_MULAW = 0x0007
+WAVE_FORMAT_OPUS = 0x704F
 
 # RDPSND flags
 TSSNDCAPS_ALIVE = 0x00000001
@@ -203,6 +299,19 @@ class RdpsndLayer(LayerAutomata):
         self._audioBuffer = None  # _AudioRingBuffer (pull mode)
         self._audioIO = None
         self._audioInitialized = False
+        self._audioSinkStarted = False  # True after QAudioSink.start()
+        self._audioPrebufBytes = 0      # bytes to accumulate before starting
+        # Debug WAV dump (set to a path to write raw PCM to a WAV file)
+        self._wavDumpFile = None
+        self._wavDumpFmt = None
+        self._wavDumpPath = None
+        self._audioGain = 1.0
+        self._lastPlayTime = 0.0
+        # Auto-enable WAV dump from environment variable
+        import os
+        wav_path = os.environ.get('RDPSND_WAV_DUMP')
+        if wav_path:
+            self._wavDumpPath = wav_path
         # DVC send callback (set when audio arrives via DVC)
         self._dvcSendCallback = None
 
@@ -479,8 +588,11 @@ class RdpsndLayer(LayerAutomata):
 
         Pull mode lets QAudioSink read data from our buffer at its own
         pace, decoupling audio playback from the Twisted reactor thread.
-        This prevents clicks/pops caused by reactor stalls (e.g. when
-        the reactor is busy decoding RDPGFX video frames).
+        QAudioSink.start() is deferred until the ring buffer has accumulated
+        0.5 seconds of audio (pre-buffer).  This prevents the buffer from
+        emptying during early playback — especially important for servers
+        that send small blocks (e.g. gnome-remote-desktop sends 4096
+        bytes = 23ms per block).
         """
         if not fmt.is_pcm():
             log.warning("RDPSND: non-PCM format, audio playback not supported: %s" % fmt)
@@ -517,10 +629,20 @@ class RdpsndLayer(LayerAutomata):
         self._audioBuffer.open(QIODevice.OpenModeFlag.ReadOnly)
 
         self._audioSink = QAudioSink(device, audioFmt)
-        self._audioSink.setBufferSize(fmt.avg_bytes_per_sec * 2)
-        self._audioSink.start(self._audioBuffer)
+        self._audioSink.setBufferSize(fmt.avg_bytes_per_sec // 5)  # 200ms
+        self._audioPrebufBytes = fmt.avg_bytes_per_sec // 5        # 200ms
+        self._audioSinkStarted = False
         self._audioInitialized = True
-        log.debug("RDPSND: audio output configured (pull mode): %s" % fmt)
+        # gnome-remote-desktop sends very quiet audio (~-34dB peak).
+        # Amplify to bring it closer to Windows levels.
+        self._audioGain = 1.0
+        self._wavDumpFmt = fmt
+        # Open deferred WAV dump if enableWavDump() was called before format negotiation
+        if hasattr(self, '_wavDumpPath') and self._wavDumpPath:
+            self.enableWavDump(self._wavDumpPath)
+            self._wavDumpPath = None
+        log.debug("RDPSND: audio output prepared (pull mode, rate=%dHz, gain=%.1f, prebuf=%d bytes): %s" % (
+            fmt.samples_per_sec, self._audioGain, self._audioPrebufBytes, fmt))
 
     def _playAudio(self, data):
         """Append PCM data to the audio ring buffer.
@@ -528,13 +650,39 @@ class RdpsndLayer(LayerAutomata):
         QAudioSink reads from the buffer at its own pace (pull mode),
         so this call never blocks and never drops data unless the buffer
         overflows (~1 MB, about 6 seconds of audio).
+
+        On the first call(s), data is accumulated in the ring buffer
+        without starting playback.  Once 0.5 seconds of audio has been
+        buffered, QAudioSink.start() is called so playback begins with
+        a comfortable head start.
         """
         if not self._audioInitialized or self._audioBuffer is None:
             return
+        now = time.monotonic()
+        if self._lastPlayTime > 0:
+            gap = now - self._lastPlayTime
+            if gap > 0.050:  # >50ms gap = potential underrun
+                log.debug("RDPSND: audio gap %.0fms (buf %d bytes)" %
+                         (gap * 1000, self._audioBuffer.bytesAvailable()))
+        self._lastPlayTime = now
+        if self._audioGain != 1.0:
+            data = _amplify_pcm16_stereo(data, self._audioGain)
         self._audioBuffer.append(data)
+        if self._wavDumpFile is not None:
+            try:
+                self._wavDumpFile.writeframesraw(data)
+            except Exception:
+                pass
+        if not self._audioSinkStarted and self._audioSink is not None:
+            if self._audioBuffer.bytesAvailable() >= self._audioPrebufBytes:
+                self._audioSink.start(self._audioBuffer)
+                self._audioSinkStarted = True
+                log.debug("RDPSND: playback started (prebuf %d bytes ready)" %
+                          self._audioBuffer.bytesAvailable())
 
     def _stopAudio(self):
         """Stop and clean up audio output."""
+        self._closeWavDump()
         if self._audioSink is not None:
             try:
                 self._audioSink.stop()
@@ -549,6 +697,39 @@ class RdpsndLayer(LayerAutomata):
             self._audioBuffer = None
         self._audioIO = None
         self._audioInitialized = False
+        self._audioSinkStarted = False
+
+    def enableWavDump(self, path):
+        """Start dumping raw PCM audio to *path* (WAV format).
+
+        Call before connecting, or at any time — the file is opened when
+        the first audio format is negotiated.  The dump captures the
+        exact bytes received from the server, BEFORE any crossfade or
+        buffering.  Play the resulting file locally to verify whether
+        scratchiness originates from the server or from client playback.
+        """
+        import wave
+        if self._wavDumpFmt is None:
+            # Format not yet known; store path and open later
+            self._wavDumpPath = path
+            return
+        self._closeWavDump()
+        fmt = self._wavDumpFmt
+        wf = wave.open(path, 'wb')
+        wf.setnchannels(fmt.channels)
+        wf.setsampwidth(fmt.bits_per_sample // 8)
+        wf.setframerate(fmt.samples_per_sec)
+        self._wavDumpFile = wf
+        log.info("RDPSND: WAV dump started: %s" % path)
+
+    def _closeWavDump(self):
+        if self._wavDumpFile is not None:
+            try:
+                self._wavDumpFile.close()
+                log.info("RDPSND: WAV dump closed")
+            except Exception:
+                pass
+            self._wavDumpFile = None
 
     # ---------------------------------------------------------------
     # Send helper

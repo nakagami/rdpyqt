@@ -45,12 +45,14 @@ class MessageType(object):
     SC_CORE = 0x0C01
     SC_SECURITY = 0x0C02
     SC_NET = 0x0C03
+    SC_MCS_MSGCHANNEL = 0x0C04
     #client -> server
     CS_CORE = 0xC001
     CS_SECURITY = 0xC002
     CS_NET = 0xC003
     CS_CLUSTER = 0xC004
     CS_MONITOR = 0xC005
+    CS_MCS_MSGCHANNEL = 0xC006
     
 
 class ColorDepth(object):
@@ -225,7 +227,8 @@ class DataBlock(CompositeType):
             """
             @summary: build settings in accordance of type self.type.value
             """
-            for c in [ClientCoreData, ClientSecurityData, ClientNetworkData, ServerCoreData, ServerNetworkData, ServerSecurityData]:
+            for c in [ClientCoreData, ClientSecurityData, ClientNetworkData, ClientMessageChannelData,
+                      ServerCoreData, ServerNetworkData, ServerSecurityData, ServerMessageChannelData]:
                 if self.type.value == c._TYPE_:
                     return c(readLen = self.length - 4)
             log.debug("unknown GCC block type : %s"%hex(self.type.value))
@@ -266,7 +269,7 @@ class ClientCoreData(CompositeType):
         self.serialNumber = UInt32Le(0, optional = True)
         self.highColorDepth = UInt16Le(HighColor.HIGH_COLOR_24BPP, optional = True)
         self.supportedColorDepths = UInt16Le(Support.RNS_UD_15BPP_SUPPORT | Support.RNS_UD_16BPP_SUPPORT | Support.RNS_UD_24BPP_SUPPORT | Support.RNS_UD_32BPP_SUPPORT, optional = True)
-        self.earlyCapabilityFlags = UInt16Le(CapabilityFlags.RNS_UD_CS_SUPPORT_ERRINFO_PDU | CapabilityFlags.RNS_UD_CS_WANT_32BPP_SESSION | CapabilityFlags.RNS_UD_CS_VALID_CONNECTION_TYPE | CapabilityFlags.RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL, optional = True)
+        self.earlyCapabilityFlags = UInt16Le(CapabilityFlags.RNS_UD_CS_SUPPORT_ERRINFO_PDU | CapabilityFlags.RNS_UD_CS_WANT_32BPP_SESSION | CapabilityFlags.RNS_UD_CS_VALID_CONNECTION_TYPE | CapabilityFlags.RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT | CapabilityFlags.RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL, optional = True)
         self.clientDigProductId = String(b"\x00" * 64, readLen = CallableValue(64), optional = True)
         self.connectionType = UInt8(ConnectionType.CONNECTION_TYPE_LAN, optional = True)
         self.pad1octet = UInt8(optional = True)
@@ -477,6 +480,32 @@ class ChannelDef(CompositeType):
         self.name = String(name[0:8] + b"\x00" * (8 - len(name)), readLen = CallableValue(8))
         self.options = UInt32Le(options)
         
+class ClientMessageChannelData(CompositeType):
+    """
+    @summary: GCC client message channel block (TS_UD_CS_MCS_MSGCHANNEL)
+    Tells the server to allocate a message channel for auto-detect / heartbeat.
+    @see: https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/9c3f2711-3e57-4a73-b64e-23a5a5a7f2e5
+    """
+    _TYPE_ = MessageType.CS_MCS_MSGCHANNEL
+
+    def __init__(self, readLen=None):
+        CompositeType.__init__(self, readLen=readLen)
+        self.flags = UInt32Le(0)
+
+
+class ServerMessageChannelData(CompositeType):
+    """
+    @summary: GCC server message channel block (TS_UD_SC_MCS_MSGCHANNEL)
+    Contains the channel ID allocated by the server for the message channel.
+    @see: https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/6b816186-6dcc-44ef-98d9-47e6f00b3873
+    """
+    _TYPE_ = MessageType.SC_MCS_MSGCHANNEL
+
+    def __init__(self, readLen=None):
+        CompositeType.__init__(self, readLen=readLen)
+        self.mcsChannelId = UInt16Le(0)
+
+
 class ClientNetworkData(CompositeType):
     """
     @summary: GCC client network block
@@ -540,7 +569,7 @@ def clientSettings():
     """
     log.debug("gcc.clientSettings()")
 #    return Settings([ClientCoreData(), ClientClusterData(), ClientSecurityData(), ClientNetworkData()])
-    return Settings([ClientCoreData(), ClientNetworkData(), ClientSecurityData()])
+    return Settings([ClientCoreData(), ClientNetworkData(), ClientSecurityData(), ClientMessageChannelData()])
 
 def serverSettings():
     """

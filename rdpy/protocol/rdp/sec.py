@@ -632,6 +632,15 @@ class Client(SecLayer):
         Wait Demand Active PDU
         @param s: Stream
         """
+        if not self._enableEncryption:
+            # NLA/TLS mode: no security header, server may skip license exchange.
+            # Restore default recv and signal PDU layer to proceed, then re-dispatch
+            # the current PDU (e.g. DeactivateAllPDU) through the presentation layer.
+            self.setNextState()
+            self._presentation.connect()
+            self._presentation.recv(s)
+            return
+
         #packet preambule
         securityFlag = UInt16Le()
         securityFlagHi = UInt16Le()

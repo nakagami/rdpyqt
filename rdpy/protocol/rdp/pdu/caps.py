@@ -479,7 +479,7 @@ class SoundCapability(CompositeType):
     
     def __init__(self, readLen = None):
         CompositeType.__init__(self, readLen = readLen)
-        self.soundFlags = UInt16Le(SoundFlag.NONE)
+        self.soundFlags = UInt16Le(SoundFlag.SOUND_BEEPS_FLAG)
         self.pad2octetsA = UInt16Le()
         
 class ControlCapability(CompositeType):

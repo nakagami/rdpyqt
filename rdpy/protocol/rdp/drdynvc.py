@@ -334,7 +334,9 @@ class DrdynvcLayer(LayerAutomata):
         # server doesn't expect functionality we cannot provide (matching grdp).
         _SUPPORTED_CHANNELS = {
             RDPGFX_CHANNEL_NAME,
-            "rdpsnd", "AUDIO_PLAYBACK_DVC", "AUDIO_PLAYBACK_LOSSY_DVC",
+            "rdpsnd", "AUDIO_PLAYBACK_DVC",
+            # AUDIO_PLAYBACK_LOSSY_DVC (AAC/Opus) is not supported; reject it so
+            # gnome-remote-desktop falls back to lossless AUDIO_PLAYBACK_DVC (PCM).
         }
         accepted = channelName in _SUPPORTED_CHANNELS
 
@@ -366,7 +368,7 @@ class DrdynvcLayer(LayerAutomata):
                 self._sendRdpgfxCapsAdvertise(channelId, cbId)
             else:
                 log.debug("RDPGFX: channel re-created without close, skipping duplicate CAPS_ADVERTISE")
-        elif channelName in ("rdpsnd", "AUDIO_PLAYBACK_DVC", "AUDIO_PLAYBACK_LOSSY_DVC"):
+        elif channelName in ("rdpsnd", "AUDIO_PLAYBACK_DVC"):
             self._rdpsndDvcChannelIds.add(channelId)
             log.debug("DrdynvcLayer: RDPSND DVC channel mapped to channelId=%d (%s)" % (channelId, channelName))
             if self._rdpsndLayer is not None and self._rdpsndDvcPrimaryId is None:
@@ -504,20 +506,19 @@ class DrdynvcLayer(LayerAutomata):
     # ---------------------------------------------------------------
 
     def _processRdpgfxStream(self, data):
-        """Unwrap RDP_SEGMENTED_DATA and parse concatenated RDPGFX PDUs.
+        """Unwrap RDP_SEGMENTED_DATA and parse concatenated RDPGFX PDUs."""
+        self._processRdpgfxStreamSync(data)
 
-        PDUs are processed in order (decode → ACK), matching grdp's behaviour
-        where ACKs are sent *after* decode completes.  When a batch contains
-        multiple frames, the reactor is given control between frames so it can
-        flush the preceding ACK and read new incoming data.
+    def _processRdpgfxStreamSync(self, data):
+        """Synchronous GFX processing (decompress + parse + dispatch inline).
+
+        PDUs are dispatched one at a time via callLater(0, ...) so the
+        Twisted reactor can process audio DVC packets between heavy
+        codec decodes (Progressive RFX can block for 100-300ms per tile).
         """
         raw = self._unwrapSegmentedData(data)
         if raw is None:
             return
-        log.debug("RDPGFX: decompressed %d -> %d bytes, first16=%s" %
-                  (len(data), len(raw), raw[:16].hex() if len(raw) >= 16 else raw.hex()))
-
-        # Parse all PDUs in the batch
         pdus = []
         offset = 0
         while offset + 8 <= len(raw):
@@ -525,33 +526,23 @@ class DrdynvcLayer(LayerAutomata):
             flags = struct.unpack_from('<H', raw, offset + 2)[0]
             pduLen = struct.unpack_from('<I', raw, offset + 4)[0]
             if pduLen < 8 or offset + pduLen > len(raw):
-                log.warning("RDPGFX: truncated PDU cmdId=0x%04x pduLen=%d remaining=%d" %
-                            (cmdId, pduLen, len(raw) - offset))
                 break
             payload = bytes(raw[offset + 8:offset + pduLen])
             pdus.append((cmdId, flags, payload))
             offset += pduLen
+        if pdus:
+            self._processGfxPduQueue(pdus, 0)
 
-        # Process PDUs, yielding to reactor between frames
-        self._processRdpgfxPduChunk(pdus, 0)
-
-    def _processRdpgfxPduChunk(self, pdus, start):
-        """Process PDUs from *start* index.  After each END_FRAME (and its
-        ACK), yield to the reactor via ``callLater(0, ...)`` so it can flush
-        the ACK write and process incoming data before the next frame's heavy
-        decode begins."""
-        i = start
-        while i < len(pdus):
-            cmdId, flags, payload = pdus[i]
-            self._processRdpgfxPdu(cmdId, flags, payload)
-            i += 1
-
-            # After an END_FRAME (ACK just sent), yield to the reactor so
-            # the ACK is flushed before the next frame's decode starts.
-            if cmdId == RDPGFX_CMDID_ENDFRAME and i < len(pdus):
-                from twisted.internet import reactor
-                reactor.callLater(0, self._processRdpgfxPduChunk, pdus, i)
-                return
+    def _processGfxPduQueue(self, pdus, idx):
+        """Process one GFX PDU, then yield to the reactor before the next."""
+        if idx >= len(pdus):
+            return
+        cmdId, flags, payload = pdus[idx]
+        self._processRdpgfxPdu(cmdId, flags, payload)
+        idx += 1
+        if idx < len(pdus):
+            from twisted.internet import reactor
+            reactor.callLater(0, self._processGfxPduQueue, pdus, idx)
 
     def _processRdpgfxPdu(self, cmdId, flags, payload):
         """Dispatch a single RDPGFX PDU."""
