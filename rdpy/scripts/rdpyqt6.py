@@ -22,9 +22,10 @@ example of use rdpy as rdp client
 
 import sys, getopt, socket
 import getpass
+import threading
 
 from PyQt6.QtWidgets import QApplication
-from rdpy.ui.qt6 import RDPClientQt
+from rdpy.ui.qt6 import RDPClientQt, QRemoteDesktop, _get_qt_invoker
 from rdpy.protocol.rdp import rdp
 from rdpy.core.error import RDPSecurityNegoFail
 import rdpy.core.log as log
@@ -162,7 +163,9 @@ class RDPClientQtFactory(rdp.ClientFactory):
         self._width = width
         self._height = height
         self._resizing = True
-        self._client._controller.close()
+        # Close must be called from the Twisted thread, not the Qt timer thread
+        from twisted.internet import reactor
+        reactor.callFromThread(self._client._controller.close)
 
     def clientConnectionLost(self, connector, reason):
         """
@@ -192,7 +195,8 @@ class RDPClientQtFactory(rdp.ClientFactory):
         log.info("Lost connection : %s"%reason)
         from twisted.internet import reactor
         reactor.stop()
-        self._app.exit()
+        # quit() is documented thread-safe in Qt; posts a quit event to the main loop
+        self._app.quit()
         
     def clientConnectionFailed(self, connector, reason):
         """
@@ -203,7 +207,7 @@ class RDPClientQtFactory(rdp.ClientFactory):
         log.info("Connection failed : %s"%reason)
         from twisted.internet import reactor
         reactor.stop()
-        self._app.exit()
+        self._app.quit()
         
 def help():
     print ("""
@@ -273,15 +277,38 @@ def main():
     
     app = QApplication(sys.argv)
     
-    import qreactor
-    qreactor.install()
-    
+    from twisted.internet import reactor
+
     log.info("keyboard type set to %s" % keyboardType)
     log.info("keyboard layout set to %s" % keyboardLayout)
 
-    from twisted.internet import reactor
-    reactor.connectTCP(ip, int(port), RDPClientQtFactory(app, width, height, username, password, domain, keyboardType, keyboardLayout, "nego", swap_alt_meta))
-    reactor.runReturn()
+    factory = RDPClientQtFactory(app, width, height, username, password, domain, keyboardType, keyboardLayout, "nego", swap_alt_meta)
+
+    # Pre-create the Qt invoker on the Qt main thread so the _QtInvoker QObject
+    # lives on the Qt main thread.  If created lazily from the Twisted thread it
+    # would be owned by that thread and QueuedConnection would not dispatch to Qt.
+    _get_qt_invoker()
+
+    # Pre-create the widget on the Qt main thread so buildObserver (which runs
+    # on the Twisted thread) never has to create Qt objects directly.
+    initial_widget = QRemoteDesktop(width, height, None)
+    initial_widget.setWindowTitle('rdpyqt6')
+    initial_widget.show()
+    factory._w = initial_widget
+
+    reactor.connectTCP(ip, int(port), factory)
+
+    # Run the Twisted reactor on a background thread so it never blocks Qt's
+    # event loop.  installSignalHandlers=False is required when the reactor
+    # is not on the main thread.
+    t = threading.Thread(
+        target=reactor.run,
+        kwargs={'installSignalHandlers': False},
+        daemon=True,
+        name='twisted-reactor',
+    )
+    t.start()
+
     app.exec()
 
 

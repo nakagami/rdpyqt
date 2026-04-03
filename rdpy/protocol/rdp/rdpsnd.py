@@ -296,8 +296,8 @@ class RdpsndLayer(LayerAutomata):
         self._expectingWaveData = False
         # Audio playback
         self._audioSink = None
-        self._audioBuffer = None  # _AudioRingBuffer (pull mode)
-        self._audioIO = None
+        self._audioPushDevice = None      # push-mode write device (Qt main thread)
+        self._audioPendingBuf = bytearray()  # pre-buffer (Twisted thread, plain bytes)
         self._audioInitialized = False
         self._audioSinkStarted = False  # True after QAudioSink.start()
         self._audioPrebufBytes = 0      # bytes to accumulate before starting
@@ -314,6 +314,21 @@ class RdpsndLayer(LayerAutomata):
             self._wavDumpPath = wav_path
         # DVC send callback (set when audio arrives via DVC)
         self._dvcSendCallback = None
+        # Qt main-thread invoker: set by RDPClientQt via setQtInvoker().
+        # Default calls fn() directly (safe when qreactor is used, or in tests).
+        self._qt_invoke = lambda fn: fn()
+
+    def setQtInvoker(self, invoke_fn):
+        """Set the function used to post callables to the Qt main thread.
+
+        Must be called before any audio data arrives.  When the Twisted
+        reactor runs on a background thread (not via qreactor), pass a
+        thread-safe dispatcher here so that QAudioSink operations are
+        always executed on the Qt main thread.
+
+        @param invoke_fn: callable(fn) — schedules fn() on the Qt main thread.
+        """
+        self._qt_invoke = invoke_fn
 
     def connect(self):
         log.debug("RdpsndLayer.connect()")
@@ -580,19 +595,14 @@ class RdpsndLayer(LayerAutomata):
         log.debug("RDPSND: sent Quality Mode (DYNAMIC)")
 
     # ---------------------------------------------------------------
-    # Audio playback via QAudioSink (pull mode)
+    # Audio playback via QAudioSink (push mode)
     # ---------------------------------------------------------------
 
     def _setupAudio(self, fmt):
-        """Configure QAudioSink in pull mode for the given AudioFormat.
+        """Configure audio for the given AudioFormat.
 
-        Pull mode lets QAudioSink read data from our buffer at its own
-        pace, decoupling audio playback from the Twisted reactor thread.
-        QAudioSink.start() is deferred until the ring buffer has accumulated
-        0.5 seconds of audio (pre-buffer).  This prevents the buffer from
-        emptying during early playback — especially important for servers
-        that send small blocks (e.g. gnome-remote-desktop sends 4096
-        bytes = 23ms per block).
+        Safe to call from the Twisted background thread.  All Qt objects
+        are created on the Qt main thread via _qt_invoke.
         """
         if not fmt.is_pcm():
             log.warning("RDPSND: non-PCM format, audio playback not supported: %s" % fmt)
@@ -600,9 +610,25 @@ class RdpsndLayer(LayerAutomata):
 
         self._stopAudio()
 
+        self._audioPrebufBytes = fmt.avg_bytes_per_sec // 2   # 500 ms pre-buffer
+        self._audioSinkStarted = False
+        self._audioInitialized = True
+        self._audioGain = 1.0
+        self._wavDumpFmt = fmt
+        if hasattr(self, '_wavDumpPath') and self._wavDumpPath:
+            self.enableWavDump(self._wavDumpPath)
+            self._wavDumpPath = None
+        log.debug("RDPSND: audio ready (rate=%dHz prebuf=%d bytes): %s" % (
+            fmt.samples_per_sec, self._audioPrebufBytes, fmt))
+
+    def _qtStartSink(self, fmt, initial_data):
+        """Create QAudioSink in push mode and write initial buffered data.
+
+        Must be called on the Qt main thread.
+        """
+        log.debug("RDPSND: _qtStartSink called with %d initial bytes" % len(initial_data))
         try:
             from PyQt6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices
-            from PyQt6.QtCore import QIODevice
         except ImportError:
             log.warning("RDPSND: PyQt6.QtMultimedia not available, audio disabled")
             return
@@ -625,79 +651,86 @@ class RdpsndLayer(LayerAutomata):
             log.warning("RDPSND: no audio output device available")
             return
 
-        self._audioBuffer = _AudioRingBuffer()
-        self._audioBuffer.open(QIODevice.OpenModeFlag.ReadOnly)
+        sink = QAudioSink(device, audioFmt)
+        # Use a 1-second hardware buffer so brief Twisted delivery gaps
+        # don't cause underruns.
+        sink.setBufferSize(fmt.avg_bytes_per_sec)
+        push_dev = sink.start()   # push mode — returns a writable QIODevice
+        self._audioSink = sink
+        self._audioPushDevice = push_dev
+        if push_dev is not None:
+            written = push_dev.write(initial_data)
+            log.debug("RDPSND: QAudioSink (push) started, wrote %d/%d initial bytes" % (
+                written, len(initial_data)))
+        else:
+            log.warning("RDPSND: QAudioSink.start() returned None push device")
 
-        self._audioSink = QAudioSink(device, audioFmt)
-        self._audioSink.setBufferSize(fmt.avg_bytes_per_sec // 5)  # 200ms
-        self._audioPrebufBytes = fmt.avg_bytes_per_sec // 5        # 200ms
-        self._audioSinkStarted = False
-        self._audioInitialized = True
-        # gnome-remote-desktop sends very quiet audio (~-34dB peak).
-        # Amplify to bring it closer to Windows levels.
-        self._audioGain = 1.0
-        self._wavDumpFmt = fmt
-        # Open deferred WAV dump if enableWavDump() was called before format negotiation
-        if hasattr(self, '_wavDumpPath') and self._wavDumpPath:
-            self.enableWavDump(self._wavDumpPath)
-            self._wavDumpPath = None
-        log.debug("RDPSND: audio output prepared (pull mode, rate=%dHz, gain=%.1f, prebuf=%d bytes): %s" % (
-            fmt.samples_per_sec, self._audioGain, self._audioPrebufBytes, fmt))
+    def _qtPushAudio(self, data):
+        """Write PCM data to the push device.  Must be called on Qt main thread."""
+        if self._audioPushDevice is not None:
+            written = self._audioPushDevice.write(data)
+            if written < len(data):
+                log.debug("RDPSND: push write short %d/%d bytes" % (written, len(data)))
 
     def _playAudio(self, data):
-        """Append PCM data to the audio ring buffer.
+        """Receive PCM data from the Twisted thread and forward to QAudioSink.
 
-        QAudioSink reads from the buffer at its own pace (pull mode),
-        so this call never blocks and never drops data unless the buffer
-        overflows (~1 MB, about 6 seconds of audio).
-
-        On the first call(s), data is accumulated in the ring buffer
-        without starting playback.  Once 0.5 seconds of audio has been
-        buffered, QAudioSink.start() is called so playback begins with
-        a comfortable head start.
+        Pre-buffers data until enough is accumulated, then starts the sink
+        on the Qt main thread.  Subsequent chunks are dispatched via _qt_invoke.
         """
-        if not self._audioInitialized or self._audioBuffer is None:
+        if not self._audioInitialized:
             return
         now = time.monotonic()
         if self._lastPlayTime > 0:
             gap = now - self._lastPlayTime
-            if gap > 0.050:  # >50ms gap = potential underrun
-                log.debug("RDPSND: audio gap %.0fms (buf %d bytes)" %
-                         (gap * 1000, self._audioBuffer.bytesAvailable()))
+            if gap > 0.050:
+                bufsize = len(self._audioPendingBuf) if not self._audioSinkStarted else -1
+                log.debug("RDPSND: audio gap %.0fms" % (gap * 1000,))
         self._lastPlayTime = now
         if self._audioGain != 1.0:
             data = _amplify_pcm16_stereo(data, self._audioGain)
-        self._audioBuffer.append(data)
         if self._wavDumpFile is not None:
             try:
                 self._wavDumpFile.writeframesraw(data)
             except Exception:
                 pass
-        if not self._audioSinkStarted and self._audioSink is not None:
-            if self._audioBuffer.bytesAvailable() >= self._audioPrebufBytes:
-                self._audioSink.start(self._audioBuffer)
+        if not self._audioSinkStarted:
+            self._audioPendingBuf.extend(data)
+            if len(self._audioPendingBuf) >= self._audioPrebufBytes:
                 self._audioSinkStarted = True
-                log.debug("RDPSND: playback started (prebuf %d bytes ready)" %
-                          self._audioBuffer.bytesAvailable())
+                initial = bytes(self._audioPendingBuf)
+                self._audioPendingBuf = bytearray()
+                fmt_snap = self._wavDumpFmt
+                self._qt_invoke(lambda: self._qtStartSink(fmt_snap, initial))
+                log.debug("RDPSND: posted _qtStartSink with %d bytes" % len(initial))
+        else:
+            chunk = bytes(data)
+            self._qt_invoke(lambda: self._qtPushAudio(chunk))
 
     def _stopAudio(self):
-        """Stop and clean up audio output."""
+        """Stop and clean up audio output.
+
+        Qt objects (QAudioSink) are stopped on the Qt main thread.
+        All bookkeeping flags are cleared immediately so subsequent
+        calls see a clean state.
+        """
         self._closeWavDump()
-        if self._audioSink is not None:
-            try:
-                self._audioSink.stop()
-            except Exception:
-                pass
-            self._audioSink = None
-        if hasattr(self, '_audioBuffer') and self._audioBuffer is not None:
-            try:
-                self._audioBuffer.close()
-            except Exception:
-                pass
-            self._audioBuffer = None
-        self._audioIO = None
         self._audioInitialized = False
         self._audioSinkStarted = False
+        self._audioPendingBuf = bytearray()
+
+        sink = self._audioSink
+        self._audioSink      = None
+        self._audioPushDevice = None
+
+        def _qt_cleanup():
+            if sink is not None:
+                try:
+                    sink.stop()
+                except Exception:
+                    pass
+
+        self._qt_invoke(_qt_cleanup)
 
     def enableWavDump(self, path):
         """Start dumping raw PCM audio to *path* (WAV format).

@@ -34,6 +34,8 @@ import numpy as np
 from rdpy.core import rle
 import rdpy.core.log as log
 
+from twisted.internet import reactor
+
 # Scan code swap table for --swap-alt-meta: swaps Alt keys with Meta (Windows) keys.
 _ALT_META_SWAP = {
     0x38:   0xE05B,  # Left Alt -> Left Windows
@@ -185,6 +187,41 @@ def RDPBitmapToQtImage(width, height, bitsPerPixel, isCompress, data):
     return image
 
 
+class _QtInvoker(QtCore.QObject):
+    """Posts callables from any thread to the Qt main thread.
+
+    Used to marshal QAudioSink and other Qt-thread-only operations from
+    the Twisted background thread.
+    """
+    _signal = QtCore.pyqtSignal(object)
+
+    def __init__(self):
+        super().__init__()
+        self._signal.connect(self._run, QtCore.Qt.ConnectionType.QueuedConnection)
+
+    @QtCore.pyqtSlot(object)
+    def _run(self, fn):
+        try:
+            fn()
+        except Exception as e:
+            log.warning("_QtInvoker: exception in queued call: %s" % e)
+
+    def invoke(self, fn):
+        """Thread-safe: post fn() to be executed on the Qt main thread."""
+        self._signal.emit(fn)
+
+
+# Module-level singleton; created lazily (Qt must be running first).
+_qt_invoker = None
+
+
+def _get_qt_invoker():
+    global _qt_invoker
+    if _qt_invoker is None:
+        _qt_invoker = _QtInvoker()
+    return _qt_invoker
+
+
 class RDPClientQt(RDPClientObserver, QAdaptor):
     """
     @summary: Adaptor for RDP client
@@ -209,6 +246,11 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
         #set widget screen to RDP stack
         controller.setScreen(width, height)
         controller.setPerformanceSession()
+
+        # Route QAudioSink operations to the Qt main thread so they are
+        # never executed from the Twisted background thread.
+        if hasattr(controller, '_rdpsndLayer') and controller._rdpsndLayer is not None:
+            controller._rdpsndLayer.setQtInvoker(_get_qt_invoker().invoke)
 
         # Clipboard integration
         self._clipboard = QtWidgets.QApplication.clipboard()
@@ -237,7 +279,7 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
     def _onLocalClipboardChanged(self):
         """Notify the RDP server that local clipboard content changed."""
         log.debug("CLIPRDR DEBUG [Qt]: _onLocalClipboardChanged() fired")
-        self._controller.onLocalClipboardChanged()
+        reactor.callFromThread(self._controller.onLocalClipboardChanged)
 
     def _onRemoteClipboardText(self, text):
         """Update the local clipboard with text received from the RDP server."""
@@ -269,7 +311,8 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
             buttonNumber = 2
         elif button == QtCore.Qt.MouseButton.MiddleButton:
             buttonNumber = 3
-        self._controller.sendPointerEvent(int(e.pos().x()), int(e.pos().y()), buttonNumber, isPressed)
+        x, y = int(e.pos().x()), int(e.pos().y())
+        reactor.callFromThread(self._controller.sendPointerEvent, x, y, buttonNumber, isPressed)
 
     # Mapping from macOS native key codes (kVK_xxx) to RDP scan codes.
     # Extended keys use the 0xE0xx form; the upper byte is stripped and
@@ -414,7 +457,7 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
         extended = (code >> 8 == 0xE0)
         if extended:
             code = code & 0xFF
-        self._controller.sendKeyEventScancode(code, isPressed, extended)
+        reactor.callFromThread(self._controller.sendKeyEventScancode, code, isPressed, extended)
 
     def sendWheelEvent(self, e):
         """
@@ -432,7 +475,7 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
             scroll = delta_y
             if scroll == 0:
                 scroll = 1 if delta_y > 0 else -1
-            self._controller.sendWheelEvent(x, y, scroll, False)
+            reactor.callFromThread(self._controller.sendWheelEvent, x, y, scroll, False)
 
         # Horizontal scroll
         delta_x = angle.x()
@@ -440,14 +483,14 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
             scroll = delta_x
             if scroll == 0:
                 scroll = 1 if delta_x > 0 else -1
-            self._controller.sendWheelEvent(x, y, scroll, True)
+            reactor.callFromThread(self._controller.sendWheelEvent, x, y, scroll, True)
 
     def closeEvent(self, e):
         """
         @summary: Convert Qt close widget event into close stack event
         @param e: QCloseEvent
         """
-        self._controller.close()
+        reactor.callFromThread(self._controller.close)
 
     def setResizeCallback(self, callback):
         """
@@ -504,14 +547,14 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
         @summary: Called when the server hides the pointer
         @see: rdp.RDPClientObserver.onPointerHide
         """
-        self._widget.setCursor(QCursor(Qt.CursorShape.BlankCursor))
+        self._widget.setCursorThreadSafe(QCursor(Qt.CursorShape.BlankCursor))
 
     def onPointerDefault(self):
         """
         @summary: Called when the server restores the default pointer
         @see: rdp.RDPClientObserver.onPointerDefault
         """
-        self._widget.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+        self._widget.setCursorThreadSafe(QCursor(Qt.CursorShape.ArrowCursor))
 
     def onPointerCached(self, cacheIndex):
         """
@@ -520,10 +563,10 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
         """
         cursor = self._pointerCache.get(cacheIndex)
         if cursor is not None:
-            self._widget.setCursor(cursor)
+            self._widget.setCursorThreadSafe(cursor)
         else:
             log.debug("RDPClientQt.onPointerCached() cache miss for index %d, restoring default" % cacheIndex)
-            self._widget.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+            self._widget.setCursorThreadSafe(QCursor(Qt.CursorShape.ArrowCursor))
 
     def onPointerUpdate(self, xorBpp, cacheIndex, hotSpotX, hotSpotY, width, height, andMask, xorMask):
         """
@@ -612,7 +655,7 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
         pixmap = QPixmap.fromImage(image)
         cursor = QCursor(pixmap, hotSpotX, hotSpotY)
         self._pointerCache[cacheIndex] = cursor
-        self._widget.setCursor(cursor)
+        self._widget.setCursorThreadSafe(cursor)
 
     @staticmethod
     def _unpack_and_mask(mask_data, stride, width, height):
@@ -632,6 +675,8 @@ class QRemoteDesktop(QtWidgets.QWidget):
     @summary: Qt display widget
     """
     _updateSignal = QtCore.pyqtSignal(int, int, QtGui.QImage, int, int)
+    # Thread-safe cursor update: Twisted thread emits, Qt main thread applies
+    _cursorSignal = QtCore.pyqtSignal(object)
 
     def __init__(self, width, height, adaptor):
         """
@@ -647,6 +692,7 @@ class QRemoteDesktop(QtWidgets.QWidget):
         self.setMouseTracking(True)
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         self._updateSignal.connect(self._doNotifyImage)
+        self._cursorSignal.connect(self._applyCursor)
         #resize debounce
         self._programmaticResize = False
         self._sessionReady = False  # suppress resize-reconnect until first frame
@@ -725,10 +771,23 @@ class QRemoteDesktop(QtWidgets.QWidget):
         """
         @summary: Called after resize debounce period to trigger RDP reconnection
         """
-        if self._pendingSize:
+        if self._pendingSize and self._adaptor:
             w, h = self._pendingSize
             self._pendingSize = None
             self._adaptor.onResizeRequest(w, h)
+
+    @QtCore.pyqtSlot(object)
+    def _applyCursor(self, cursor):
+        """
+        @summary: Slot that applies a cursor change on the Qt main thread
+        """
+        self.setCursor(cursor)
+
+    def setCursorThreadSafe(self, cursor):
+        """
+        @summary: Thread-safe cursor update — safe to call from Twisted thread
+        """
+        self._cursorSignal.emit(cursor)
 
     def paintEvent(self, e):
         """
@@ -745,46 +804,53 @@ class QRemoteDesktop(QtWidgets.QWidget):
         @summary: Call when mouse move
         @param event: QMouseEvent
         """
-        self._adaptor.sendMouseEvent(event, False)
+        if self._adaptor:
+            self._adaptor.sendMouseEvent(event, False)
 
     def mousePressEvent(self, event):
         """
         @summary: Call when button mouse is pressed
         @param event: QMouseEvent
         """
-        self._adaptor.sendMouseEvent(event, True)
+        if self._adaptor:
+            self._adaptor.sendMouseEvent(event, True)
 
     def mouseReleaseEvent(self, event):
         """
         @summary: Call when button mouse is released
         @param event: QMouseEvent
         """
-        self._adaptor.sendMouseEvent(event, False)
+        if self._adaptor:
+            self._adaptor.sendMouseEvent(event, False)
 
     def keyPressEvent(self, event):
         """
         @summary: Call when button key is pressed
         @param event: QKeyEvent
         """
-        self._adaptor.sendKeyEvent(event, True)
+        if self._adaptor:
+            self._adaptor.sendKeyEvent(event, True)
 
     def keyReleaseEvent(self, event):
         """
         @summary: Call when button key is released
         @param event: QKeyEvent
         """
-        self._adaptor.sendKeyEvent(event, False)
+        if self._adaptor:
+            self._adaptor.sendKeyEvent(event, False)
 
     def wheelEvent(self, event):
         """
         @summary: Call on wheel event
         @param event:    QWheelEvent
         """
-        self._adaptor.sendWheelEvent(event)
+        if self._adaptor:
+            self._adaptor.sendWheelEvent(event)
 
     def closeEvent(self, event):
         """
         @summary: Call when widget is closed
         @param event: QCloseEvent
         """
-        self._adaptor.closeEvent(event)
+        if self._adaptor:
+            self._adaptor.closeEvent(event)
