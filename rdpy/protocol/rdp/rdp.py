@@ -64,6 +64,9 @@ class RDPClientController(pdu.layer.PDUClientListener):
         self._cliprdrLayer = cliprdr.CliprdrLayer()
         #PDU layer
         self._pduLayer = pdu.layer.Client(self)
+        # AVC freeze recovery: when H.264 output stalls for too long, request
+        # a full-screen refresh (IDR) from the server via REFRESH_RECT PDU.
+        self._drdynvcLayer.setRequestRefreshCallback(self._pduLayer.requestFullRefresh)
         #secure layer
         self._secLayer = sec.Client(self._pduLayer)
         #multi channel service with drdynvc, rdpsnd, cliprdr, and rdpdr virtual channels

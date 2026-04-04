@@ -670,6 +670,36 @@ class Client(PDULayer):
         suppressPDU.desktopRect.right.value = self._gccCore.desktopWidth.value
         suppressPDU.desktopRect.bottom.value = self._gccCore.desktopHeight.value
         self.sendDataPDU(suppressPDU)
+
+    def requestFullRefresh(self):
+        """Request a full-screen refresh to try to recover from an H.264 freeze.
+
+        Sends SUPPRESS_DISPLAY_UPDATES followed immediately by
+        ALLOW_DISPLAY_UPDATES.  Some RDP servers respond by restarting their
+        display stream with a new key frame; others (notably Windows with
+        RDPGFX H.264) ignore this and continue with the existing GOP.
+
+        The decoder is NOT reset before this call (see drdynvc._onAvcNoOutput):
+        the existing decoder keeps its SPS/PPS context so it can decode the
+        server's next IDR frame even if SPS is not re-sent.
+        """
+        if not hasattr(self, '_gccCore'):
+            return
+        log.debug("PDULayer.requestFullRefresh()")
+        try:
+            suppressPDU = data.SupressOutputDataPDU()
+            suppressPDU.allowDisplayUpdates.value = data.Display.SUPPRESS_DISPLAY_UPDATES
+            self.sendDataPDU(suppressPDU)
+
+            allowPDU = data.SupressOutputDataPDU()
+            allowPDU.allowDisplayUpdates.value = data.Display.ALLOW_DISPLAY_UPDATES
+            allowPDU.desktopRect.left.value = 0
+            allowPDU.desktopRect.top.value = 0
+            allowPDU.desktopRect.right.value = self._gccCore.desktopWidth.value
+            allowPDU.desktopRect.bottom.value = self._gccCore.desktopHeight.value
+            self.sendDataPDU(allowPDU)
+        except Exception as e:
+            log.debug("PDULayer.requestFullRefresh error: %s" % e)
     
     def _handleSurfaceCommands(self, surfData):
         """

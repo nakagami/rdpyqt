@@ -160,6 +160,10 @@ class DrdynvcLayer(LayerAutomata):
         self._zgfx = ZgfxDecompressor()
         # H.264/AVC decoder (lazy init)
         self._avcDecoder = None
+        # AVC freeze recovery: track the last successful decode time so we
+        # can request a full-screen refresh (IDR) after a prolonged freeze.
+        self._avcLastSuccessTime = 0.0   # monotonic; 0 = no success yet this session
+        self._avcLastRefreshTime = 0.0   # monotonic; time of last refresh request
         # Bitmap cache: cacheSlot -> (width, height, bytearray BGRA data)
         self._gfxCache = {}
         # ClearCodec VBAR caches (persistent across decode calls, matching grdp)
@@ -172,6 +176,7 @@ class DrdynvcLayer(LayerAutomata):
         # Callbacks
         self._gfxCallback = None       # bitmap delivery callback
         self._capsConfirmCallback = None  # called when CAPS_CONFIRM received
+        self._requestRefreshCallback = None  # called to request IDR from server
         # RDPSND DVC routing
         self._rdpsndLayer = None       # set via setRdpsndLayer() for DVC audio routing
         self._rdpsndDvcChannelIds = set()  # DVC channelIds for rdpsnd audio
@@ -188,6 +193,15 @@ class DrdynvcLayer(LayerAutomata):
     def setRdpsndLayer(self, rdpsndLayer):
         """Set the RDPSND layer for DVC audio routing."""
         self._rdpsndLayer = rdpsndLayer
+
+    def setRequestRefreshCallback(self, callback):
+        """Set callback to request a full-screen refresh (IDR) from the server.
+
+        The callback takes no arguments.  It is called when AVC frames have
+        produced no output for longer than _AVC_FREEZE_THRESHOLD seconds,
+        indicating the decoder is stuck waiting for an IDR key frame.
+        """
+        self._requestRefreshCallback = callback
 
     def connect(self):
         log.debug("DrdynvcLayer.connect()")
@@ -534,15 +548,28 @@ class DrdynvcLayer(LayerAutomata):
             self._processGfxPduQueue(pdus, 0)
 
     def _processGfxPduQueue(self, pdus, idx):
-        """Process one GFX PDU, then yield to the reactor before the next."""
-        if idx >= len(pdus):
-            return
-        cmdId, flags, payload = pdus[idx]
-        self._processRdpgfxPdu(cmdId, flags, payload)
-        idx += 1
-        if idx < len(pdus):
-            from twisted.internet import reactor
-            reactor.callLater(0, self._processGfxPduQueue, pdus, idx)
+        """Process GFX PDUs, yielding to the reactor only between frames.
+
+        A single RDPGFX frame spans three PDUs: START_FRAME, WIRE_TO_SURFACE,
+        and END_FRAME.  Yielding after every PDU (as the previous approach did)
+        created 3N−1 reactor cycles for a burst of N frames, each cycle allowing
+        audio delivery to run (~10–15 ms), summing to ~500 ms of video lag on a
+        typical 15-frame burst.
+
+        By processing the full triplet in one reactor turn and yielding only at
+        END_FRAME boundaries, we reduce reactor cycles to N−1 for N frames, which
+        matches the minimum necessary to keep audio DVC packets interleaved between
+        heavy Progressive-RFX tile decodes.  AVC/H264 decodes are fast (~10–30 ms)
+        so no intra-frame yield is needed.
+        """
+        while idx < len(pdus):
+            cmdId, flags, payload = pdus[idx]
+            self._processRdpgfxPdu(cmdId, flags, payload)
+            idx += 1
+            if cmdId == RDPGFX_CMDID_ENDFRAME and idx < len(pdus):
+                from twisted.internet import reactor
+                reactor.callLater(0, self._processGfxPduQueue, pdus, idx)
+                return
 
     def _processRdpgfxPdu(self, cmdId, flags, payload):
         """Dispatch a single RDPGFX PDU."""
@@ -622,6 +649,9 @@ class DrdynvcLayer(LayerAutomata):
             except Exception:
                 pass
             self._avcDecoder = None
+        # Reset AVC freeze-recovery timing (fresh start after graphics reset)
+        self._avcLastSuccessTime = 0.0
+        self._avcLastRefreshTime = 0.0
         # Reset frame counter (matches grdp's framesDecoded.Store(0))
         self._totalFramesDecoded = 0
         log.debug("RDPGFX: RESET_GRAPHICS %dx%d monitors=%d" % (width, height, monitorCount))
@@ -862,6 +892,14 @@ class DrdynvcLayer(LayerAutomata):
                 return None
         return self._avcDecoder
 
+    # Seconds of no AVC output before requesting a full-screen refresh from
+    # the server.  A value of 1.5 s is large enough to avoid false triggers
+    # during normal codec start-up but small enough to recover quickly after
+    # a real freeze caused by missing reference frames.
+    _AVC_FREEZE_THRESHOLD = 1.5
+    # Minimum seconds between consecutive refresh requests (cooldown).
+    _AVC_REFRESH_COOLDOWN = 2.0
+
     def _renderAvc420(self, surfaceId, left, top, width, height, data):
         """Decode and render AVC420 (H.264 YUV420) bitmap data."""
         decoder = self._getAvcDecoder()
@@ -870,12 +908,15 @@ class DrdynvcLayer(LayerAutomata):
         try:
             bgra_bytes = decoder.decode_avc420(data, width, height)
             if bgra_bytes is None:
+                self._onAvcNoOutput()
                 return
+            self._avcLastSuccessTime = time.monotonic()
             self._blitToSurface(surfaceId, left, top, width, height, bgra_bytes)
             ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
             self._deliverBitmap(ox + left, oy + top, width, height, 32, bgra_bytes)
         except Exception as e:
             log.warning("RDPGFX: AVC420 decode error: %s" % e)
+            self._onAvcNoOutput()
 
     def _renderAvc444(self, surfaceId, left, top, width, height, data):
         """Decode and render AVC444/AVC444v2 (H.264 YUV444) bitmap data."""
@@ -885,12 +926,53 @@ class DrdynvcLayer(LayerAutomata):
         try:
             bgra_bytes = decoder.decode_avc444(data, width, height)
             if bgra_bytes is None:
+                self._onAvcNoOutput()
                 return
+            self._avcLastSuccessTime = time.monotonic()
             self._blitToSurface(surfaceId, left, top, width, height, bgra_bytes)
             ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
             self._deliverBitmap(ox + left, oy + top, width, height, 32, bgra_bytes)
         except Exception as e:
             log.warning("RDPGFX: AVC444 decode error: %s" % e)
+            self._onAvcNoOutput()
+
+    def _onAvcNoOutput(self):
+        """Called when an AVC frame produces no output.
+
+        If the decoder has been silent for longer than _AVC_FREEZE_THRESHOLD
+        seconds (and we have previously decoded at least one frame), the
+        decoder is stalled because the H.264 reference chain is broken.
+        We flush its buffers (preserving SPS/PPS context) and ask the server
+        for a refresh.  Some servers respond with a new IDR; others send bare
+        IDRs on their own schedule.  Either way, the flushed decoder (with
+        SPS intact) is ready to decode the next IDR immediately.
+        """
+        if self._avcLastSuccessTime == 0.0:
+            return  # No successful decode yet; normal during startup
+
+        now = time.monotonic()
+        frozen_for = now - self._avcLastSuccessTime
+        if frozen_for < self._AVC_FREEZE_THRESHOLD:
+            return  # Too soon; might just be normal codec buffering
+
+        if now - self._avcLastRefreshTime < self._AVC_REFRESH_COOLDOWN:
+            return  # Cooldown: avoid spamming the server
+
+        log.debug("RDPGFX: AVC frozen for %.1fs, flushing decoder and requesting refresh"
+                  % frozen_for)
+        self._avcLastRefreshTime = now
+
+        # Flush (not destroy) the decoder: this clears buffered frames and the
+        # broken reference chain, but KEEPS the codec context (SPS/PPS intact).
+        # The server's next bare IDR (sent without SPS, since the client already
+        # received SPS at session start) can only be decoded if SPS is cached.
+        # Destroying the decoder here causes InvalidDataError on every subsequent
+        # frame because the new decoder has no SPS context.
+        if self._avcDecoder is not None:
+            self._avcDecoder.flush()
+
+        if self._requestRefreshCallback is not None:
+            self._requestRefreshCallback()
 
     def _renderUncompressed(self, surfaceId, left, top, width, height, pixelFormat, data):
         """Render uncompressed XRGB_8888/ARGB_8888 bitmap data."""

@@ -107,6 +107,12 @@ class AvcDecoder:
         self._hw_name = None
         self._decode_count = 0
         self._null_count = 0
+        # SPS/PPS recovery state
+        self._sps_nal = b''          # cached SPS NAL (Annex B, with start code)
+        self._pps_nal = b''          # cached PPS NAL (Annex B, with start code)
+        self._hw_error_count = 0     # consecutive non-IDR decode errors
+        self._hw_reset_count = 0     # total hard resets (for software fallback)
+        self._prepend_sps_next_idr = False  # inject SPS+PPS before next IDR
         self._init_decoder()
 
     def _init_decoder(self):
@@ -128,6 +134,117 @@ class AvcDecoder:
     def close(self):
         if self._ctx is not None:
             self._ctx = None
+
+    def flush(self):
+        """Flush decoder buffers while preserving the codec context.
+
+        VideoToolbox (hardware H.264 decoder on macOS) silently returns null
+        frames when it is waiting for an IDR to restart the reference chain.
+        This is *correct behaviour*, not an error state.  Calling
+        flush_buffers() while VideoToolbox is in this wait state has been
+        confirmed to push it into a hard AVERROR_UNKNOWN error from which
+        only full decoder recreation recovers.
+
+        Therefore we intentionally do NOT call flush_buffers() here.  We
+        just reset the null-frame counters so _onAvcNoOutput does not keep
+        firing every 1.5 s.  The decoder stays alive with its full codec
+        context (SPS, PPS, reference frames) intact, and it will resume
+        naturally as soon as the server sends the next IDR — exactly the
+        behaviour VideoToolbox expects.
+
+        For software (libavcodec) decoders an IDR also naturally restarts
+        the reference chain without needing an explicit flush, so this
+        approach is correct for both paths.
+
+        Explicit flush_buffers() is still used in _flush_and_retry_idr(),
+        which is called only when an IDR packet fails to decode — a
+        fundamentally different situation where the codec state is already
+        known to be corrupt.
+        """
+        self._decode_count = 0
+        self._null_count = 0
+
+    def _cache_sps_pps(self, h264_data):
+        """Extract and cache SPS/PPS NAL units from an Annex B bitstream.
+
+        Called whenever the incoming bitstream contains NAL types 7 (SPS) or
+        8 (PPS).  The cached bytes are used by _hard_reset() to seed a freshly
+        created decoder so it can decode the server's subsequent bare IDRs.
+        """
+        data = bytes(h264_data) if not isinstance(h264_data, bytes) else h264_data
+        n = len(data)
+        i = 0
+        while i < n:
+            if i + 4 <= n and data[i:i+4] == b'\x00\x00\x00\x01':
+                sc_len = 4
+            elif i + 3 <= n and data[i:i+3] == b'\x00\x00\x01':
+                sc_len = 3
+            else:
+                i += 1
+                continue
+            if i + sc_len >= n:
+                break
+            nal_type = data[i + sc_len] & 0x1F
+            if nal_type not in (7, 8):
+                i += sc_len + 1
+                continue
+            # Find end: next start code or end of data
+            j = i + sc_len + 1
+            while j < n:
+                if (j + 4 <= n and data[j:j+4] == b'\x00\x00\x00\x01') or \
+                   (j + 3 <= n and data[j:j+3] == b'\x00\x00\x01'):
+                    break
+                j += 1
+            nal_bytes = data[i:j]
+            if nal_type == 7:
+                self._sps_nal = nal_bytes
+                log.debug("AVC: cached SPS NAL (%d bytes)" % len(nal_bytes))
+            else:
+                self._pps_nal = nal_bytes
+                log.debug("AVC: cached PPS NAL (%d bytes)" % len(nal_bytes))
+            i = j
+
+    def _hard_reset(self):
+        """Destroy and recreate the decoder after a persistent hardware error.
+
+        VideoToolbox (macOS hardware decoder) can enter an unrecoverable error
+        state where every avcodec_send_packet() returns AVERROR_UNKNOWN.
+        flush_buffers() has no effect on this state; the only fix is to destroy
+        and recreate the codec context.
+
+        After recreation the decoder has no SPS/PPS context.  If we have
+        cached SPS/PPS from the original session we set _prepend_sps_next_idr
+        so those headers are prepended to the next IDR, giving the fresh
+        decoder the codec context it needs to decode the server's bare IDRs.
+
+        After 3 hard resets we permanently fall back to the software decoder
+        to avoid an infinite reset loop if hardware acceleration is broken.
+        """
+        self._hw_reset_count += 1
+        log.warning("AVC: hard reset #%d (persistent hardware error, recreating decoder)"
+                    % self._hw_reset_count)
+        self._ctx = None
+        self._hw_error_count = 0
+        self._decode_count = 0
+        self._null_count = 0
+
+        if self._hw_reset_count >= 3:
+            log.warning("AVC: too many hardware resets, falling back to software decoder")
+            self._ctx = _open_sw_decoder()
+            self._hw_name = None
+        else:
+            ctx, hw_name = _try_open_hw_decoder()
+            if ctx is not None:
+                self._ctx = ctx
+                self._hw_name = hw_name
+            else:
+                self._ctx = _open_sw_decoder()
+                self._hw_name = None
+
+        if self._sps_nal and self._pps_nal:
+            self._prepend_sps_next_idr = True
+            log.debug("AVC: will inject cached SPS+PPS (%d+%d bytes) before next IDR"
+                      % (len(self._sps_nal), len(self._pps_nal)))
 
     # -----------------------------------------------------------------
     # AVC420 bitmap stream (MS-RDPEGFX 2.2.4.4)
@@ -277,6 +394,13 @@ class AvcDecoder:
         of outputting it immediately — even with LOW_DELAY set.  Flushing
         discards reference frames, but IDR slices are self-contained so the
         retry always succeeds.
+
+        When avcodec_send_packet() raises a generic error (e.g. VideoToolbox
+        AVERROR_UNKNOWN on macOS), flush_buffers() has no effect.  After
+        _HW_ERROR_THRESHOLD consecutive non-IDR failures we call _hard_reset()
+        to destroy and recreate the codec context.  Cached SPS/PPS are then
+        injected before the next IDR so the fresh decoder can decode the
+        server's bare IDRs without needing a new SPS from the server.
         """
         if self._ctx is None:
             return None
@@ -286,14 +410,27 @@ class AvcDecoder:
         nal_types = self._parse_nal_types(h264_data)
         has_idr = 5 in nal_types
 
+        # Cache SPS/PPS whenever the server includes them (session start + key events)
+        if 7 in nal_types or 8 in nal_types:
+            self._cache_sps_pps(h264_data)
+
         # Log NAL types for early frames and every IDR
         if self._decode_count <= 5 or has_idr:
             names = [self._NAL_NAMES.get(t, str(t)) for t in nal_types]
             log.debug("AVC: decode #%d NAL types: %s (h264Len=%d)" %
                      (self._decode_count, ','.join(names), len(h264_data)))
 
+        # After a hard reset the fresh decoder has no SPS context.  Inject our
+        # cached SPS+PPS before the next IDR so it can decode the server's bare IDR.
+        decode_data = h264_data
+        if has_idr and self._prepend_sps_next_idr and self._sps_nal and self._pps_nal:
+            decode_data = self._sps_nal + self._pps_nal + bytes(h264_data)
+            log.debug("AVC: decode #%d injecting cached SPS+PPS (%d+%d bytes) before IDR"
+                      % (self._decode_count, len(self._sps_nal), len(self._pps_nal)))
+
+        packet = None
         try:
-            packet = av.Packet(h264_data)
+            packet = av.Packet(decode_data)
             result = self._receive_frame(packet)
 
             if result is None and has_idr:
@@ -311,23 +448,69 @@ class AvcDecoder:
                 self._null_count += 1
                 log.debug("AVC: decode #%d returned no frame (null_count=%d, h264Len=%d)" %
                          (self._decode_count, self._null_count, len(h264_data)))
-            elif self._decode_count <= 3:
-                log.debug("AVC: decode #%d OK frame=%dx%d fmt=%s h264Len=%d" %
-                         (self._decode_count, result.width, result.height,
-                          result.format.name, len(h264_data)))
+            else:
+                self._null_count = 0
+                self._hw_error_count = 0
+                self._prepend_sps_next_idr = False
+                if self._decode_count <= 3:
+                    log.debug("AVC: decode #%d OK frame=%dx%d fmt=%s h264Len=%d" %
+                             (self._decode_count, result.width, result.height,
+                              result.format.name, len(h264_data)))
             return result
         except av.error.InvalidDataError as e:
             log.debug("AVC: H.264 decode error (invalid data): %s" % e)
+            if has_idr and packet is not None:
+                # The decoder state was corrupted by earlier bad frames.
+                # An IDR is self-contained, so flush and retry immediately
+                # rather than waiting for a future IDR to succeed on its own.
+                return self._flush_and_retry_idr(packet)
         except Exception as e:
-            # Log but do NOT recreate the decoder or flush buffers.
-            # The context (SPS/PPS, reference frames) must survive so
-            # subsequent P-frames can still be decoded.  Recreating or
-            # flushing wipes all state, causing every following P-frame
-            # to fail until the next IDR (which may never come).
-            # grdp also keeps the decoder alive after errors.
             log.warning("AVC: H.264 decode error: %s" % e)
+            if has_idr and packet is not None:
+                # IDR is self-contained; flush and retry may recover.
+                return self._flush_and_retry_idr(packet)
+            # Non-IDR hardware error: count consecutive failures.  After
+            # _HW_ERROR_THRESHOLD failures the hardware decoder is stuck in
+            # an unrecoverable error state; recreate it via _hard_reset().
+            self._hw_error_count += 1
+            if self._hw_error_count >= self._HW_ERROR_THRESHOLD:
+                self._hard_reset()
 
         return None
+
+    _HW_ERROR_THRESHOLD = 5  # consecutive non-IDR errors before hard reset
+
+    def _flush_and_retry_idr(self, packet):
+        """Flush decoder buffers and retry an IDR packet after an error.
+
+        Called when decoding an IDR frame raises an exception, which means
+        the decoder state is corrupt.  Since IDR frames are self-contained
+        (no reference frames needed), flushing and retrying always recovers
+        — without waiting for the next server-sent IDR.
+
+        If the retry also fails (e.g. VideoToolbox in hard error state) we
+        count that toward _hw_error_count so a subsequent _hard_reset() is
+        triggered if the threshold is reached.
+        """
+        try:
+            log.debug("AVC: decode #%d flushing corrupted decoder and retrying IDR" %
+                      self._decode_count)
+            self._ctx.flush_buffers()
+            result = self._receive_frame(packet)
+            if result is not None:
+                self._null_count = 0
+                self._hw_error_count = 0
+                self._prepend_sps_next_idr = False
+                log.debug("AVC: decode #%d IDR recovery after flush OK %dx%d" %
+                          (self._decode_count, result.width, result.height))
+            return result
+        except Exception as e:
+            log.debug("AVC: decode #%d IDR retry also failed: %s" %
+                      (self._decode_count, e))
+            self._hw_error_count += 1
+            if self._hw_error_count >= self._HW_ERROR_THRESHOLD:
+                self._hard_reset()
+            return None
 
     def _receive_frame(self, packet):
         """Send *packet* to the decoder and return the last decoded frame, or None."""

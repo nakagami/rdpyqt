@@ -610,7 +610,7 @@ class RdpsndLayer(LayerAutomata):
 
         self._stopAudio()
 
-        self._audioPrebufBytes = fmt.avg_bytes_per_sec // 2   # 500 ms pre-buffer
+        self._audioPrebufBytes = fmt.avg_bytes_per_sec // 20  # 50 ms pre-buffer
         self._audioSinkStarted = False
         self._audioInitialized = True
         self._audioGain = 1.0
