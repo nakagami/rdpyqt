@@ -580,6 +580,9 @@ class RdpsndLayer(LayerAutomata):
         """Handle Close PDU from server."""
         log.debug("RDPSND: server closed audio channel")
         self._stopAudio()
+        # Reset format index so the next Wave2 always re-initialises the sink,
+        # even if the server uses the same format number for the new stream.
+        self._activeFormatIndex = -1
 
     # ---------------------------------------------------------------
     # Quality Mode (MS-RDPEA 2.2.2.13)

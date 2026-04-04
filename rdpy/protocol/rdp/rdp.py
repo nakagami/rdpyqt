@@ -517,6 +517,9 @@ class RDPClientController(pdu.layer.PDUClientListener):
         """
         @summary: Close protocol stack
         """
+        import traceback
+        log.debug("RDPClientController.close() called from:\n%s" %
+                  "".join(traceback.format_stack()))
         self._pduLayer.close()
 
 class RDPServerController(pdu.layer.PDUServerListener):

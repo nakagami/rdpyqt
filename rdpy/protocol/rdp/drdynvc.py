@@ -893,12 +893,13 @@ class DrdynvcLayer(LayerAutomata):
         return self._avcDecoder
 
     # Seconds of no AVC output before requesting a full-screen refresh from
-    # the server.  A value of 1.5 s is large enough to avoid false triggers
-    # during normal codec start-up but small enough to recover quickly after
-    # a real freeze caused by missing reference frames.
-    _AVC_FREEZE_THRESHOLD = 1.5
+    # the server.  Raised from 1.5s to 30s: frequent requestFullRefresh calls
+    # were causing the server to close the audio channel (RDPSND CLOSE) as a
+    # side effect.  Most servers send IDR frames naturally during video
+    # transitions; waiting longer avoids unnecessary disruption.
+    _AVC_FREEZE_THRESHOLD = 30.0
     # Minimum seconds between consecutive refresh requests (cooldown).
-    _AVC_REFRESH_COOLDOWN = 2.0
+    _AVC_REFRESH_COOLDOWN = 60.0
 
     def _renderAvc420(self, surfaceId, left, top, width, height, data):
         """Decode and render AVC420 (H.264 YUV420) bitmap data."""
@@ -926,7 +927,14 @@ class DrdynvcLayer(LayerAutomata):
         try:
             bgra_bytes = decoder.decode_avc444(data, width, height)
             if bgra_bytes is None:
+                # Real decode failure — H.264 reference chain may be broken.
                 self._onAvcNoOutput()
+                return
+            if not bgra_bytes:
+                # b"" sentinel: LC=2 chroma-only frame — codec is alive, no
+                # luma pixels to display.  Update the success timestamp so the
+                # freeze-detection timer is not advanced spuriously.
+                self._avcLastSuccessTime = time.monotonic()
                 return
             self._avcLastSuccessTime = time.monotonic()
             self._blitToSurface(surfaceId, left, top, width, height, bgra_bytes)

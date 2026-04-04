@@ -29,6 +29,7 @@ from PyQt6.QtGui import QCursor, QPixmap
 from rdpy.protocol.rdp.rdp import RDPClientObserver
 from rdpy.core.error import CallPureVirtualFuntion
 import sys
+import traceback
 import numpy as np
 
 from rdpy.core import rle
@@ -490,6 +491,7 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
         @summary: Convert Qt close widget event into close stack event
         @param e: QCloseEvent
         """
+        log.debug("closeEvent: scheduling close() from Qt thread:\n%s" % "".join(traceback.format_stack()))
         reactor.callFromThread(self._controller.close)
 
     def setResizeCallback(self, callback):
@@ -852,5 +854,6 @@ class QRemoteDesktop(QtWidgets.QWidget):
         @summary: Call when widget is closed
         @param event: QCloseEvent
         """
+        log.debug("QRemoteDesktop.closeEvent fired:\n%s" % "".join(traceback.format_stack()))
         if self._adaptor:
             self._adaptor.closeEvent(event)

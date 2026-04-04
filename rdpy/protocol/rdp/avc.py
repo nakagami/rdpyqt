@@ -349,9 +349,11 @@ class AvcDecoder:
                 stream_data = rest[:cbAvc420Stream1]
             return self.decode_avc420(stream_data, dest_width, dest_height)
         elif lc == 2:
-            # Chroma-only refinement stream — skip
+            # Chroma-only refinement stream — skip luma decode.
+            # Return empty bytes (not None) so callers can distinguish
+            # "no output but codec is alive" from a real decode failure.
             log.debug("AVC444: LC=2 chroma-only, skipping")
-            return None
+            return b""
         else:
             log.warning("AVC444: unexpected LC value %d" % lc)
             return None

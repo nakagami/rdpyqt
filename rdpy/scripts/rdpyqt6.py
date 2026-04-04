@@ -23,6 +23,7 @@ example of use rdpy as rdp client
 import sys, getopt, socket
 import getpass
 import threading
+import traceback
 
 from PyQt6.QtWidgets import QApplication
 from rdpy.ui.qt6 import RDPClientQt, QRemoteDesktop, _get_qt_invoker
@@ -165,6 +166,7 @@ class RDPClientQtFactory(rdp.ClientFactory):
         self._resizing = True
         # Close must be called from the Twisted thread, not the Qt timer thread
         from twisted.internet import reactor
+        log.debug("_onResize: scheduling close() from Qt/timer thread:\n%s" % "".join(traceback.format_stack()))
         reactor.callFromThread(self._client._controller.close)
 
     def clientConnectionLost(self, connector, reason):
