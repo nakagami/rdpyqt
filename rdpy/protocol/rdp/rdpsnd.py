@@ -351,8 +351,31 @@ class RdpsndLayer(LayerAutomata):
 
         if flags & CHANNEL_FLAG_LAST:
             if len(self._vchanBuf) >= 1:
-                self._processData(bytes(self._vchanBuf))
+                self._processStaticData(bytes(self._vchanBuf))
             self._vchanBuf = b''
+
+    def _processStaticData(self, data):
+        """Process data from the static rdpsnd virtual channel.
+
+        When a DVC audio channel (AUDIO_PLAYBACK_DVC) is active, the server
+        sends audio on both the DVC channel and the static rdpsnd channel for
+        backward compatibility.  Playing both causes audio to play twice, which
+        sounds like the video is repeating.  When the DVC channel is active
+        (indicated by _dvcSendCallback being set), skip audio playback messages
+        on the static channel so only the DVC path produces sound.
+
+        Capability-negotiation messages (FORMATS, TRAINING, QUALITYMODE) are
+        always processed regardless of DVC state.
+        """
+        if self._dvcSendCallback is not None:
+            if self._expectingWaveData:
+                # Skip the Wave body continuation when DVC is active
+                self._expectingWaveData = False
+                return
+            if len(data) >= 1 and data[0] in (SNDC_WAVE, SNDC_WAVE2, SNDC_CLOSE):
+                log.debug("RDPSND: static channel audio/close suppressed (DVC active)")
+                return
+        self._processData(data)
 
     def _processData(self, data):
         """Dispatch a reassembled RDPSND PDU."""

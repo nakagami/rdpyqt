@@ -71,7 +71,15 @@ class QAdaptor(object):
         @summary: Interface to send wheel event to protocol stack
         @param e: QWheelEvent
         """
-        raise CallPureVirtualFuntion("%s:%s defined by interface %s"%(self.__class__, "sendWheelEvent", "QAdaptor")) 
+        raise CallPureVirtualFuntion("%s:%s defined by interface %s"%(self.__class__, "sendWheelEvent", "QAdaptor"))
+
+    def sendMouseMoveCoords(self, x, y):
+        """
+        @summary: Interface to send a mouse-move-only event with raw coordinates
+        @param x: x position
+        @param y: y position
+        """
+        raise CallPureVirtualFuntion("%s:%s defined by interface %s"%(self.__class__, "sendMouseMoveCoords", "QAdaptor"))
 
     def closeEvent(self, e):
         """
@@ -314,6 +322,14 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
             buttonNumber = 3
         x, y = int(e.pos().x()), int(e.pos().y())
         reactor.callFromThread(self._controller.sendPointerEvent, x, y, buttonNumber, isPressed)
+
+    def sendMouseMoveCoords(self, x, y):
+        """
+        @summary: Send a mouse-move-only event with raw coordinates (no button)
+        @param x: x position
+        @param y: y position
+        """
+        reactor.callFromThread(self._controller.sendPointerEvent, x, y, 0, False)
 
     # Mapping from macOS native key codes (kVK_xxx) to RDP scan codes.
     # Extended keys use the 0xE0xx form; the upper byte is stripped and
@@ -702,6 +718,12 @@ class QRemoteDesktop(QtWidgets.QWidget):
         self._resizeTimer.setSingleShot(True)
         self._resizeTimer.timeout.connect(self._handleResizeTimeout)
         self._pendingSize = None
+        #mouse move throttle: coalesce rapid moves to ~60fps
+        self._pendingMousePos = None
+        self._mouseMoveTimer = QtCore.QTimer()
+        self._mouseMoveTimer.setSingleShot(True)
+        self._mouseMoveTimer.setInterval(16)  # ~60 fps
+        self._mouseMoveTimer.timeout.connect(self._flushMouseMove)
         #set correct size; buffer is created in resizeEvent
         self.resize(width, height)
 
@@ -807,7 +829,20 @@ class QRemoteDesktop(QtWidgets.QWidget):
         @param event: QMouseEvent
         """
         if self._adaptor:
-            self._adaptor.sendMouseEvent(event, False)
+            pos = event.pos()
+            self._pendingMousePos = (int(pos.x()), int(pos.y()))
+            if not self._mouseMoveTimer.isActive():
+                self._mouseMoveTimer.start()
+
+    def _flushMouseMove(self):
+        """
+        @summary: Timer callback that sends the latest pending mouse position.
+        Coalesces rapid mouse-move events to avoid flooding the RDP connection.
+        """
+        if self._adaptor and self._pendingMousePos is not None:
+            x, y = self._pendingMousePos
+            self._pendingMousePos = None
+            self._adaptor.sendMouseMoveCoords(x, y)
 
     def mousePressEvent(self, event):
         """
