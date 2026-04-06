@@ -230,6 +230,8 @@ class ZgfxDecompressor:
                                 out.extend(chunk)
                                 hist[hist_idx:hist_idx + count] = chunk
                                 hist_idx += count
+                                if hist_idx >= hist_size:
+                                    hist_idx %= hist_size
                             else:
                                 for _ in range(count):
                                     b = hist[src_idx % hist_size]
