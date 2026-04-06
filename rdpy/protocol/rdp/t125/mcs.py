@@ -266,6 +266,12 @@ class MCSLayer(LayerAutomata):
     _RDP_BW_PAYLOAD = 0x0002
     _RDP_BW_STOP_CONNECTTIME = 0x002B
 
+    # Continuous auto-detect request types (used during active sessions)
+    _RDP_RTT_REQUEST_CONTINUOUS = 0x0001   # standard continuous RTT probe
+    _RDP_BW_START_CONTINUOUS = 0x0014      # continuous BW start (no response needed)
+    _RDP_BW_STOP_CONTINUOUS = 0x002B       # continuous BW stop (respond with BW results)
+    _RDP_RTT_REQUEST_GNOMERD = 0x0429      # gnome-remote-desktop continuous RTT probe
+
     # Response types
     _TYPE_ID_AUTODETECT_RESPONSE = 0x01
     _RDP_RTT_RESPONSE_TYPE = 0x0000
@@ -295,13 +301,15 @@ class MCSLayer(LayerAutomata):
         seq = sequenceNumber.value
         log.debug("AutoDetect request: requestType=0x%04x sequenceNumber=%d" % (req, seq))
 
-        if req == self._RDP_RTT_REQUEST_CONNECTTIME:
+        if req in (self._RDP_RTT_REQUEST_CONNECTTIME,
+                   self._RDP_RTT_REQUEST_CONTINUOUS,
+                   self._RDP_RTT_REQUEST_GNOMERD):
             # RTT Measure Response: headerLength=6, responseType=0x0000
             self._sendAutoDetectResponse(seq, self._RDP_RTT_RESPONSE_TYPE)
         elif req == self._RDP_BW_STOP_CONNECTTIME:
             # BW Results (connect-time): headerLength=14, responseType=0x0003 + timeDelta + byteCount
             self._sendAutoDetectResponse(seq, self._RDP_BW_RESULTS_CONNECTTIME, include_bw=True)
-        # BW_START (0x1014) and BW_PAYLOAD (0x0002) require no response
+        # BW_START (0x0014/0x1014) and BW_PAYLOAD (0x0002) require no response
 
     def _sendAutoDetectResponse(self, sequenceNumber, responseType, include_bw=False):
         """
