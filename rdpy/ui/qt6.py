@@ -185,11 +185,12 @@ def RDPBitmapToQtImage(width, height, bitsPerPixel, isCompress, data):
             image = QtGui.QImage(buf, width, height, width * bpp, fmt)
             image._buffer_ref = buf
         else:
-            raw = bytearray(data)
-            raw[3::4] = b'\xff' * (width * height)
-            _flip_rows_inplace(raw, width, height, bpp)
-            image = QtGui.QImage(raw, width, height, width * bpp, fmt)
-            image._buffer_ref = raw
+            # Flip rows and set alpha in one numpy pass — avoids the
+            # intermediate  b'\xff' * N  allocation from the old slice-assign.
+            arr = np.frombuffer(data, dtype=np.uint8).reshape(height, width, 4)[::-1].copy()
+            arr[:, :, 3] = 0xff
+            image = QtGui.QImage(arr.data, width, height, width * bpp, fmt)
+            image._buffer_ref = arr
     else:
         log.error("Receive image in bad format")
         image = QtGui.QImage(width, height, QtGui.QImage.Format.Format_RGB32)

@@ -208,7 +208,7 @@ class RawLayer(protocol.Protocol, LayerAutomata, IStreamSender):
         while self._expectedLen > 0 and (len(self._buffer) - self._bufferOffset) >= self._expectedLen:
             #expected data is first expected bytes
             end = self._bufferOffset + self._expectedLen
-            expectedData = Stream(bytes(self._buffer[self._bufferOffset:end]))
+            expectedData = Stream(self._buffer[self._bufferOffset:end])
             #advance offset instead of O(n) memmove
             self._bufferOffset = end
             #compact buffer when consumed portion exceeds remaining data
