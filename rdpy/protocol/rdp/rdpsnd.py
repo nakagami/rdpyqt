@@ -296,11 +296,12 @@ class RdpsndLayer(LayerAutomata):
         self._expectingWaveData = False
         # Audio playback
         self._audioSink = None
-        self._audioPushDevice = None      # push-mode write device (Qt main thread)
-        self._audioPendingBuf = bytearray()  # pre-buffer (Twisted thread, plain bytes)
+        self._audioPushDevice = None      # unused (kept for compat); pull mode is used
+        self._audioPendingBuf = bytearray()  # pre-buffer until ring buffer is ready
         self._audioInitialized = False
         self._audioSinkStarted = False  # True after QAudioSink.start()
-        self._audioPrebufBytes = 0      # bytes to accumulate before starting
+        self._audioPrebufBytes = 0      # unused in pull mode
+        self._audioRingBuffer = None    # pull-mode ring buffer (thread-safe)
         # Debug WAV dump (set to a path to write raw PCM to a WAV file)
         self._wavDumpFile = None
         self._wavDumpFmt = None
@@ -636,7 +637,6 @@ class RdpsndLayer(LayerAutomata):
 
         self._stopAudio()
 
-        self._audioPrebufBytes = fmt.avg_bytes_per_sec // 20  # 50 ms pre-buffer
         self._audioSinkStarted = False
         self._audioInitialized = True
         self._audioGain = 1.0
@@ -644,17 +644,21 @@ class RdpsndLayer(LayerAutomata):
         if hasattr(self, '_wavDumpPath') and self._wavDumpPath:
             self.enableWavDump(self._wavDumpPath)
             self._wavDumpPath = None
-        log.debug("RDPSND: audio ready (rate=%dHz prebuf=%d bytes): %s" % (
-            fmt.samples_per_sec, self._audioPrebufBytes, fmt))
+        log.debug("RDPSND: audio ready (pull mode, rate=%dHz): %s" % (
+            fmt.samples_per_sec, fmt))
+        fmt_snap = fmt
+        self._qt_invoke(lambda: self._qtStartSink(fmt_snap))
 
-    def _qtStartSink(self, fmt, initial_data):
-        """Create QAudioSink in push mode and write initial buffered data.
+    def _qtStartSink(self, fmt):
+        """Create QAudioSink in pull mode using _AudioRingBuffer.
 
-        Must be called on the Qt main thread.
+        Must be called on the Qt main thread.  The ring buffer is thread-safe
+        and can be written from the Twisted thread once this method returns.
         """
-        log.debug("RDPSND: _qtStartSink called with %d initial bytes" % len(initial_data))
+        log.debug("RDPSND: _qtStartSink (pull mode) for %s" % fmt)
         try:
             from PyQt6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices
+            from PyQt6.QtCore import QIODevice
         except ImportError:
             log.warning("RDPSND: PyQt6.QtMultimedia not available, audio disabled")
             return
@@ -677,32 +681,31 @@ class RdpsndLayer(LayerAutomata):
             log.warning("RDPSND: no audio output device available")
             return
 
+        ringBuf = _AudioRingBuffer()
+        ringBuf.open(QIODevice.OpenModeFlag.ReadOnly)
+
         sink = QAudioSink(device, audioFmt)
-        # Use a 1-second hardware buffer so brief Twisted delivery gaps
-        # don't cause underruns.
-        sink.setBufferSize(fmt.avg_bytes_per_sec)
-        push_dev = sink.start()   # push mode — returns a writable QIODevice
+        # 2-second hardware buffer provides headroom for Qt event-loop jitter.
+        sink.setBufferSize(fmt.avg_bytes_per_sec * 2)
+        sink.start(ringBuf)   # pull mode — Qt audio thread calls readData()
         self._audioSink = sink
-        self._audioPushDevice = push_dev
-        if push_dev is not None:
-            written = push_dev.write(initial_data)
-            log.debug("RDPSND: QAudioSink (push) started, wrote %d/%d initial bytes" % (
-                written, len(initial_data)))
-        else:
-            log.warning("RDPSND: QAudioSink.start() returned None push device")
+        # Set _audioRingBuffer last: the Twisted thread polls this to decide
+        # when to start writing (GIL ensures atomic pointer store).
+        self._audioRingBuffer = ringBuf
+        self._audioSinkStarted = True
+        log.debug("RDPSND: QAudioSink (pull) started")
 
     def _qtPushAudio(self, data):
-        """Write PCM data to the push device.  Must be called on Qt main thread."""
-        if self._audioPushDevice is not None:
-            written = self._audioPushDevice.write(data)
-            if written < len(data):
-                log.debug("RDPSND: push write short %d/%d bytes" % (written, len(data)))
+        """Unused in pull mode; kept for compatibility."""
+        pass
 
     def _playAudio(self, data):
-        """Receive PCM data from the Twisted thread and forward to QAudioSink.
+        """Receive PCM data from the Twisted thread and feed it to the ring buffer.
 
-        Pre-buffers data until enough is accumulated, then starts the sink
-        on the Qt main thread.  Subsequent chunks are dispatched via _qt_invoke.
+        The ring buffer is consumed by the Qt audio thread in pull mode,
+        independently of the Qt main event loop.  If the ring buffer is not
+        yet ready (sink still being initialised on the Qt thread), data is
+        accumulated in _audioPendingBuf and flushed on the next call.
         """
         if not self._audioInitialized:
             return
@@ -710,7 +713,6 @@ class RdpsndLayer(LayerAutomata):
         if self._lastPlayTime > 0:
             gap = now - self._lastPlayTime
             if gap > 0.050:
-                bufsize = len(self._audioPendingBuf) if not self._audioSinkStarted else -1
                 log.debug("RDPSND: audio gap %.0fms" % (gap * 1000,))
         self._lastPlayTime = now
         if self._audioGain != 1.0:
@@ -720,23 +722,20 @@ class RdpsndLayer(LayerAutomata):
                 self._wavDumpFile.writeframesraw(data)
             except Exception:
                 pass
-        if not self._audioSinkStarted:
-            self._audioPendingBuf.extend(data)
-            if len(self._audioPendingBuf) >= self._audioPrebufBytes:
-                self._audioSinkStarted = True
-                initial = bytes(self._audioPendingBuf)
+        ring = self._audioRingBuffer  # atomic read under GIL
+        if ring is not None:
+            if self._audioPendingBuf:
+                ring.append(bytes(self._audioPendingBuf))
                 self._audioPendingBuf = bytearray()
-                fmt_snap = self._wavDumpFmt
-                self._qt_invoke(lambda: self._qtStartSink(fmt_snap, initial))
-                log.debug("RDPSND: posted _qtStartSink with %d bytes" % len(initial))
+            ring.append(bytes(data) if not isinstance(data, (bytes, bytearray)) else bytes(data))
         else:
-            chunk = bytes(data)
-            self._qt_invoke(lambda: self._qtPushAudio(chunk))
+            # Sink not started yet — accumulate until _qtStartSink runs.
+            self._audioPendingBuf.extend(data)
 
     def _stopAudio(self):
         """Stop and clean up audio output.
 
-        Qt objects (QAudioSink) are stopped on the Qt main thread.
+        Qt objects (QAudioSink, ring buffer) are stopped on the Qt main thread.
         All bookkeeping flags are cleared immediately so subsequent
         calls see a clean state.
         """
@@ -746,10 +745,17 @@ class RdpsndLayer(LayerAutomata):
         self._audioPendingBuf = bytearray()
 
         sink = self._audioSink
-        self._audioSink      = None
+        ring = self._audioRingBuffer
+        self._audioSink       = None
         self._audioPushDevice = None
+        self._audioRingBuffer = None
 
         def _qt_cleanup():
+            if ring is not None:
+                try:
+                    ring.close()
+                except Exception:
+                    pass
             if sink is not None:
                 try:
                     sink.stop()
