@@ -1120,7 +1120,9 @@ class DrdynvcLayer(LayerAutomata):
                 plane[y * w + x] ^= plane[(y - 1) * w + x]
 
 
+    def _renderClearCodec(self, surfaceId, left, top, width, height, pixelFormat, bitmapData):
         """Decode ClearCodec bitmap per MS-RDPEGFX 2.2.4."""
+        data = bitmapData
         if len(data) < 12:
             return
         off = 0
