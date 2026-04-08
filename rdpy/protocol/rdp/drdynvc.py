@@ -769,7 +769,6 @@ class DrdynvcLayer(LayerAutomata):
                  (surfaceId, codecId, w, h, len(bitmapData)))
 
         if codecId == RDPGFX_CODECID_CAPROGRESSIVE:
-            surfInfo = self._surfaces.get(surfaceId)
             surfBuf = self._surfaceData.get(surfaceId)
             if surfInfo is None or surfBuf is None:
                 log.warning("RDPGFX: WIRE_TO_SURFACE_2 unknown surface %d" % surfaceId)
@@ -781,7 +780,6 @@ class DrdynvcLayer(LayerAutomata):
             except Exception as e:
                 log.warning("RDPGFX: Progressive decode error: %s" % str(e))
         elif codecId == RDPGFX_CODECID_CAVIDEO:
-            surfInfo = self._surfaces.get(surfaceId)
             surfBuf = self._surfaceData.get(surfaceId)
             if surfInfo is None or surfBuf is None:
                 log.warning("RDPGFX: WTS2 unknown surface %d" % surfaceId)
@@ -793,14 +791,12 @@ class DrdynvcLayer(LayerAutomata):
             except Exception as e:
                 log.warning("RDPGFX: CaVideo RFX decode error: %s" % str(e))
         elif codecId == RDPGFX_CODECID_AVC420:
-            surfInfo = self._surfaces.get(surfaceId)
             if surfInfo is None:
                 log.warning("RDPGFX: WTS2 unknown surface %d" % surfaceId)
                 return
             w, h, _ = surfInfo
             self._renderAvc420(surfaceId, 0, 0, w, h, bitmapData)
         elif codecId in (RDPGFX_CODECID_AVC444, RDPGFX_CODECID_AVC444v2):
-            surfInfo = self._surfaces.get(surfaceId)
             if surfInfo is None:
                 log.warning("RDPGFX: WTS2 unknown surface %d" % surfaceId)
                 return

@@ -33,7 +33,7 @@ class _BitReader:
     __slots__ = ('_data', '_pos', '_total')
 
     def __init__(self, data):
-        self._data = data
+        self._data = bytes(data) if not isinstance(data, bytes) else data
         self._pos = 0
         self._total = len(data) * 8
 
@@ -317,8 +317,12 @@ def _inverse_dwt_2d(coeffs):
 # Component decoding
 # ---------------------------------------------------------------
 
-def _decode_component(data, quant):
-    """Decode one color component (Y/Cb/Cr) for a 64×64 tile."""
+def _decode_component(data, quant, store=False):
+    """Decode one color component (Y/Cb/Cr) for a 64×64 tile.
+
+    If store=True, also returns (raw_coeffs, sign_context) needed for
+    progressive upgrade (pre-dequantization values).
+    """
     TILE_PIXELS = RFX_TILE_SIZE * RFX_TILE_SIZE  # 4096
 
     # 1. RLGR1 entropy decode
@@ -328,33 +332,21 @@ def _decode_component(data, quant):
     for i in range(4033, 4096):
         coeffs[i] += coeffs[i - 1]
 
+    if store:
+        raw = coeffs.copy()
+        sign = np.zeros(TILE_PIXELS, dtype=np.int8)
+        sign[raw > 0] = 1
+        sign[raw < 0] = -1
+
     # 3. Dequantize
     _dequantize(coeffs, quant)
 
     # 4. Inverse DWT (3 levels)
     _inverse_dwt_2d(coeffs)
 
+    if store:
+        return coeffs, raw, sign
     return coeffs
-
-
-def _decode_component_store(data, quant):
-    """Decode one component and return (spatial_coeffs, raw_coeffs, sign_context).
-    raw_coeffs stores pre-dequant values for progressive upgrade."""
-    TILE_PIXELS = RFX_TILE_SIZE * RFX_TILE_SIZE
-
-    coeffs = rlgr1_decode(data, TILE_PIXELS)
-    for i in range(4033, 4096):
-        coeffs[i] += coeffs[i - 1]
-
-    # Store raw coefficients and sign context before dequantization
-    raw = coeffs.copy()
-    sign = np.zeros(TILE_PIXELS, dtype=np.int8)
-    sign[raw > 0] = 1
-    sign[raw < 0] = -1
-
-    _dequantize(coeffs, quant)
-    _inverse_dwt_2d(coeffs)
-    return coeffs, raw, sign
 
 
 # ---------------------------------------------------------------
@@ -415,41 +407,6 @@ def _place_tile(y_coeffs, cb_coeffs, cr_coeffs, x_idx, y_idx, output, out_w, out
 # SRL + RAW bit-level reader for progressive upgrades
 # ---------------------------------------------------------------
 
-class _RawBitReader:
-    """Read bits from a byte buffer for SRL/RAW streams."""
-    __slots__ = ('_data', '_pos', '_total')
-
-    def __init__(self, data):
-        self._data = bytes(data) if not isinstance(data, bytes) else data
-        self._pos = 0
-        self._total = len(data) * 8
-
-    def remaining(self):
-        return self._total - self._pos
-
-    def read_bits(self, n):
-        if n <= 0:
-            return 0
-        val = 0
-        for _ in range(n):
-            if self._pos < self._total:
-                byte_idx = self._pos >> 3
-                bit_idx = 7 - (self._pos & 7)
-                val = (val << 1) | ((self._data[byte_idx] >> bit_idx) & 1)
-                self._pos += 1
-            else:
-                val <<= 1
-        return val
-
-    def read_bit(self):
-        if self._pos < self._total:
-            byte_idx = self._pos >> 3
-            bit_idx = 7 - (self._pos & 7)
-            self._pos += 1
-            return (self._data[byte_idx] >> bit_idx) & 1
-        return 0
-
-
 def _upgrade_component(srl_data, raw_data, current, sign, quant, prog_quant):
     """Apply progressive upgrade delta to stored coefficients.
     Uses SRL+RAW bit-level decoding per MS-RDPEGFX 3.3.8.4.
@@ -459,8 +416,8 @@ def _upgrade_component(srl_data, raw_data, current, sign, quant, prog_quant):
     quant: regular quant values for dequantization
     prog_quant: progressive quant values (bit positions)
     """
-    srl = _RawBitReader(srl_data)
-    raw = _RawBitReader(raw_data)
+    srl = _BitReader(srl_data)
+    raw = _BitReader(raw_data)
 
     shifts = quant.subband_shifts()
     bit_positions = prog_quant.subband_shifts()
@@ -672,9 +629,9 @@ class RfxProgressiveDecoder:
                        quant_idx_y, quant_idx_cb, quant_idx_cr))
         self._debug_tile_count += 1
 
-        y_pixels, y_raw, y_sign = _decode_component_store(y_data, q_y)
-        cb_pixels, cb_raw, cb_sign = _decode_component_store(cb_data, q_cb)
-        cr_pixels, cr_raw, cr_sign = _decode_component_store(cr_data, q_cr)
+        y_pixels, y_raw, y_sign = _decode_component(y_data, q_y, store=True)
+        cb_pixels, cb_raw, cb_sign = _decode_component(cb_data, q_cb, store=True)
+        cr_pixels, cr_raw, cr_sign = _decode_component(cr_data, q_cr, store=True)
 
         if self._debug_tile_count <= 3:
             # Sample center pixel (32,32) of the tile for debugging
@@ -719,9 +676,9 @@ class RfxProgressiveDecoder:
                        quant_idx_y, quant_idx_cb, quant_idx_cr))
         self._debug_tile_count += 1
 
-        y_pixels, y_raw, y_sign = _decode_component_store(y_data, q_y)
-        cb_pixels, cb_raw, cb_sign = _decode_component_store(cb_data, q_cb)
-        cr_pixels, cr_raw, cr_sign = _decode_component_store(cr_data, q_cr)
+        y_pixels, y_raw, y_sign = _decode_component(y_data, q_y, store=True)
+        cb_pixels, cb_raw, cb_sign = _decode_component(cb_data, q_cb, store=True)
+        cr_pixels, cr_raw, cr_sign = _decode_component(cr_data, q_cr, store=True)
 
         if self._debug_tile_count <= 3:
             idx = 32 * 64 + 32
