@@ -762,12 +762,21 @@ class Client(PDULayer):
                 pixels = None
                 outBpp = bpp
                 if codecID == 0:
-                    # Uncompressed
+                    # Uncompressed (top-down)
                     pixels = bitmapData
+                    outBpp = bpp
                 elif codecID == 1:
-                    # NSCodec
-                    pixels = decode_nscodec(bytes(bitmapData), width, height)
+                    # NSCodec decodes to top-down BGRA, but empirically the
+                    # output needs to be flipped vertically before passing to Qt
+                    # (mirrors grdp's explicit vertical flip after decodeNSCodec).
+                    raw = decode_nscodec(bytes(bitmapData), width, height)
                     outBpp = 32
+                    if raw is not None:
+                        import numpy as _np
+                        arr = _np.frombuffer(raw, dtype=_np.uint8).reshape(height, width, 4)
+                        pixels = arr[::-1].tobytes()
+                    else:
+                        pixels = None
                 else:
                     log.warning("Unsupported surface codec: %d" % codecID)
                     continue
@@ -775,12 +784,13 @@ class Client(PDULayer):
                 if pixels is None:
                     continue
 
-                # Deliver decoded bitmap to display (not RLE compressed).
-                # RDPBitmapToQtImage handles the top-down to bottom-up flip via .mirrored().
+                # Pass isCompress='gfx' so RDPBitmapToQtImage calls .copy() on the
+                # QImage, making Qt own the pixel buffer and avoiding cross-thread
+                # dangling-pointer issues with Python-managed buffers.
                 if hasattr(self._listener, '_onGfxBitmap'):
                     self._listener._onGfxBitmap(
                         destLeft, destTop, destRight, destBottom,
-                        width, height, outBpp, False, pixels)
+                        width, height, outBpp, 'gfx', pixels)
             else:
                 log.debug("Unknown surface command type: %s" % hex(cmdType))
                 break

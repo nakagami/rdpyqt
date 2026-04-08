@@ -650,11 +650,18 @@ class BitmapCodecsCapability(CompositeType):
     @staticmethod
     def buildClientCodecs():
         """
-        @summary: Build a BitmapCodecsCapability with NSCodec and RemoteFX codecs
+        @summary: Build a BitmapCodecsCapability with NSCodec only.
+
+        RemoteFX is intentionally omitted: when advertised with codecID=0
+        (the conventional value), the server uses 0 in TS_BITMAP_DATA_EX
+        which collides with the "uncompressed" sentinel and causes garbled
+        output because we cannot decode RemoteFX tiles in the surface-
+        commands path.  Advertising only NSCodec (codecID=1) keeps the
+        mapping unambiguous and lets the server send readable bitmaps.
         """
         import struct
         cap = BitmapCodecsCapability()
-        cap.bitmapCodecCount.value = 2
+        cap.bitmapCodecCount.value = 1
         # NSCodec entry
         nscodec = BitmapCodecsCapability.NSCODEC_GUID
         nscodec += struct.pack('<B', 1)     # codecID (client chooses 1 for NSCodec)
@@ -662,26 +669,7 @@ class BitmapCodecsCapability(CompositeType):
         nscodec += struct.pack('<H', len(nscodec_props))  # codecPropertiesLength
         nscodec += nscodec_props
 
-        # RemoteFX entry with full TS_RFX_CLNT_CAPS_CONTAINER
-        rfx = BitmapCodecsCapability.REMOTEFX_GUID
-        rfx += struct.pack('<B', 0)         # codecID (0 for RemoteFX)
-        # Build TS_RFX_CLNT_CAPS_CONTAINER per MS-RDPRFX
-        icap = struct.pack('<HHBBBB',
-            0x0100,  # version
-            0x0040,  # tileSize (CT_TILE_64x64)
-            0x01,    # flags (CODEC_MODE)
-            0x01,    # colConvBits
-            0x01,    # transformBits
-            0x01)    # entropyBits (CLW_ENTROPY_RLGR1)
-        capset_data = struct.pack('<BHH', 0x01, 0xCFC0, 1) + struct.pack('<H', 8) + icap
-        capset_block = struct.pack('<HI', 0xCBC1, 6 + len(capset_data)) + capset_data
-        caps_block = struct.pack('<HIH', 0xCBC0, 8, 1)
-        caps_data = caps_block + capset_block
-        rfx_props = struct.pack('<III', 12 + len(caps_data), 0, len(caps_data)) + caps_data
-        rfx += struct.pack('<H', len(rfx_props))
-        rfx += rfx_props
-
-        cap.bitmapCodecArray = String(nscodec + rfx)
+        cap.bitmapCodecArray = String(nscodec)
         return cap
 
 class FrameAcknowledgeCapability(CompositeType):

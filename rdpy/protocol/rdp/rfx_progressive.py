@@ -269,41 +269,46 @@ def _idwt_2d_level(buf, n):
     lo = np.vstack([ll, lh])   # (2n, n)
     hi = np.vstack([hl, hh])   # (2n, n)
 
-    # Even positions (undo update step)
+    # Even positions (undo update step); compute in int32, then truncate to int16 (matching grdp)
     even_h = np.empty((2 * n, n), dtype=np.int32)
     even_h[:, 0] = lo[:, 0] - ((hi[:, 0] * 2 + 1) >> 1)
     even_h[:, 1:] = lo[:, 1:] - ((hi[:, :-1] + hi[:, 1:] + 1) >> 1)
+    even_h_i16 = even_h.astype(np.int16)
+    even_h_i32 = even_h_i16.astype(np.int32)  # sign-extended truncated values
 
-    # Odd positions (undo predict step, H<<1 scaling)
+    # Odd positions — both neighbours are read from int16 tmp (both truncated, matching grdp)
     odd_h = np.empty((2 * n, n), dtype=np.int32)
-    odd_h[:, :-1] = (hi[:, :-1] << 1) + ((even_h[:, :-1] + even_h[:, 1:]) >> 1)
-    odd_h[:, -1] = (hi[:, -1] << 1) + even_h[:, -1]
+    odd_h[:, :-1] = (hi[:, :-1] << 1) + ((even_h_i32[:, :-1] + even_h_i32[:, 1:]) >> 1)
+    odd_h[:, -1] = (hi[:, -1] << 1) + even_h_i32[:, -1]
 
-    # Interleave even/odd into tmp columns
-    tmp = np.empty((2 * n, size), dtype=np.int32)
-    tmp[:, 0::2] = even_h
-    tmp[:, 1::2] = odd_h
+    # Interleave even/odd into tmp as int16 (matching grdp's int16 tmp buffer)
+    tmp = np.empty((2 * n, size), dtype=np.int16)
+    tmp[:, 0::2] = even_h_i16
+    tmp[:, 1::2] = odd_h.astype(np.int16)
 
     # --- Step 2: Vertical IDWT (all columns at once) ---
-    lo_v = tmp[:n, :]    # L rows
-    hi_v = tmp[n:, :]    # H rows
+    lo_v = tmp[:n, :].astype(np.int32)    # L rows (sign-extended from int16)
+    hi_v = tmp[n:, :].astype(np.int32)    # H rows (sign-extended from int16)
 
-    # Even rows
+    # Even rows; compute in int32, then truncate to int16 (matching grdp)
     even_v = np.empty((n, size), dtype=np.int32)
     even_v[0, :] = lo_v[0, :] - ((hi_v[0, :] * 2 + 1) >> 1)
     even_v[1:, :] = lo_v[1:, :] - ((hi_v[:-1, :] + hi_v[1:, :] + 1) >> 1)
+    even_v_i16 = even_v.astype(np.int16)
+    even_v_i32 = even_v_i16.astype(np.int32)  # sign-extended truncated values
 
-    # Odd rows
+    # Odd rows — prevEven (even[row-1]) is truncated; current even[row] is not yet truncated
+    # (matches grdp: prevEven = int32(buf[prev]) is truncated, even = local int32 is not)
     odd_v = np.empty((n, size), dtype=np.int32)
-    odd_v[:-1, :] = (hi_v[:-1, :] << 1) + ((even_v[:-1, :] + even_v[1:, :]) >> 1)
-    odd_v[-1, :] = (hi_v[-1, :] << 1) + even_v[-1, :]
+    odd_v[:-1, :] = (hi_v[:-1, :] << 1) + ((even_v_i32[:-1, :] + even_v[1:, :]) >> 1)
+    odd_v[-1, :] = (hi_v[-1, :] << 1) + even_v_i32[-1, :]
 
-    # Interleave even/odd into output rows
-    out = np.empty((size, size), dtype=np.int32)
-    out[0::2, :] = even_v
-    out[1::2, :] = odd_v
+    # Interleave even/odd into output as int16
+    out = np.empty((size, size), dtype=np.int16)
+    out[0::2, :] = even_v_i16
+    out[1::2, :] = odd_v.astype(np.int16)
 
-    buf[:size * size] = out.reshape(-1).astype(np.int16)
+    buf[:size * size] = out.reshape(-1)
 
 
 def _inverse_dwt_2d(coeffs):
@@ -370,7 +375,9 @@ def _place_tile_abs(y_coeffs, cb_coeffs, cr_coeffs, tile_x, tile_y, output, out_
     cb_arr = cb_coeffs[coeff_idx].astype(np.int32)
     cr_arr = cr_coeffs[coeff_idx].astype(np.int32)
 
-    # ICT (YCbCr → RGB) with fixed-point arithmetic matching FreeRDP/grdp
+    # ICT (BT.601) inverse colour transform — same formula as grdp rfxPlaceTileAbs:
+    #   IDWT output is 32x-scaled (dequant shifts by q-1), so +4096 centres black,
+    #   then >> 21 = >> 16 / 32 converts to [0,255] pixel range.
     y_scaled = (y_arr + 4096) << 16
     r = (cr_arr * 91916 + y_scaled) >> 21
     g = (y_scaled - cb_arr * 22527 - cr_arr * 46819) >> 21

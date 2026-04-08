@@ -77,9 +77,10 @@ _RDPGFX_CMDID_NAMES = {
 # RDPGFX codec IDs (MS-RDPEGFX, FreeRDP rdpgfx.h)
 RDPGFX_CODECID_UNCOMPRESSED = 0x0000
 RDPGFX_CODECID_CAVIDEO = 0x0003
+RDPGFX_CODECID_PLANAR = 0x0004      # grdp-style Planar (thin-client / v8.0 path)
 RDPGFX_CODECID_CLEARCODEC = 0x0008
 RDPGFX_CODECID_CAPROGRESSIVE = 0x0009
-RDPGFX_CODECID_PLANAR = 0x000A
+RDPGFX_CODECID_PLANAR_V2 = 0x000A  # MS-RDPEGFX 2.2.2.1 Planar (v10 path)
 RDPGFX_CODECID_AVC420 = 0x000B
 RDPGFX_CODECID_ALPHA = 0x000C
 RDPGFX_CODECID_AVC444 = 0x000E
@@ -736,8 +737,8 @@ class DrdynvcLayer(LayerAutomata):
         elif codecId == RDPGFX_CODECID_UNCOMPRESSED:
             self._renderUncompressed(surfaceId, left, top, width, height,
                                      pixelFormat, bitmapData)
-        elif codecId == RDPGFX_CODECID_PLANAR:
-            log.debug("RDPGFX: PLANAR codec not yet supported, %d bytes" % len(bitmapData))
+        elif codecId in (RDPGFX_CODECID_PLANAR, RDPGFX_CODECID_PLANAR_V2):
+            self._renderPlanar(surfaceId, left, top, width, height, bitmapData)
         elif codecId == RDPGFX_CODECID_CAPROGRESSIVE:
             log.debug("RDPGFX: Progressive RemoteFX not yet supported, %d bytes" % len(bitmapData))
         elif codecId == RDPGFX_CODECID_CLEARCODEC:
@@ -1001,7 +1002,124 @@ class DrdynvcLayer(LayerAutomata):
         ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
         self._deliverBitmap(ox + left, oy + top, width, height, bpp, bytes(raw))
 
-    def _renderClearCodec(self, surfaceId, left, top, width, height, pixelFormat, data):
+    # ---------------------------------------------------------------
+    # Planar codec (0x0004) — ported from grdp decodePlanar
+    # ---------------------------------------------------------------
+
+    def _renderPlanar(self, surfaceId, left, top, width, height, data):
+        """Decode Planar bitmap (codec 0x0004) per MS-RDPEGDI 2.2.2.5."""
+        out = self._decodePlanar(data, width, height)
+        self._blitToSurface(surfaceId, left, top, width, height, out)
+        ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
+        self._deliverBitmap(ox + left, oy + top, width, height, 32, bytes(out))
+
+    def _decodePlanar(self, data, w, h):
+        """Decode one Planar-codec bitmap; returns BGRA bytearray (w*h*4)."""
+        plane_size = w * h
+        out = bytearray(plane_size * 4)
+        if len(data) < 1:
+            return out
+
+        header = data[0]
+        rle = (header >> 5) & 1
+        no_alpha = (header >> 6) & 1
+        offset = 1
+
+        if rle == 0:
+            if no_alpha == 0:
+                alpha_plane, offset = self._readRawPlane(data, offset, plane_size)
+            else:
+                alpha_plane = None
+            red_plane, offset = self._readRawPlane(data, offset, plane_size)
+            green_plane, offset = self._readRawPlane(data, offset, plane_size)
+            blue_plane, offset = self._readRawPlane(data, offset, plane_size)
+        else:
+            if no_alpha == 0:
+                alpha_plane, offset = self._decodeNRLE(data, offset, plane_size)
+            else:
+                alpha_plane = None
+            red_plane, offset = self._decodeNRLE(data, offset, plane_size)
+            green_plane, offset = self._decodeNRLE(data, offset, plane_size)
+            blue_plane, offset = self._decodeNRLE(data, offset, plane_size)
+
+        self._applyDelta(alpha_plane, w, h)
+        self._applyDelta(red_plane, w, h)
+        self._applyDelta(green_plane, w, h)
+        self._applyDelta(blue_plane, w, h)
+
+        for i in range(plane_size):
+            a = alpha_plane[i] if (alpha_plane and i < len(alpha_plane)) else 0xFF
+            r = red_plane[i] if (red_plane and i < len(red_plane)) else 0
+            g = green_plane[i] if (green_plane and i < len(green_plane)) else 0
+            b = blue_plane[i] if (blue_plane and i < len(blue_plane)) else 0
+            out[i * 4] = b
+            out[i * 4 + 1] = g
+            out[i * 4 + 2] = r
+            out[i * 4 + 3] = a
+        return out
+
+    def _readRawPlane(self, data, offset, size):
+        plane = bytearray(size)
+        end = min(offset + size, len(data))
+        if offset < end:
+            plane[:end - offset] = data[offset:end]
+        return plane, offset + size
+
+    def _decodeNRLE(self, data, offset, plane_size):
+        """Decode an NRLE-encoded color plane (grdp decodeNRLE)."""
+        out = bytearray(plane_size)
+        pos = 0
+        while pos < plane_size and offset < len(data):
+            ctrl = data[offset]
+            offset += 1
+            run_len = (ctrl >> 4) & 0x0F
+            raw_len = ctrl & 0x0F
+
+            if run_len == 15:
+                if offset >= len(data):
+                    break
+                ext = data[offset]
+                offset += 1
+                run_len += ext
+                if ext == 0xFF:
+                    if offset + 1 >= len(data):
+                        break
+                    run_len += struct.unpack_from('<H', data, offset)[0]
+                    offset += 2
+            for _ in range(run_len):
+                if pos >= plane_size:
+                    break
+                out[pos] = 0
+                pos += 1
+
+            if raw_len == 15:
+                if offset >= len(data):
+                    break
+                ext = data[offset]
+                offset += 1
+                raw_len += ext
+                if ext == 0xFF:
+                    if offset + 1 >= len(data):
+                        break
+                    raw_len += struct.unpack_from('<H', data, offset)[0]
+                    offset += 2
+            for _ in range(raw_len):
+                if pos >= plane_size or offset >= len(data):
+                    break
+                out[pos] = data[offset]
+                pos += 1
+                offset += 1
+        return out, offset
+
+    def _applyDelta(self, plane, w, h):
+        """XOR each row with the previous row (delta decode)."""
+        if plane is None or len(plane) < w * h:
+            return
+        for y in range(1, h):
+            for x in range(w):
+                plane[y * w + x] ^= plane[(y - 1) * w + x]
+
+
         """Decode ClearCodec bitmap per MS-RDPEGFX 2.2.4."""
         if len(data) < 12:
             return
@@ -1363,19 +1481,21 @@ class DrdynvcLayer(LayerAutomata):
         """Send RDPGFX CAPS_ADVERTISE PDU (MS-RDPEGFX 2.2.3)
 
         When PyAV is available, advertise v10 (AVC444) and v8.0 (AVC420)
-        capsets without THINCLIENT flag — the flag causes the server to
-        prefer RemoteFX over H.264 even when AVC is not disabled.
-        When PyAV is unavailable, fall back to a single v8.0 capset with
-        THINCLIENT | SMALL_CACHE | AVC_DISABLED."""
+        capsets without THINCLIENT flag.
+        When PyAV is unavailable, advertise v8.0 only with THINCLIENT flag,
+        matching grdp's non-h264 advertisement.  This causes the server to
+        send Planar (codecId 0x0004) instead of ClearCodec (0x0008)."""
         capsSets = []
         if avc_module.is_available():
             # v10 capset — preferred; enables AVC444 + AVC420
             capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_10, 4,
                                         RDPGFX_CAPS_FLAG_SMALL_CACHE))
-            # v8.0 capset — fallback; enables AVC420
+            # v8.0 capset — fallback
             capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_8, 4,
                                         RDPGFX_CAPS_FLAG_SMALL_CACHE))
         else:
+            # Non-AVC: v8.0 only + THINCLIENT, matching grdp's thin-client path.
+            # This tells the server to use Planar codec instead of ClearCodec.
             capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_8, 4,
                                         RDPGFX_CAPS_FLAG_THINCLIENT |
                                         RDPGFX_CAPS_FLAG_SMALL_CACHE |
@@ -1393,7 +1513,7 @@ class DrdynvcLayer(LayerAutomata):
         if avc_module.is_available():
             log.debug("RDPGFX: sent CAPS_ADVERTISE (v10+v8.0, AVC enabled)")
         else:
-            log.debug("RDPGFX: sent CAPS_ADVERTISE (v8.0, AVC disabled)")
+            log.debug("RDPGFX: sent CAPS_ADVERTISE (v8.0 only, THINCLIENT, AVC disabled)")
 
     # ---------------------------------------------------------------
     # DVC transport
