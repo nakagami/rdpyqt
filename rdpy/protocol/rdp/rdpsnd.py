@@ -39,6 +39,14 @@ import rdpy.core.log as log
 # Audio ring buffer (QIODevice subclass for QAudioSink pull mode)
 # ---------------------------------------------------------------------------
 
+# Prebuffer duration in seconds.  The sink is not started until this much
+# PCM data has accumulated.  This keeps the ring buffer ahead of the Qt
+# audio thread so that normal per-packet jitter (~±25 ms) never causes an
+# underrun.  500 ms ≈ 2–3 standard RDP wave packets at 44100 Hz stereo
+# 16-bit; it adds a one-time latency at the start of a stream but prevents
+# the periodic crackling that occurs when the buffer runs dry every packet.
+_AUDIO_PREBUF_SECONDS = 0.5
+
 # Crossfade length in sample frames.  At 44100 Hz stereo 16-bit
 # (frame = 4 bytes), 128 frames ≈ 2.9 ms — short enough to be
 # inaudible as a fade but long enough to eliminate the "click" that
@@ -159,12 +167,21 @@ class _AudioRingBuffer:
                                     memoryview(chunk)[-_FADE_FRAMES * 4:],
                                     _FADE_OUT_STEREO,
                                 )
+                                # Mark underrun so the NEXT read that has
+                                # data applies a fade-in.  Without this, new
+                                # data that arrives between two readData calls
+                                # would start at full amplitude immediately
+                                # after the fade-out → audible click.
+                                self._was_underrun = True
 
                             return bytes(chunk)
 
                         self._was_underrun = True
 
-                    return b''
+                    # Return silence rather than an empty bytes object so
+                    # that the QAudioSink never stops/restarts (which would
+                    # produce an audible pop on macOS Core Audio).
+                    return b'\x00' * maxSize
 
                 def writeData(self, data):
                     return -1  # read-only
@@ -300,7 +317,8 @@ class RdpsndLayer(LayerAutomata):
         self._audioPendingBuf = bytearray()  # pre-buffer until ring buffer is ready
         self._audioInitialized = False
         self._audioSinkStarted = False  # True after QAudioSink.start()
-        self._audioPrebufBytes = 0      # unused in pull mode
+        self._audioPrebufBytes = 0      # set in _setupAudio; sink waits until this many bytes buffered
+        self._pendingSinkFmt = None     # format stored until prebuffer fills
         self._audioRingBuffer = None    # pull-mode ring buffer (thread-safe)
         # Debug WAV dump (set to a path to write raw PCM to a WAV file)
         self._wavDumpFile = None
@@ -644,10 +662,16 @@ class RdpsndLayer(LayerAutomata):
         if hasattr(self, '_wavDumpPath') and self._wavDumpPath:
             self.enableWavDump(self._wavDumpPath)
             self._wavDumpPath = None
-        log.debug("RDPSND: audio ready (pull mode, rate=%dHz): %s" % (
-            fmt.samples_per_sec, fmt))
-        fmt_snap = fmt
-        self._qt_invoke(lambda: self._qtStartSink(fmt_snap))
+        # Compute how many bytes to pre-buffer before starting the sink.
+        # Accumulating ~500 ms ensures the ring buffer stays ahead of the
+        # audio thread even when packet arrival jitter is ±25 ms.
+        self._audioPrebufBytes = max(
+            32768,
+            int(fmt.avg_bytes_per_sec * _AUDIO_PREBUF_SECONDS),
+        )
+        self._pendingSinkFmt = fmt
+        log.debug("RDPSND: audio ready (pull mode, rate=%dHz): %s (prebuf %d bytes)" % (
+            fmt.samples_per_sec, fmt, self._audioPrebufBytes))
 
     def _qtStartSink(self, fmt):
         """Create QAudioSink in pull mode using _AudioRingBuffer.
@@ -729,8 +753,17 @@ class RdpsndLayer(LayerAutomata):
                 self._audioPendingBuf = bytearray()
             ring.append(bytes(data) if not isinstance(data, (bytes, bytearray)) else bytes(data))
         else:
-            # Sink not started yet — accumulate until _qtStartSink runs.
+            # Sink not started yet — accumulate until prebuffer fills.
             self._audioPendingBuf.extend(data)
+            if (self._pendingSinkFmt is not None and
+                    len(self._audioPendingBuf) >= self._audioPrebufBytes):
+                # Enough data buffered: start the sink now.  The pending
+                # bytes will be flushed into the ring on the next call.
+                fmt_snap = self._pendingSinkFmt
+                self._pendingSinkFmt = None
+                log.debug("RDPSND: prebuffer full (%d bytes), starting sink" %
+                          len(self._audioPendingBuf))
+                self._qt_invoke(lambda: self._qtStartSink(fmt_snap))
 
     def _stopAudio(self):
         """Stop and clean up audio output.
@@ -743,6 +776,7 @@ class RdpsndLayer(LayerAutomata):
         self._audioInitialized = False
         self._audioSinkStarted = False
         self._audioPendingBuf = bytearray()
+        self._pendingSinkFmt = None
 
         sink = self._audioSink
         ring = self._audioRingBuffer
