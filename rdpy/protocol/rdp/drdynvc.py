@@ -1491,9 +1491,11 @@ class DrdynvcLayer(LayerAutomata):
         if avc_module.is_available():
             # v10 capset — preferred; enables AVC444 + AVC420
             capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_10, 4,
+                                        RDPGFX_CAPS_FLAG_THINCLIENT |
                                         RDPGFX_CAPS_FLAG_SMALL_CACHE))
             # v8.0 capset — fallback
             capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_8, 4,
+                                        RDPGFX_CAPS_FLAG_THINCLIENT |
                                         RDPGFX_CAPS_FLAG_SMALL_CACHE))
         else:
             # Non-AVC: v8.0 only + THINCLIENT, matching grdp's thin-client path.
