@@ -140,7 +140,7 @@ def _decompress1(output, width, height, input_data):
                 if prevline == 0:
                     output[line + x : line + x + n_pix] = bytes([mix]) * n_pix
                 else:
-                    src = output[prevline + x : prevline + x + n_pix]
+                    src = bytes(output[prevline + x : prevline + x + n_pix])
                     output[line + x : line + x + n_pix] = src.translate(mix_table)
                 count -= n_pix
                 x += n_pix
@@ -226,9 +226,12 @@ def _decompress2(output, width, height, input_data):
     mixmask = 0
 
     # Internal buffer of uint16 pixel values (pixel-indexed)
-    pixels = array.array('H', bytes(width * height * 2))
+    pixels = array.array('H', b'\x00' * (width * height * 2))
     # Pre-allocated zero row for Fill/Black ops
-    _zero_row = array.array('H', bytes(width * 2))
+    _zero_row = array.array('H', b'\x00' * (width * 2))
+    # Pre-allocated single-element arrays for repeated fill patterns
+    _mix_arr = array.array('H', [mix])
+    _white_arr = array.array('H', [0xffff])
 
     def read_pixel():
         nonlocal pos
@@ -250,6 +253,7 @@ def _decompress2(output, width, height, input_data):
             colour2 = read_pixel()
         elif opcode == 6 or opcode == 7:  # SetMix/Mix or SetMix/FillOrMix
             mix = read_pixel()
+            _mix_arr = array.array('H', [mix])
             opcode -= 5
         elif opcode == 9:  # FillOrMix_1
             mask = 0x03
@@ -290,12 +294,14 @@ def _decompress2(output, width, height, input_data):
             elif opcode == 1:  # Mix
                 n_pix = min(count, width - x)
                 if prevline == 0:
-                    pixels[line + x : line + x + n_pix] = array.array('H', [mix]) * n_pix
+                    pixels[line + x : line + x + n_pix] = _mix_arr * n_pix
                 else:
                     dst = line + x
                     src_off = prevline + x
-                    for i in range(n_pix):
-                        pixels[dst + i] = (pixels[src_off + i] ^ mix) & 0xffff
+                    # Batch XOR using array slicing + list comprehension
+                    src_slice = pixels[src_off:src_off + n_pix]
+                    pixels[dst:dst + n_pix] = array.array('H',
+                        ((v ^ mix) & 0xffff for v in src_slice))
                 count -= n_pix
                 x += n_pix
 
@@ -344,7 +350,7 @@ def _decompress2(output, width, height, input_data):
 
             elif opcode == 0xd:  # White
                 n_pix = min(count, width - x)
-                pixels[line + x : line + x + n_pix] = array.array('H', [0xffff]) * n_pix
+                pixels[line + x : line + x + n_pix] = _white_arr * n_pix
                 count -= n_pix
                 x += n_pix
 

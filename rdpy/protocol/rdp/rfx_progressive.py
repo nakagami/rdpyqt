@@ -30,34 +30,57 @@ _SUBBAND_SIZES = [1024, 1024, 1024, 256, 256, 256, 64, 64, 64, 64]
 # ---------------------------------------------------------------
 
 class _BitReader:
-    __slots__ = ('_data', '_pos', '_total')
+    __slots__ = ('_data', '_pos', '_total', '_accum', '_accum_bits')
 
     def __init__(self, data):
         self._data = bytes(data) if not isinstance(data, bytes) else data
         self._pos = 0
         self._total = len(data) * 8
+        self._accum = 0       # bit accumulator (up to 64 bits)
+        self._accum_bits = 0  # valid bits in accumulator
 
     def remaining(self):
-        return self._total - self._pos
+        # _pos tracks bits loaded into accumulator; _accum_bits are loaded but unconsumed
+        return self._total - self._pos + self._accum_bits
+
+    def _refill(self, need):
+        """Ensure at least `need` bits in the accumulator."""
+        data = self._data
+        byte_pos = self._pos >> 3
+        # Load up to 4 bytes at a time
+        while self._accum_bits < need:
+            if byte_pos < len(data):
+                self._accum = (self._accum << 8) | data[byte_pos]
+                byte_pos += 1
+                self._accum_bits += 8
+                self._pos += 8
+            else:
+                self._accum <<= 8
+                self._accum_bits += 8
+                self._pos += 8
 
     def read_bit(self):
-        if self._pos >= self._total:
-            return 0
-        byte_idx = self._pos >> 3
-        bit_idx = 7 - (self._pos & 7)
-        self._pos += 1
-        return (self._data[byte_idx] >> bit_idx) & 1
+        if self._accum_bits < 1:
+            self._refill(1)
+        self._accum_bits -= 1
+        return (self._accum >> self._accum_bits) & 1
 
     def read_bits(self, n):
-        val = 0
-        for _ in range(n):
-            val = (val << 1) | self.read_bit()
+        if n == 0:
+            return 0
+        if self._accum_bits < n:
+            self._refill(n)
+        self._accum_bits -= n
+        val = (self._accum >> self._accum_bits) & ((1 << n) - 1)
         return val
 
     def count_leading_bits(self, target):
         count = 0
         while self.remaining() > 0:
-            bit = self.read_bit()
+            if self._accum_bits < 1:
+                self._refill(8)  # refill in larger chunks
+            self._accum_bits -= 1
+            bit = (self._accum >> self._accum_bits) & 1
             if bit == target:
                 count += 1
             else:
@@ -235,16 +258,13 @@ class ProgQuant:
 
 
 def _dequantize(coeffs, q):
-    """Apply dequantization (left-shift by factor-1) per subband."""
-    # Sub-band order: HL1 LH1 HH1 HL2 LH2 HH2 HL3 LH3 HH3 LL3
-    factors = [q.HL1, q.LH1, q.HH1, q.HL2, q.LH2, q.HH2,
-               q.HL3, q.LH3, q.HH3, q.LL3]
-    offset = 0
-    for i, size in enumerate(_SUBBAND_SIZES):
-        f = factors[i]
-        if f > 1:
-            coeffs[offset:offset + size] <<= (f - 1)
-        offset += size
+    """Apply dequantization (left-shift by factor-1) per subband — vectorized."""
+    factors = np.array([q.HL1, q.LH1, q.HH1, q.HL2, q.LH2, q.HH2,
+                        q.HL3, q.LH3, q.HH3, q.LL3], dtype=np.int16)
+    shifts = np.maximum(factors - 1, 0)
+    if np.any(shifts > 0):
+        shift_arr = np.repeat(shifts, _SUBBAND_SIZES)
+        coeffs <<= shift_arr
 
 
 # ---------------------------------------------------------------
@@ -333,15 +353,12 @@ def _decode_component(data, quant, store=False):
     # 1. RLGR1 entropy decode
     coeffs = rlgr1_decode(data, TILE_PIXELS)
 
-    # 2. Differential decode LL3 (positions 4032..4095)
-    for i in range(4033, 4096):
-        coeffs[i] += coeffs[i - 1]
+    # 2. Differential decode LL3 (positions 4032..4095) using numpy cumsum
+    coeffs[4032:4096] = np.cumsum(coeffs[4032:4096], dtype=np.int16)
 
     if store:
         raw = coeffs.copy()
-        sign = np.zeros(TILE_PIXELS, dtype=np.int8)
-        sign[raw > 0] = 1
-        sign[raw < 0] = -1
+        sign = np.sign(raw).astype(np.int8)
 
     # 3. Dequantize
     _dequantize(coeffs, quant)
@@ -365,19 +382,20 @@ def _place_tile_abs(y_coeffs, cb_coeffs, cr_coeffs, tile_x, tile_y, output, out_
     if tile_w <= 0 or tile_h <= 0:
         return
 
-    # Build indices into coefficient arrays (RFX_TILE_SIZE-wide rows)
-    rows = np.arange(tile_h)
-    cols = np.arange(tile_w)
-    row_grid, col_grid = np.meshgrid(rows, cols, indexing='ij')
-    coeff_idx = (row_grid * RFX_TILE_SIZE + col_grid).ravel()
+    # Build flat index into 64-wide coefficient arrays
+    if tile_w == RFX_TILE_SIZE and tile_h == RFX_TILE_SIZE:
+        # Full tile — use contiguous range (avoids meshgrid overhead)
+        coeff_idx = np.arange(RFX_TILE_SIZE * RFX_TILE_SIZE, dtype=np.int32)
+    else:
+        rows = np.arange(tile_h, dtype=np.int32)
+        cols = np.arange(tile_w, dtype=np.int32)
+        coeff_idx = (rows[:, np.newaxis] * RFX_TILE_SIZE + cols[np.newaxis, :]).ravel()
 
     y_arr = y_coeffs[coeff_idx].astype(np.int32)
     cb_arr = cb_coeffs[coeff_idx].astype(np.int32)
     cr_arr = cr_coeffs[coeff_idx].astype(np.int32)
 
-    # ICT (BT.601) inverse colour transform — same formula as grdp rfxPlaceTileAbs:
-    #   IDWT output is 32x-scaled (dequant shifts by q-1), so +4096 centres black,
-    #   then >> 21 = >> 16 / 32 converts to [0,255] pixel range.
+    # ICT (BT.601) inverse colour transform
     y_scaled = (y_arr + 4096) << 16
     r = (cr_arr * 91916 + y_scaled) >> 21
     g = (y_scaled - cb_arr * 22527 - cr_arr * 46819) >> 21
@@ -388,19 +406,27 @@ def _place_tile_abs(y_coeffs, cb_coeffs, cr_coeffs, tile_x, tile_y, output, out_
     np.clip(b, 0, 255, out=b)
 
     # Assemble BGRA tile
-    bgra = np.empty((tile_h * tile_w, 4), dtype=np.uint8)
-    bgra[:, 0] = b
-    bgra[:, 1] = g
-    bgra[:, 2] = r
-    bgra[:, 3] = 0xFF
-    bgra_bytes = bgra.tobytes()
+    bgra = np.empty((tile_h, tile_w, 4), dtype=np.uint8)
+    bgra_flat = bgra.reshape(-1, 4)
+    bgra_flat[:, 0] = b
+    bgra_flat[:, 1] = g
+    bgra_flat[:, 2] = r
+    bgra_flat[:, 3] = 0xFF
 
-    # Write into output row by row
-    stride = tile_w * 4
-    for row in range(tile_h):
-        out_start = ((tile_y + row) * out_w + tile_x) * 4
-        if out_start + stride <= len(output):
-            output[out_start:out_start + stride] = bgra_bytes[row * stride:(row + 1) * stride]
+    # Write into output using numpy 2D view (avoids Python row loop)
+    try:
+        out_arr = np.frombuffer(output, dtype=np.uint8).reshape(out_h, out_w * 4)
+        out_arr[tile_y:tile_y + tile_h, tile_x * 4:(tile_x + tile_w) * 4] = \
+            bgra.reshape(tile_h, tile_w * 4)
+    except (ValueError, IndexError):
+        stride = tile_w * 4
+        out_stride = out_w * 4
+        out_mv = memoryview(output)
+        bgra_bytes = bgra.tobytes()
+        for row in range(tile_h):
+            out_start = ((tile_y + row) * out_w + tile_x) * 4
+            if out_start + stride <= len(output):
+                out_mv[out_start:out_start + stride] = bgra_bytes[row * stride:(row + 1) * stride]
 
 
 def _place_tile(y_coeffs, cb_coeffs, cr_coeffs, x_idx, y_idx, output, out_w, out_h):
@@ -435,27 +461,23 @@ def _upgrade_component(srl_data, raw_data, current, sign, quant, prog_quant):
         bit_pos = bit_positions[band_idx]
         n_bits = max(0, shift - bit_pos)
 
+        # Process band: separate known-sign and unknown-sign elements
         for i in range(offset, offset + band_size):
             if sign[i] != 0:
-                # Known sign: read magnitude refinement from RAW
                 mag = raw.read_bits(n_bits) if n_bits > 0 else 0
                 if sign[i] > 0:
                     current[i] += mag
                 else:
                     current[i] -= mag
             else:
-                # Unknown sign: read significance from SRL
                 if srl.read_bit():
-                    # Becomes significant: read magnitude from RAW
                     mag = raw.read_bits(n_bits) if n_bits > 0 else 0
-                    # Read sign bit from SRL (0=positive, 1=negative)
                     if srl.read_bit():
                         current[i] = -mag
                         sign[i] = -1
                     else:
                         current[i] = mag
                         sign[i] = 1
-                # else: stays zero
 
         offset += band_size
 
@@ -492,8 +514,7 @@ class RfxProgressiveDecoder:
         offset = 0
 
         while offset + 6 <= len(data):
-            block_type = struct.unpack_from('<H', data, offset)[0]
-            block_len = struct.unpack_from('<I', data, offset + 2)[0]
+            block_type, block_len = struct.unpack_from('<HI', data, offset)
 
             if block_len < 6 or offset + block_len > len(data):
                 break
@@ -559,8 +580,7 @@ class RfxProgressiveDecoder:
         for _ in range(num_tiles):
             if offset + 6 > len(data):
                 break
-            tile_type = struct.unpack_from('<H', data, offset)[0]
-            tile_len = struct.unpack_from('<I', data, offset + 2)[0]
+            tile_type, tile_len = struct.unpack_from('<HI', data, offset)
 
             if tile_len < 6 or offset + tile_len > len(data):
                 break
@@ -569,8 +589,7 @@ class RfxProgressiveDecoder:
 
             # Log tile position from header (xIdx at offset 3, yIdx at offset 5)
             if len(tile_data) >= 7:
-                tx = struct.unpack_from('<H', tile_data, 3)[0]
-                ty = struct.unpack_from('<H', tile_data, 5)[0]
+                tx, ty = struct.unpack_from('<HH', tile_data, 3)
                 tile_positions.append((tx, ty))
 
             if tile_type == PROG_WBT_TILE_SIMPLE:
@@ -613,11 +632,8 @@ class RfxProgressiveDecoder:
         quant_idx_y = data[0]
         quant_idx_cb = data[1]
         quant_idx_cr = data[2]
-        x_idx = struct.unpack_from('<H', data, 3)[0]
-        y_idx = struct.unpack_from('<H', data, 5)[0]
-        y_len = struct.unpack_from('<H', data, 8)[0]
-        cb_len = struct.unpack_from('<H', data, 10)[0]
-        cr_len = struct.unpack_from('<H', data, 12)[0]
+        x_idx, y_idx = struct.unpack_from('<HH', data, 3)
+        y_len, cb_len, cr_len = struct.unpack_from('<HHH', data, 8)
 
         off = 16
         y_data = data[off:off + y_len] if y_len > 0 else None
@@ -660,11 +676,8 @@ class RfxProgressiveDecoder:
         quant_idx_y = data[0]
         quant_idx_cb = data[1]
         quant_idx_cr = data[2]
-        x_idx = struct.unpack_from('<H', data, 3)[0]
-        y_idx = struct.unpack_from('<H', data, 5)[0]
-        y_len = struct.unpack_from('<H', data, 9)[0]
-        cb_len = struct.unpack_from('<H', data, 11)[0]
-        cr_len = struct.unpack_from('<H', data, 13)[0]
+        x_idx, y_idx = struct.unpack_from('<HH', data, 3)
+        y_len, cb_len, cr_len = struct.unpack_from('<HHH', data, 9)
 
         off = 17
         y_data = data[off:off + y_len] if y_len > 0 else None
@@ -707,15 +720,9 @@ class RfxProgressiveDecoder:
         quant_idx_y = data[0]
         quant_idx_cb = data[1]
         quant_idx_cr = data[2]
-        x_idx = struct.unpack_from('<H', data, 3)[0]
-        y_idx = struct.unpack_from('<H', data, 5)[0]
+        x_idx, y_idx = struct.unpack_from('<HH', data, 3)
         quality = data[7]
-        y_srl_len = struct.unpack_from('<H', data, 8)[0]
-        y_raw_len = struct.unpack_from('<H', data, 10)[0]
-        cb_srl_len = struct.unpack_from('<H', data, 12)[0]
-        cb_raw_len = struct.unpack_from('<H', data, 14)[0]
-        cr_srl_len = struct.unpack_from('<H', data, 16)[0]
-        cr_raw_len = struct.unpack_from('<H', data, 18)[0]
+        y_srl_len, y_raw_len, cb_srl_len, cb_raw_len, cr_srl_len, cr_raw_len = struct.unpack_from('<HHHHHH', data, 8)
 
         off = 20
         y_srl = data[off:off + y_srl_len]; off += y_srl_len

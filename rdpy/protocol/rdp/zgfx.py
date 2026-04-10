@@ -54,6 +54,19 @@ _TOKEN_TABLE = [
     (9,   382,  24, 1, 17094304),   # 101111110   -> match
 ]
 
+# Pre-built lookup tables for O(1) Huffman decode (max prefix = 9 bits).
+# _HUFF_LOOKUP[bits9] = (prefixLength, valueBits, tokenType, valueBase) or None.
+# _HUFF_FLAT groups entries by prefix length for fast fallback.
+_MAX_PREFIX_BITS = 9
+_HUFF_LOOKUP = [None] * (1 << _MAX_PREFIX_BITS)  # 512 entries
+for _plen, _pcode, _vbits, _ttype, _vbase in _TOKEN_TABLE:
+    _pad_bits = _MAX_PREFIX_BITS - _plen
+    _base_idx = _pcode << _pad_bits
+    for _pad in range(1 << _pad_bits):
+        _HUFF_LOOKUP[_base_idx | _pad] = (_plen, _vbits, _ttype, _vbase)
+# Convert to tuple for slightly faster indexing
+_HUFF_LOOKUP = tuple(_HUFF_LOOKUP)
+
 
 class ZgfxDecompressor:
     """Stateful ZGFX decompressor with persistent history buffer.
@@ -112,177 +125,169 @@ class ZgfxDecompressor:
         # Input data (excluding last byte which is padding count)
         input_data = data
         input_pos = 0
+        # Use a wide accumulator to minimize per-bit refills
         bits_current = 0
         n_bits_current = 0
         out = bytearray()
         hist = self._history
         hist_idx = self._hist_idx
         hist_size = ZGFX_HISTORY_SIZE
+        huff_lookup = _HUFF_LOOKUP
+        max_prefix = _MAX_PREFIX_BITS
 
         while bits_remaining > 0:
-            # --- get_bits inlined for Huffman prefix decoding ---
-            have_bits = 0
-            in_prefix = 0
-            matched = False
+            # Ensure we have at least 9 bits in the accumulator for Huffman lookup
+            while n_bits_current < max_prefix:
+                bits_current = (bits_current << 8)
+                if input_pos < num_data_bytes:
+                    bits_current |= input_data[input_pos]
+                    input_pos += 1
+                n_bits_current += 8
 
-            for entry in _TOKEN_TABLE:
-                plen, pcode, vbits, ttype, vbase = entry
-                while have_bits < plen:
-                    # inline get_bits(1)
-                    while n_bits_current < 1:
-                        bits_current <<= 8
+            # O(1) Huffman lookup via 9-bit prefix table
+            peek = (bits_current >> (n_bits_current - max_prefix)) & 0x1FF
+            entry = huff_lookup[peek]
+            if entry is None:
+                log.warning("ZGFX: no token matched at input_pos=%d outLen=%d" %
+                            (input_pos, len(out)))
+                break
+
+            plen, vbits, ttype, vbase = entry
+            bits_remaining -= plen
+            n_bits_current -= plen
+            bits_current &= (1 << n_bits_current) - 1 if n_bits_current > 0 else 0
+
+            if ttype == 0:
+                # Literal
+                if vbits > 0:
+                    while n_bits_current < vbits:
+                        bits_current = (bits_current << 8)
                         if input_pos < num_data_bytes:
-                            bits_current += input_data[input_pos]
+                            bits_current |= input_data[input_pos]
+                            input_pos += 1
+                        n_bits_current += 8
+                    bits_remaining -= vbits
+                    n_bits_current -= vbits
+                    value = (vbase + ((bits_current >> n_bits_current) & ((1 << vbits) - 1))) & 0xFF
+                    bits_current &= (1 << n_bits_current) - 1 if n_bits_current > 0 else 0
+                else:
+                    value = vbase
+                hist[hist_idx] = value
+                hist_idx += 1
+                if hist_idx >= hist_size:
+                    hist_idx = 0
+                out.append(value)
+            else:
+                # Match or Unencoded
+                if vbits > 0:
+                    while n_bits_current < vbits:
+                        bits_current = (bits_current << 8)
+                        if input_pos < num_data_bytes:
+                            bits_current |= input_data[input_pos]
+                            input_pos += 1
+                        n_bits_current += 8
+                    bits_remaining -= vbits
+                    n_bits_current -= vbits
+                    distance = vbase + ((bits_current >> n_bits_current) & ((1 << vbits) - 1))
+                    bits_current &= (1 << n_bits_current) - 1 if n_bits_current > 0 else 0
+                else:
+                    distance = vbase
+                if distance != 0:
+                    # Decode match length
+                    while n_bits_current < 1:
+                        bits_current = (bits_current << 8)
+                        if input_pos < num_data_bytes:
+                            bits_current |= input_data[input_pos]
                             input_pos += 1
                         n_bits_current += 8
                     bits_remaining -= 1
                     n_bits_current -= 1
-                    in_prefix = (in_prefix << 1) | ((bits_current >> n_bits_current) & 1)
-                    bits_current &= (1 << n_bits_current) - 1
-                    have_bits += 1
-                if in_prefix == pcode:
-                    if ttype == 0:
-                        # Literal
-                        if vbits > 0:
-                            # inline get_bits(vbits)
-                            while n_bits_current < vbits:
-                                bits_current <<= 8
-                                if input_pos < num_data_bytes:
-                                    bits_current += input_data[input_pos]
-                                    input_pos += 1
-                                n_bits_current += 8
-                            bits_remaining -= vbits
-                            n_bits_current -= vbits
-                            value = (vbase + ((bits_current >> n_bits_current) & ((1 << vbits) - 1))) & 0xFF
-                            bits_current &= (1 << n_bits_current) - 1
-                        else:
-                            value = vbase
-                        hist[hist_idx] = value
-                        hist_idx += 1
-                        if hist_idx >= hist_size:
-                            hist_idx = 0
-                        out.append(value)
+                    bit = (bits_current >> n_bits_current) & 1
+                    bits_current &= (1 << n_bits_current) - 1 if n_bits_current > 0 else 0
+                    if bit == 0:
+                        count = 3
                     else:
-                        # Match or Unencoded
-                        # inline get_bits(vbits)
-                        if vbits > 0:
-                            while n_bits_current < vbits:
-                                bits_current <<= 8
-                                if input_pos < num_data_bytes:
-                                    bits_current += input_data[input_pos]
-                                    input_pos += 1
-                                n_bits_current += 8
-                            bits_remaining -= vbits
-                            n_bits_current -= vbits
-                            distance = vbase + ((bits_current >> n_bits_current) & ((1 << vbits) - 1))
-                            bits_current &= (1 << n_bits_current) - 1
-                        else:
-                            distance = vbase
-                        if distance != 0:
-                            # Decode match length
+                        count = 4
+                        extra = 2
+                        while True:
                             while n_bits_current < 1:
-                                bits_current <<= 8
+                                bits_current = (bits_current << 8)
                                 if input_pos < num_data_bytes:
-                                    bits_current += input_data[input_pos]
+                                    bits_current |= input_data[input_pos]
                                     input_pos += 1
                                 n_bits_current += 8
                             bits_remaining -= 1
                             n_bits_current -= 1
                             bit = (bits_current >> n_bits_current) & 1
-                            bits_current &= (1 << n_bits_current) - 1
-                            if bit == 0:
-                                count = 3
-                            else:
-                                count = 4
-                                extra = 2
-                                while True:
-                                    while n_bits_current < 1:
-                                        bits_current <<= 8
-                                        if input_pos < num_data_bytes:
-                                            bits_current += input_data[input_pos]
-                                            input_pos += 1
-                                        n_bits_current += 8
-                                    bits_remaining -= 1
-                                    n_bits_current -= 1
-                                    bit = (bits_current >> n_bits_current) & 1
-                                    bits_current &= (1 << n_bits_current) - 1
-                                    if bit != 1:
-                                        break
-                                    count *= 2
-                                    extra += 1
-                                # inline get_bits(extra)
-                                while n_bits_current < extra:
-                                    bits_current <<= 8
-                                    if input_pos < num_data_bytes:
-                                        bits_current += input_data[input_pos]
-                                        input_pos += 1
-                                    n_bits_current += 8
-                                bits_remaining -= extra
-                                n_bits_current -= extra
-                                count += (bits_current >> n_bits_current) & ((1 << extra) - 1)
-                                bits_current &= (1 << n_bits_current) - 1
+                            bits_current &= (1 << n_bits_current) - 1 if n_bits_current > 0 else 0
+                            if bit != 1:
+                                break
+                            count *= 2
+                            extra += 1
+                        while n_bits_current < extra:
+                            bits_current = (bits_current << 8)
+                            if input_pos < num_data_bytes:
+                                bits_current |= input_data[input_pos]
+                                input_pos += 1
+                            n_bits_current += 8
+                        bits_remaining -= extra
+                        n_bits_current -= extra
+                        count += (bits_current >> n_bits_current) & ((1 << extra) - 1)
+                        bits_current &= (1 << n_bits_current) - 1 if n_bits_current > 0 else 0
 
-                            # output_match — batch copy from history
-                            src_idx = (hist_idx + hist_size - distance) % hist_size
-                            if distance >= count and src_idx + count <= hist_size and hist_idx + count <= hist_size:
-                                # Non-overlapping: safe to batch
-                                chunk = bytes(hist[src_idx:src_idx + count])
-                                out.extend(chunk)
-                                hist[hist_idx:hist_idx + count] = chunk
-                                hist_idx += count
-                                if hist_idx >= hist_size:
-                                    hist_idx %= hist_size
-                            else:
-                                for _ in range(count):
-                                    b = hist[src_idx % hist_size]
-                                    hist[hist_idx] = b
-                                    hist_idx += 1
-                                    if hist_idx >= hist_size:
-                                        hist_idx = 0
-                                    out.append(b)
-                                    src_idx += 1
-                        else:
-                            # Unencoded: 15-bit count + flush bits + raw bytes
-                            # inline get_bits(15)
-                            while n_bits_current < 15:
-                                bits_current <<= 8
-                                if input_pos < num_data_bytes:
-                                    bits_current += input_data[input_pos]
-                                    input_pos += 1
-                                n_bits_current += 8
-                            bits_remaining -= 15
-                            n_bits_current -= 15
-                            count = (bits_current >> n_bits_current) & ((1 << 15) - 1)
-                            bits_current &= (1 << n_bits_current) - 1
-                            bits_remaining -= n_bits_current
-                            n_bits_current = 0
-                            bits_current = 0
-                            # Bulk copy raw bytes
-                            end_pos = min(input_pos + count, num_data_bytes)
-                            chunk = input_data[input_pos:end_pos]
-                            actual = len(chunk)
-                            out.extend(chunk)
-                            # Copy to history in bulk
-                            space = hist_size - hist_idx
-                            if actual <= space:
-                                hist[hist_idx:hist_idx + actual] = chunk
-                                hist_idx += actual
-                            else:
-                                hist[hist_idx:hist_idx + space] = chunk[:space]
-                                rest = actual - space
-                                hist[0:rest] = chunk[space:]
-                                hist_idx = rest
+                    # output_match — batch copy from history
+                    src_idx = (hist_idx + hist_size - distance) % hist_size
+                    if distance >= count and src_idx + count <= hist_size and hist_idx + count <= hist_size:
+                        # Non-overlapping: safe to batch
+                        chunk = hist[src_idx:src_idx + count]
+                        out.extend(chunk)
+                        hist[hist_idx:hist_idx + count] = chunk
+                        hist_idx += count
+                        if hist_idx >= hist_size:
+                            hist_idx %= hist_size
+                    else:
+                        for _ in range(count):
+                            b = hist[src_idx % hist_size]
+                            hist[hist_idx] = b
+                            hist_idx += 1
                             if hist_idx >= hist_size:
-                                hist_idx %= hist_size
-                            input_pos = end_pos
-                            bits_remaining -= actual * 8
-                    matched = True
-                    break
-
-            if not matched:
-                log.warning("ZGFX: no token matched at input_pos=%d have_bits=%d prefix=0x%x outLen=%d" %
-                            (input_pos, have_bits, in_prefix, len(out)))
-                break
+                                hist_idx = 0
+                            out.append(b)
+                            src_idx += 1
+                else:
+                    # Unencoded: 15-bit count + flush bits + raw bytes
+                    while n_bits_current < 15:
+                        bits_current = (bits_current << 8)
+                        if input_pos < num_data_bytes:
+                            bits_current |= input_data[input_pos]
+                            input_pos += 1
+                        n_bits_current += 8
+                    bits_remaining -= 15
+                    n_bits_current -= 15
+                    count = (bits_current >> n_bits_current) & ((1 << 15) - 1)
+                    bits_current &= (1 << n_bits_current) - 1 if n_bits_current > 0 else 0
+                    bits_remaining -= n_bits_current
+                    n_bits_current = 0
+                    bits_current = 0
+                    # Bulk copy raw bytes
+                    end_pos = min(input_pos + count, num_data_bytes)
+                    chunk = input_data[input_pos:end_pos]
+                    actual = len(chunk)
+                    out.extend(chunk)
+                    # Copy to history in bulk
+                    space = hist_size - hist_idx
+                    if actual <= space:
+                        hist[hist_idx:hist_idx + actual] = chunk
+                        hist_idx += actual
+                    else:
+                        hist[hist_idx:hist_idx + space] = chunk[:space]
+                        rest = actual - space
+                        hist[0:rest] = chunk[space:]
+                        hist_idx = rest
+                    if hist_idx >= hist_size:
+                        hist_idx %= hist_size
+                    input_pos = end_pos
+                    bits_remaining -= actual * 8
 
         self._hist_idx = hist_idx
         return bytes(out)

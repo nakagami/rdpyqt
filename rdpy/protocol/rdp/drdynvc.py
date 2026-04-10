@@ -212,14 +212,13 @@ class DrdynvcLayer(LayerAutomata):
         data = s.read()
         if len(data) < 9:
             return
-        totalLen = struct.unpack_from('<I', data, 0)[0]
-        flags = struct.unpack_from('<I', data, 4)[0]
+        totalLen, flags = struct.unpack_from('<II', data, 0)
         payload = data[8:]
 
         if flags & CHANNEL_FLAG_FIRST:
-            self._vchanBuf = payload
+            self._vchanBuf = bytearray(payload)
         else:
-            self._vchanBuf += payload
+            self._vchanBuf.extend(payload)
 
         if flags & CHANNEL_FLAG_LAST:
             if len(self._vchanBuf) >= 1:
@@ -493,8 +492,8 @@ class DrdynvcLayer(LayerAutomata):
         elif descriptor == self.ZGFX_SEGMENTED_MULTIPART:
             if len(data) < 7:
                 return None
-            segmentCount = struct.unpack_from('<H', data, 1)[0]
-            uncompressedSize = struct.unpack_from('<I', data, 3)[0]
+            segmentCount, = struct.unpack_from('<H', data, 1)
+            uncompressedSize, = struct.unpack_from('<I', data, 3)
             offset = 7
             result = bytearray()
             for i in range(segmentCount):
@@ -507,7 +506,7 @@ class DrdynvcLayer(LayerAutomata):
                 segData = data[offset:offset + segSize]
                 offset += segSize
                 try:
-                    result += self._zgfx.decompress_segment(segData)
+                    result.extend(self._zgfx.decompress_segment(segData))
                 except Exception as e:
                     log.warning("RDPGFX: ZGFX decompress error (multi seg %d): %s" % (i, e))
                     return None
@@ -537,9 +536,7 @@ class DrdynvcLayer(LayerAutomata):
         pdus = []
         offset = 0
         while offset + 8 <= len(raw):
-            cmdId = struct.unpack_from('<H', raw, offset)[0]
-            flags = struct.unpack_from('<H', raw, offset + 2)[0]
-            pduLen = struct.unpack_from('<I', raw, offset + 4)[0]
+            cmdId, flags, pduLen = struct.unpack_from('<HHI', raw, offset)
             if pduLen < 8 or offset + pduLen > len(raw):
                 break
             payload = bytes(raw[offset + 8:offset + pduLen])
@@ -714,15 +711,11 @@ class DrdynvcLayer(LayerAutomata):
         """WIRE_TO_SURFACE_1: surfaceId(2) + codecId(2) + pixelFormat(1) + destRect(8) + bitmapData"""
         if len(payload) < 17:
             return
-        surfaceId = struct.unpack_from('<H', payload, 0)[0]
-        codecId = struct.unpack_from('<H', payload, 2)[0]
+        surfaceId, codecId = struct.unpack_from('<HH', payload, 0)
         pixelFormat = payload[4]
         # destRect: left(2) + top(2) + right(2) + bottom(2)
-        left = struct.unpack_from('<H', payload, 5)[0]
-        top = struct.unpack_from('<H', payload, 7)[0]
-        right = struct.unpack_from('<H', payload, 9)[0]
-        bottom = struct.unpack_from('<H', payload, 11)[0]
-        bitmapDataLen = struct.unpack_from('<I', payload, 13)[0]
+        left, top, right, bottom = struct.unpack_from('<HHHH', payload, 5)
+        bitmapDataLen, = struct.unpack_from('<I', payload, 13)
         bitmapData = payload[17:17 + bitmapDataLen]
 
         width = right - left
@@ -757,11 +750,10 @@ class DrdynvcLayer(LayerAutomata):
         """WIRE_TO_SURFACE_2: surfaceId(2) + codecId(2) + codecContextId(4) + pixelFormat(1) + bitmapDataLen(4) + bitmapData"""
         if len(payload) < 13:
             return
-        surfaceId = struct.unpack_from('<H', payload, 0)[0]
-        codecId = struct.unpack_from('<H', payload, 2)[0]
-        codecContextId = struct.unpack_from('<I', payload, 4)[0]
+        surfaceId, codecId = struct.unpack_from('<HH', payload, 0)
+        codecContextId, = struct.unpack_from('<I', payload, 4)
         pixelFormat = payload[8]
-        bitmapDataLen = struct.unpack_from('<I', payload, 9)[0]
+        bitmapDataLen, = struct.unpack_from('<I', payload, 9)
         bitmapData = payload[13:13 + bitmapDataLen]
 
         surfInfo = self._surfaces.get(surfaceId)
@@ -810,12 +802,12 @@ class DrdynvcLayer(LayerAutomata):
         """SOLID_FILL: surfaceId(2) + fillPixel(4) + fillRectCount(2) + fillRects"""
         if len(payload) < 8:
             return
-        surfaceId = struct.unpack_from('<H', payload, 0)[0]
+        surfaceId, = struct.unpack_from('<H', payload, 0)
         fillPixelB = payload[2]
         fillPixelG = payload[3]
         fillPixelR = payload[4]
         fillPixelA = payload[5]
-        rectCount = struct.unpack_from('<H', payload, 6)[0]
+        rectCount, = struct.unpack_from('<H', payload, 6)
         log.debug("RDPGFX: SOLID_FILL surf=%d color=(%d,%d,%d,%d) rects=%d" %
                   (surfaceId, fillPixelR, fillPixelG, fillPixelB, fillPixelA, rectCount))
 
@@ -827,10 +819,7 @@ class DrdynvcLayer(LayerAutomata):
         for i in range(rectCount):
             if offset + 8 > len(payload):
                 break
-            left = struct.unpack_from('<H', payload, offset)[0]
-            top = struct.unpack_from('<H', payload, offset + 2)[0]
-            right = struct.unpack_from('<H', payload, offset + 4)[0]
-            bottom = struct.unpack_from('<H', payload, offset + 6)[0]
+            left, top, right, bottom = struct.unpack_from('<HHHH', payload, offset)
             offset += 8
             w = right - left
             h = bottom - top
@@ -860,17 +849,20 @@ class DrdynvcLayer(LayerAutomata):
             if not rects:
                 return
             ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
-            stride = sw * 4
+            # Numpy view for fast extraction
+            try:
+                surf_arr = np.frombuffer(surfBuf, dtype=np.uint8).reshape(sh, sw * 4)
+            except ValueError:
+                surf_arr = None
             for (rx, ry, rw, rh) in rects:
-                needed = rw * rh * 4
-                region = bytearray(needed)
-                row_bytes = rw * 4
-                for row in range(rh):
-                    src_off = (ry + row) * stride + rx * 4
-                    dst_off = row * row_bytes
-                    if src_off + row_bytes <= len(surfBuf):
-                        region[dst_off:dst_off + row_bytes] = surfBuf[src_off:src_off + row_bytes]
-                self._deliverBitmap(ox + rx, oy + ry, rw, rh, 32, bytes(region))
+                if surf_arr is not None:
+                    try:
+                        region = surf_arr[ry:ry + rh, rx * 4:(rx + rw) * 4].tobytes()
+                    except (ValueError, IndexError):
+                        region = self._extractRegionFallback(surfBuf, sw, rx, ry, rw, rh)
+                else:
+                    region = self._extractRegionFallback(surfBuf, sw, rx, ry, rw, rh)
+                self._deliverBitmap(ox + rx, oy + ry, rw, rh, 32, region)
         except Exception as e:
             log.warning("RDPGFX: CaVideo RFX decode error: %s" % e)
 
@@ -1319,12 +1311,20 @@ class DrdynvcLayer(LayerAutomata):
         if surfInfo is None or surfBuf is None:
             return
         surfW = surfInfo[0]
-        stride = width * 4
-        for row in range(height):
-            src_off = row * stride
-            dst_off = ((top + row) * surfW + left) * 4
-            if src_off + stride <= len(data) and dst_off + stride <= len(surfBuf):
-                surfBuf[dst_off:dst_off + stride] = data[src_off:src_off + stride]
+        surfH = surfInfo[1]
+        # Use numpy views for bulk 2D copy (avoids Python row loop)
+        try:
+            src = np.frombuffer(data, dtype=np.uint8).reshape(height, width * 4)
+            dst = np.frombuffer(surfBuf, dtype=np.uint8).reshape(surfH, surfW * 4)
+            dst[top:top + height, left * 4:(left + width) * 4] = src
+        except (ValueError, IndexError):
+            # Fallback for mismatched sizes
+            stride = width * 4
+            for row in range(height):
+                src_off = row * stride
+                dst_off = ((top + row) * surfW + left) * 4
+                if src_off + stride <= len(data) and dst_off + stride <= len(surfBuf):
+                    surfBuf[dst_off:dst_off + stride] = data[src_off:src_off + stride]
 
     def _onSurfaceToCache(self, payload):
         """SURFACETOCACHE: surfaceId(2) + cacheKey(8) + cacheSlot(2) + rectLeft(2) +
@@ -1332,11 +1332,7 @@ class DrdynvcLayer(LayerAutomata):
         if len(payload) < 20:
             return
         surfaceId = struct.unpack_from('<H', payload, 0)[0]
-        cacheSlot = struct.unpack_from('<H', payload, 10)[0]
-        rectLeft = struct.unpack_from('<H', payload, 12)[0]
-        rectTop = struct.unpack_from('<H', payload, 14)[0]
-        rectRight = struct.unpack_from('<H', payload, 16)[0]
-        rectBottom = struct.unpack_from('<H', payload, 18)[0]
+        cacheSlot, rectLeft, rectTop, rectRight, rectBottom = struct.unpack_from('<HHHHH', payload, 10)
 
         w = rectRight - rectLeft
         h = rectBottom - rectTop
@@ -1350,13 +1346,19 @@ class DrdynvcLayer(LayerAutomata):
             return
 
         surfW = surfInfo[0]
-        # Copy the rect from surface to cache
-        region = bytearray(w * h * 4)
-        for row in range(h):
-            src_off = ((rectTop + row) * surfW + rectLeft) * 4
-            dst_off = row * w * 4
-            if src_off + w * 4 <= len(surfBuf):
-                region[dst_off:dst_off + w * 4] = surfBuf[src_off:src_off + w * 4]
+        surfH = surfInfo[1]
+        # Use numpy for fast region extraction
+        try:
+            surf_arr = np.frombuffer(surfBuf, dtype=np.uint8).reshape(surfH, surfW * 4)
+            region = surf_arr[rectTop:rectTop + h, rectLeft * 4:(rectLeft + w) * 4].tobytes()
+            region = bytearray(region)
+        except (ValueError, IndexError):
+            region = bytearray(w * h * 4)
+            for row in range(h):
+                src_off = ((rectTop + row) * surfW + rectLeft) * 4
+                dst_off = row * w * 4
+                if src_off + w * 4 <= len(surfBuf):
+                    region[dst_off:dst_off + w * 4] = surfBuf[src_off:src_off + w * 4]
 
         self._gfxCache[cacheSlot] = (w, h, region)
         log.debug("RDPGFX: SURFACETOCACHE surf=%d slot=%d rect=(%d,%d,%d,%d)" %
@@ -1366,9 +1368,7 @@ class DrdynvcLayer(LayerAutomata):
         """CACHETOSURFACE: cacheSlot(2) + surfaceId(2) + numDestPoints(2) + destPoints"""
         if len(payload) < 6:
             return
-        cacheSlot = struct.unpack_from('<H', payload, 0)[0]
-        surfaceId = struct.unpack_from('<H', payload, 2)[0]
-        numDest = struct.unpack_from('<H', payload, 4)[0]
+        cacheSlot, surfaceId, numDest = struct.unpack_from('<HHH', payload, 0)
 
         cached = self._gfxCache.get(cacheSlot)
         if cached is None:
@@ -1382,26 +1382,42 @@ class DrdynvcLayer(LayerAutomata):
             return
 
         surfW = surfInfo[0]
+        surfH = surfInfo[1]
         ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
+
+        # Numpy views for fast blit
+        try:
+            surf_arr = np.frombuffer(surfBuf, dtype=np.uint8).reshape(surfH, surfW * 4)
+            cache_arr = np.frombuffer(cdata, dtype=np.uint8).reshape(ch, cw * 4)
+            use_numpy = True
+        except ValueError:
+            use_numpy = False
 
         off = 6
         dest_coords = []
         for _ in range(numDest):
             if off + 4 > len(payload):
                 break
-            dx = struct.unpack_from('<H', payload, off)[0]
-            dy = struct.unpack_from('<H', payload, off + 2)[0]
+            dx, dy = struct.unpack_from('<HH', payload, off)
             off += 4
             dest_coords.append((dx, dy))
 
-            # Blit cached data to surface buffer
-            for row in range(ch):
-                src_off = row * cw * 4
-                dst_off = ((dy + row) * surfW + dx) * 4
-                if dst_off + cw * 4 <= len(surfBuf) and src_off + cw * 4 <= len(cdata):
-                    surfBuf[dst_off:dst_off + cw * 4] = cdata[src_off:src_off + cw * 4]
+            if use_numpy:
+                try:
+                    surf_arr[dy:dy + ch, dx * 4:(dx + cw) * 4] = cache_arr
+                except (ValueError, IndexError):
+                    for row in range(ch):
+                        src_off = row * cw * 4
+                        dst_off = ((dy + row) * surfW + dx) * 4
+                        if dst_off + cw * 4 <= len(surfBuf) and src_off + cw * 4 <= len(cdata):
+                            surfBuf[dst_off:dst_off + cw * 4] = cdata[src_off:src_off + cw * 4]
+            else:
+                for row in range(ch):
+                    src_off = row * cw * 4
+                    dst_off = ((dy + row) * surfW + dx) * 4
+                    if dst_off + cw * 4 <= len(surfBuf) and src_off + cw * 4 <= len(cdata):
+                        surfBuf[dst_off:dst_off + cw * 4] = cdata[src_off:src_off + cw * 4]
 
-            # Deliver to display
             self._deliverBitmap(ox + dx, oy + dy, cw, ch, 32, bytes(cdata))
 
         first_coords = ", ".join("(%d,%d)" % (dx, dy) for dx, dy in dest_coords[:5])
@@ -1438,16 +1454,35 @@ class DrdynvcLayer(LayerAutomata):
         surfW, surfH, _ = surfInfo
         ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
 
+        # Numpy view of surface for fast region extraction
+        try:
+            surf_arr = np.frombuffer(surfBuf, dtype=np.uint8).reshape(surfH, surfW * 4)
+        except ValueError:
+            surf_arr = None
+
         for (rx, ry, rw, rh) in rects:
             if rw <= 0 or rh <= 0:
                 continue
-            # Extract the region from the surface buffer
-            region = bytearray(rw * rh * 4)
-            for row in range(rh):
-                src_off = ((ry + row) * surfW + rx) * 4
-                dst_off = row * rw * 4
-                region[dst_off:dst_off + rw * 4] = surfBuf[src_off:src_off + rw * 4]
-            self._deliverBitmap(ox + rx, oy + ry, rw, rh, 32, bytes(region))
+            if surf_arr is not None:
+                try:
+                    region = surf_arr[ry:ry + rh, rx * 4:(rx + rw) * 4].tobytes()
+                except (ValueError, IndexError):
+                    region = self._extractRegionFallback(surfBuf, surfW, rx, ry, rw, rh)
+            else:
+                region = self._extractRegionFallback(surfBuf, surfW, rx, ry, rw, rh)
+            self._deliverBitmap(ox + rx, oy + ry, rw, rh, 32, region)
+
+    def _extractRegionFallback(self, surfBuf, surfW, rx, ry, rw, rh):
+        """Row-by-row region extraction fallback."""
+        region = bytearray(rw * rh * 4)
+        row_bytes = rw * 4
+        stride = surfW * 4
+        for row in range(rh):
+            src_off = (ry + row) * stride + rx * 4
+            dst_off = row * row_bytes
+            if src_off + row_bytes <= len(surfBuf):
+                region[dst_off:dst_off + row_bytes] = surfBuf[src_off:src_off + row_bytes]
+        return bytes(region)
 
     def _deliverBitmap(self, x, y, width, height, bpp, data):
         """Deliver decoded bitmap to the observer via callback.

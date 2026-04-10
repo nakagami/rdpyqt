@@ -42,7 +42,9 @@ def _nrle_decode(data, original_size):
             if run_len > left:
                 run_len = left
             end = min(out_pos + run_len, original_size)
-            output[out_pos:end] = bytes([value]) * (end - out_pos)
+            fill_len = end - out_pos
+            if fill_len > 0:
+                output[out_pos:end] = bytes([value]) * fill_len
             out_pos = end
             left -= run_len
         else:
@@ -74,10 +76,7 @@ def decode_nscodec(data, width, height):
         log.warning("NSCodec data too short: %d" % len(data))
         return None
 
-    luma_len = struct.unpack_from('<I', data, 0)[0]
-    orange_len = struct.unpack_from('<I', data, 4)[0]
-    green_len = struct.unpack_from('<I', data, 8)[0]
-    alpha_len = struct.unpack_from('<I', data, 12)[0]
+    luma_len, orange_len, green_len, alpha_len = struct.unpack_from('<IIII', data, 0)
     color_loss_level = data[16]
     chroma_sub = data[17]
     # data[18:20] reserved
@@ -134,10 +133,10 @@ def decode_nscodec(data, width, height):
     if chroma_sub > 0:
         py_arr = np.arange(height, dtype=np.int32)
         px_arr = np.arange(width, dtype=np.int32)
-        py_grid, px_grid = np.meshgrid(py_arr, px_arr, indexing='ij')
 
-        y_flat_idx = (py_grid * y_row_width + px_grid).ravel()
-        co_flat_idx = ((py_grid >> 1) * co_row_width + (px_grid >> 1)).ravel()
+        # Use broadcasting instead of meshgrid for less memory/CPU
+        y_flat_idx = (py_arr[:, np.newaxis] * y_row_width + px_arr[np.newaxis, :]).ravel()
+        co_flat_idx = ((py_arr[:, np.newaxis] >> 1) * co_row_width + (px_arr[np.newaxis, :] >> 1)).ravel()
 
         np.clip(y_flat_idx, 0, len(y_plane) - 1, out=y_flat_idx)
         np.clip(co_flat_idx, 0, len(co_plane) - 1, out=co_flat_idx)

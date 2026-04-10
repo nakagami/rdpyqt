@@ -39,8 +39,7 @@ class RfxDecoder:
         offset = 0
 
         while offset + 6 <= len(data):
-            block_type = struct.unpack_from('<H', data, offset)[0]
-            block_len = struct.unpack_from('<I', data, offset + 2)[0]
+            block_type, block_len = struct.unpack_from('<HI', data, offset)
 
             if block_len < 6 or offset + block_len > len(data):
                 log.debug("RFX: invalid block type=0x%04X len=%d offset=%d dataLen=%d" %
@@ -92,10 +91,7 @@ class RfxDecoder:
         rects = []
         off = 3
         for _ in range(num_rects):
-            rx = struct.unpack_from('<H', data, off)[0]
-            ry = struct.unpack_from('<H', data, off + 2)[0]
-            rw = struct.unpack_from('<H', data, off + 4)[0]
-            rh = struct.unpack_from('<H', data, off + 6)[0]
+            rx, ry, rw, rh = struct.unpack_from('<HHHH', data, off)
             rects.append((left + rx, top + ry, rw, rh))
             off += 8
 
@@ -133,8 +129,7 @@ class RfxDecoder:
         for _ in range(num_tiles):
             if off + 6 > len(data):
                 break
-            tile_block_type = struct.unpack_from('<H', data, off)[0]
-            tile_block_len = struct.unpack_from('<I', data, off + 2)[0]
+            tile_block_type, tile_block_len = struct.unpack_from('<HI', data, off)
 
             if tile_block_type != CBT_TILE:
                 log.debug("RFX: expected CBT_TILE (0xCAC3), got 0x%04X" %
@@ -163,11 +158,7 @@ class RfxDecoder:
         quant_idx_y = data[0]
         quant_idx_cb = data[1]
         quant_idx_cr = data[2]
-        x_idx = struct.unpack_from('<H', data, 3)[0]
-        y_idx = struct.unpack_from('<H', data, 5)[0]
-        y_len = struct.unpack_from('<H', data, 7)[0]
-        cb_len = struct.unpack_from('<H', data, 9)[0]
-        cr_len = struct.unpack_from('<H', data, 11)[0]
+        x_idx, y_idx, y_len, cb_len, cr_len = struct.unpack_from('<HHHHH', data, 3)
 
         off = 13
         y_data = data[off:off + y_len] if y_len > 0 and off + y_len <= len(data) else None
