@@ -409,8 +409,9 @@ class DrdynvcLayer(LayerAutomata):
         totalLen, offset = self._readLength(data, offset, sp)
         fragment = data[offset:]
         channelName = self._dynamicChannels.get(channelId, "unknown")
-        log.debug("DrdynvcLayer: DATA_FIRST channelId=%d (%s) totalLen=%d fragLen=%d" %
-                  (channelId, channelName, totalLen, len(fragment)))
+        if log._is_debug:
+            log.debug("DrdynvcLayer: DATA_FIRST channelId=%d (%s) totalLen=%d fragLen=%d" %
+                      (channelId, channelName, totalLen, len(fragment)))
         if len(fragment) >= totalLen:
             # Complete message in first fragment — dispatch immediately
             # (matching grdp behaviour; avoids losing the message if a
@@ -445,12 +446,11 @@ class DrdynvcLayer(LayerAutomata):
         if channelId == self._gfxChannelId and len(payload) >= 8:
             self._processRdpgfxStream(payload)
         elif channelId in self._rdpsndDvcChannelIds and self._rdpsndLayer is not None:
-            log.debug("DrdynvcLayer: routing DVC rdpsnd data len=%d channelId=%d to RdpsndLayer" %
-                     (len(payload), channelId))
             self._rdpsndLayer._processData(payload)
         else:
-            log.debug("DrdynvcLayer: data on channelId=%d (%s) len=%d" %
-                      (channelId, channelName, len(payload)))
+            if log._is_debug:
+                log.debug("DrdynvcLayer: data on channelId=%d (%s) len=%d" %
+                          (channelId, channelName, len(payload)))
 
     def _processClose(self, data, cbId):
         channelId, offset = self._readChannelId(data, 1, cbId)
@@ -721,8 +721,9 @@ class DrdynvcLayer(LayerAutomata):
         width = right - left
         height = bottom - top
 
-        log.debug("RDPGFX: WTS1 surfId=%d codecId=0x%04X %dx%d bmpLen=%d" %
-                 (surfaceId, codecId, width, height, len(bitmapData)))
+        if log._is_debug:
+            log.debug("RDPGFX: WTS1 surfId=%d codecId=0x%04X %dx%d bmpLen=%d" %
+                     (surfaceId, codecId, width, height, len(bitmapData)))
 
         # CaVideo is heavy (RFX tile decode)
         if codecId == RDPGFX_CODECID_CAVIDEO:
@@ -758,8 +759,9 @@ class DrdynvcLayer(LayerAutomata):
 
         surfInfo = self._surfaces.get(surfaceId)
         w, h = (surfInfo[0], surfInfo[1]) if surfInfo else (0, 0)
-        log.debug("RDPGFX: WTS2 surfId=%d codecId=0x%04X %dx%d bmpLen=%d" %
-                 (surfaceId, codecId, w, h, len(bitmapData)))
+        if log._is_debug:
+            log.debug("RDPGFX: WTS2 surfId=%d codecId=0x%04X %dx%d bmpLen=%d" %
+                     (surfaceId, codecId, w, h, len(bitmapData)))
 
         if codecId == RDPGFX_CODECID_CAPROGRESSIVE:
             surfBuf = self._surfaceData.get(surfaceId)

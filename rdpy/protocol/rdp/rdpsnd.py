@@ -355,7 +355,6 @@ class RdpsndLayer(LayerAutomata):
     def recv(self, s):
         """Receive data on the rdpsnd static virtual channel with VChannel reassembly."""
         data = s.read()
-        log.debug("RDPSND: recv raw %d bytes" % len(data))
         if len(data) < 8:
             log.warning("RDPSND: recv data too short (%d bytes), skipping" % len(data))
             return
@@ -413,8 +412,9 @@ class RdpsndLayer(LayerAutomata):
         _names = {SNDC_FORMATS: "FORMATS", SNDC_TRAINING: "TRAINING",
                   SNDC_WAVE: "WAVE", SNDC_WAVE2: "WAVE2", SNDC_CLOSE: "CLOSE",
                   SNDC_SETVOLUME: "SETVOLUME", SNDC_QUALITYMODE: "QUALITYMODE"}
-        log.debug("RDPSND: recv msgType=%s(0x%02x) bodySize=%d" %
-                 (_names.get(msgType, "?"), msgType, bodySize))
+        if log._is_debug:
+            log.debug("RDPSND: recv msgType=%s(0x%02x) bodySize=%d" %
+                     (_names.get(msgType, "?"), msgType, bodySize))
 
         if msgType == SNDC_FORMATS:
             self._processServerFormats(body)

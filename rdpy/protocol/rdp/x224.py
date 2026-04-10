@@ -145,8 +145,8 @@ class X224Layer(LayerAutomata, IStreamSender):
                    And pass to presentation layer
         @param data: Stream
         """
-        header = X224DataHeader()
-        data.readType(header)
+        # X224DataHeader is 3 bytes: header(2), messageType(X224_TPDU_DATA), separator(0x80)
+        data.read(3)
         self._presentation.recv(data)
         
     def send(self, message):

@@ -33,7 +33,14 @@ class Level(object):
     NONE = 4
     
 _LOG_LEVEL = Level.DEBUG
-_LOG_FILE = False 
+_LOG_FILE = False
+_is_debug = _LOG_LEVEL <= Level.DEBUG
+
+def set_level(level):
+    """Set log level and update fast-check flags."""
+    global _LOG_LEVEL, _is_debug
+    _LOG_LEVEL = level
+    _is_debug = level <= Level.DEBUG
 
 def log(message):
     """

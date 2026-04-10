@@ -107,10 +107,9 @@ class TPKT(RawLayer, IFastPathSender):
         """
         @param presentation: {Layer} presentation layer, in RDP case is x224 layer
         """
-        log.debug("TPKT.__init__()")
         RawLayer.__init__(self, presentation)
         #length may be coded on more than 1 bytes
-        self._lastShortLength = UInt8()
+        self._lastShortLength = 0
         #fast path listener
         self._fastPathListener = None
         #last secure flag
@@ -121,7 +120,6 @@ class TPKT(RawLayer, IFastPathSender):
         @param fastPathListener : {IFastPathListener}
         @note: implement IFastPathSender
         """
-        log.debug("TPKT.setFastPathListener()")
         self._fastPathListener = fastPathListener
         
     def connect(self):
@@ -129,7 +127,6 @@ class TPKT(RawLayer, IFastPathSender):
         @summary:  Call when transport layer connection
                     is made (inherit from RawLayer)
         """
-        log.debug("TPKT.connect()")
         #header is on two bytes
         self.expect(2, self.readHeader)
         #no connection automata on this layer
@@ -142,25 +139,22 @@ class TPKT(RawLayer, IFastPathSender):
         @param data: {Stream} received from twisted layer
         """
         #first read packet version
-        version = UInt8()
-        data.readType(version)
+        version = data.readUInt8()
         #classic packet
-        if version.value == Action.FASTPATH_ACTION_X224:
-            log.debug("TPKT.readHeader() FASTPATH_ACTION_X224")
+        if version == Action.FASTPATH_ACTION_X224:
             #padding
-            data.readType(UInt8())
+            data.read(1)
             #read end header
             self.expect(2, self.readExtendedHeader)
         else:
-            log.debug(f"TPKT.readHeader() _lastShortLength={self._lastShortLength}")
             #is fast path packet
-            self._secFlag = ((version.value >> 6) & 0x3)
-            data.readType(self._lastShortLength)
-            if self._lastShortLength.value & 0x80:
+            self._secFlag = ((version >> 6) & 0x3)
+            self._lastShortLength = data.readUInt8()
+            if self._lastShortLength & 0x80:
                 #size is 1 byte more
                 self.expect(1, self.readExtendedFastPathHeader)
                 return
-            self.expect(self._lastShortLength.value - 2, self.readFastPath)
+            self.expect(self._lastShortLength - 2, self.readFastPath)
                 
         
     def readExtendedHeader(self, data):
@@ -168,22 +162,17 @@ class TPKT(RawLayer, IFastPathSender):
         @summary: Header may be on 4 bytes
         @param data: {Stream} from twisted layer
         """
-        log.debug("TPKT.readExtendedHeader()")
         #next state is read data
-        size = UInt16Be()
-        data.readType(size)
-        self.expect(size.value - 4, self.readData)
+        size = data.readUInt16Be()
+        self.expect(size - 4, self.readData)
     
     def readExtendedFastPathHeader(self, data):
         """
         @summary: Fast path header may be on 1 byte more
         @param data: {Stream} from twisted layer
         """
-        log.debug("TPKT.readExtendedFastPathHeader()")
-        leftPart = UInt8()
-        data.readType(leftPart)
-        self._lastShortLength.value &= ~0x80
-        packetSize = (self._lastShortLength.value << 8) + leftPart.value
+        leftPart = data.readUInt8()
+        packetSize = ((self._lastShortLength & 0x7f) << 8) + leftPart
         #next state is fast patn data
         self.expect(packetSize - 3, self.readFastPath)
     
@@ -192,7 +181,6 @@ class TPKT(RawLayer, IFastPathSender):
         @summary: Fast path data
         @param data: {Stream} from twisted layer
         """
-        log.debug(f"TPKT.recvFastPath({data}) _secFlag={self._secFlag}")
         try:
             self._fastPathListener.recvFastPath(self._secFlag, data)
         except Exception as e:
@@ -205,7 +193,6 @@ class TPKT(RawLayer, IFastPathSender):
         @summary: Read classic TPKT packet, last state in tpkt automata
         @param data: {Stream} with correct size
         """
-        log.debug("TPKT.readData()")
         try:
             self._presentation.recv(data)
         except Exception as e:
@@ -218,7 +205,6 @@ class TPKT(RawLayer, IFastPathSender):
         @summary: Send encompassed data
         @param message: {network.Type} message to send
         """
-        log.debug(f"TPKT.send() FASTPATH_ACTION_X224 {sizeof(message)=}")
         RawLayer.send(self, (UInt8(Action.FASTPATH_ACTION_X224), UInt8(0), UInt16Be(sizeof(message) + 4), message))
         
     def sendFastPath(self, secFlag, fastPathS):
@@ -226,7 +212,6 @@ class TPKT(RawLayer, IFastPathSender):
         @param fastPathS: {Type | Tuple} type transform to stream and send as fastpath
         @param secFlag: {integer} Security flag for fastpath packet
         """
-        log.debug("TPKT.sendFastPath()")
         RawLayer.send(self, (UInt8(Action.FASTPATH_ACTION_FASTPATH | ((secFlag & 0x3) << 6)), UInt16Be((sizeof(fastPathS) + 3) | 0x8000), fastPathS))
     
     def startTLS(self, sslContext):

@@ -220,16 +220,15 @@ class MCSLayer(LayerAutomata):
         @summary: Main receive method
         @param data: {Stream} 
         """
-        opcode = UInt8()
-        data.readType(opcode)
+        opcode = data.readUInt8()
         
-        if self.readMCSPDUHeader(opcode.value, DomainMCSPDU.DISCONNECT_PROVIDER_ULTIMATUM):
-            log.debug("MCS DISCONNECT_PROVIDER_ULTIMATUM")
+        if self.readMCSPDUHeader(opcode, DomainMCSPDU.DISCONNECT_PROVIDER_ULTIMATUM):
+            log.info("MCS DISCONNECT_PROVIDER_ULTIMATUM")
             self._transport.close()
             return
         
         #client case
-        elif not self.readMCSPDUHeader(opcode.value, self._receiveOpcode):
+        elif not self.readMCSPDUHeader(opcode, self._receiveOpcode):
             raise InvalidExpectedDataException("Invalid expected MCS opcode receive data")
         
         #server user id
@@ -250,9 +249,6 @@ class MCSLayer(LayerAutomata):
             else:
                 log.error("receive data for an unconnected layer channelId=%d" % channelId)
             return
-
-        if channelId != Channel.MCS_GLOBAL_CHANNEL:
-            log.debug("MCS recvData channelId=%d -> %s" % (channelId, self._channels[channelId].__class__.__name__))
 
         self._channels[channelId].recv(data) 
 
@@ -284,22 +280,15 @@ class MCSLayer(LayerAutomata):
                   so that FreeRDP/gnome-remote-desktop enables audio output redirection.
         @param data: {Stream} remaining payload after MCS header
         """
-        secFlag = UInt16Le()
-        secFlagHi = UInt16Le()
-        data.readType((secFlag, secFlagHi))
+        secFlag = data.readUInt16Le()
+        data.read(2)  # secFlagHi (unused)
 
-        if not (secFlag.value & self._SEC_AUTODETECT_REQ):
+        if not (secFlag & self._SEC_AUTODETECT_REQ):
             return
 
-        headerLength = UInt8()
-        headerTypeId = UInt8()
-        sequenceNumber = UInt16Le()
-        requestType = UInt16Le()
-        data.readType((headerLength, headerTypeId, sequenceNumber, requestType))
-
-        req = requestType.value
-        seq = sequenceNumber.value
-        log.debug("AutoDetect request: requestType=0x%04x sequenceNumber=%d" % (req, seq))
+        data.read(2)  # headerLength + headerTypeId (unused)
+        seq = data.readUInt16Le()
+        req = data.readUInt16Le()
 
         if req in (self._RDP_RTT_REQUEST_CONNECTTIME,
                    self._RDP_RTT_REQUEST_CONTINUOUS,
@@ -310,6 +299,12 @@ class MCSLayer(LayerAutomata):
             # BW Results (connect-time): headerLength=14, responseType=0x0003 + timeDelta + byteCount
             self._sendAutoDetectResponse(seq, self._RDP_BW_RESULTS_CONNECTTIME, include_bw=True)
         # BW_START (0x0014/0x1014) and BW_PAYLOAD (0x0002) require no response
+
+    # Pre-built static portions of auto-detect responses
+    import struct as _struct
+    _AUTODETECT_RSP_PREFIX = _struct.pack('<HH', 0x2000, 0)  # SEC_AUTODETECT_RSP, 0
+    _RTT_RESP_HEADER = _struct.pack('BB', 6, 0x01)  # headerLength=6, typeId=1
+    _BW_RESP_HEADER = _struct.pack('BB', 14, 0x01)  # headerLength=14, typeId=1
 
     def _sendAutoDetectResponse(self, sequenceNumber, responseType, include_bw=False):
         """
@@ -329,7 +324,6 @@ class MCSLayer(LayerAutomata):
             respBody += (UInt32Le(0), UInt32Le(0))
 
         payload = (UInt16Le(self._SEC_AUTODETECT_RSP), UInt16Le(0)) + respBody
-        log.debug("AutoDetect response: responseType=0x%04x sequenceNumber=%d" % (responseType, sequenceNumber))
         self.send(self._messageChannelId, payload)
 
 

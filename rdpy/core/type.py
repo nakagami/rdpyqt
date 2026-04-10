@@ -33,6 +33,17 @@ import rdpy.core.log as log
 # Pre-compiled struct cache — avoids re-parsing format strings on every pack/unpack
 _STRUCT_CACHE = {}
 
+# Shared default conditional — avoids allocating a new lambda per Type instance
+def _ALWAYS_TRUE():
+    return True
+
+# Pre-compiled structs for fast Stream read methods
+_STRUCT_UINT8 = struct.Struct('B')
+_STRUCT_UINT16LE = struct.Struct('<H')
+_STRUCT_UINT16BE = struct.Struct('>H')
+_STRUCT_UINT32LE = struct.Struct('<I')
+_STRUCT_SINT16LE = struct.Struct('<h')
+
 def _get_struct(fmt):
     """Return a cached struct.Struct for the given format string."""
     try:
@@ -63,7 +74,7 @@ class Type(object):
     @summary:  Root type object inheritance
                 Record conditional optional of constant mechanism
     """
-    def __init__(self, conditional = lambda:True, optional = False, constant = False):
+    def __init__(self, conditional = _ALWAYS_TRUE, optional = False, constant = False):
         """
         @param conditional :    Callable object
                                  Read and Write operation depend on return of this function
@@ -202,7 +213,7 @@ class SimpleType(Type, CallableValue):
                 leaf in type tree
                 And is a callable value
     """
-    def __init__(self, structFormat, typeSize, signed, value, conditional = lambda:True, optional = False, constant = False):
+    def __init__(self, structFormat, typeSize, signed, value, conditional = _ALWAYS_TRUE, optional = False, constant = False):
         """
         @param structFormat: letter that represent type in struct package
         @param typeSize: size in byte of type
@@ -433,7 +444,7 @@ class CompositeType(Type):
                 Track type field declared in __init__ function
                 Ex: self.lengthOfPacket = UInt16Le() -> record lengthOfPacket as sub type of node
     """
-    def __init__(self, conditional = lambda:True, optional = False, constant = False, readLen = None):
+    def __init__(self, conditional = _ALWAYS_TRUE, optional = False, constant = False, readLen = None):
         """
         @param conditional :    Callable object
                                  Read and Write operation depend on return of this function
@@ -556,7 +567,7 @@ class UInt8(SimpleType):
     """
     @summary: unsigned byte
     """    
-    def __init__(self, value = 0, conditional = lambda:True, optional = False, constant = False):
+    def __init__(self, value = 0, conditional = _ALWAYS_TRUE, optional = False, constant = False):
         """
         @param value: python value wrap
         @param conditional :    Callable object
@@ -571,7 +582,7 @@ class SInt8(SimpleType):
     """
     @summary: signed byte
     """   
-    def __init__(self, value = 0, conditional = lambda:True, optional = False, constant = False):
+    def __init__(self, value = 0, conditional = _ALWAYS_TRUE, optional = False, constant = False):
         """
         @param value: python value wrap
         @param conditional :    Callable object
@@ -588,7 +599,7 @@ class UInt16Be(SimpleType):
     @summary: unsigned short
                with Big endian representation in stream
     """
-    def __init__(self, value = 0, conditional = lambda:True, optional = False, constant = False):
+    def __init__(self, value = 0, conditional = _ALWAYS_TRUE, optional = False, constant = False):
         """
         @param value: python value wrap
         @param conditional :    Callable object
@@ -604,7 +615,7 @@ class UInt16Le(SimpleType):
     @summary: unsigned short
                with Little endian representation in stream
     """
-    def __init__(self, value = 0, conditional = lambda:True, optional = False, constant = False):
+    def __init__(self, value = 0, conditional = _ALWAYS_TRUE, optional = False, constant = False):
         """
         @param value: python value wrap
         @param conditional :    Callable object
@@ -620,7 +631,7 @@ class SInt16Le(SimpleType):
     @summary: signed short
                with Little endian representation in stream
     """
-    def __init__(self, value = 0, conditional = lambda:True, optional = False, constant = False):
+    def __init__(self, value = 0, conditional = _ALWAYS_TRUE, optional = False, constant = False):
         """
         @param value: python value wrap
         @param conditional :    Callable object
@@ -636,7 +647,7 @@ class UInt32Be(SimpleType):
     @summary: unsigned int
                with Big endian representation in stream
     """
-    def __init__(self, value = 0, conditional = lambda:True, optional = False, constant = False):
+    def __init__(self, value = 0, conditional = _ALWAYS_TRUE, optional = False, constant = False):
         """
         @param value: python value wrap
         @param conditional :    Callable object
@@ -652,7 +663,7 @@ class UInt32Le(SimpleType):
     @summary: unsigned int
                with Little endian representation in stream
     """
-    def __init__(self, value = 0, conditional = lambda:True, optional = False, constant = False):
+    def __init__(self, value = 0, conditional = _ALWAYS_TRUE, optional = False, constant = False):
         """
         @param value: python value wrap
         @param conditional :    Callable object
@@ -668,7 +679,7 @@ class SInt32Le(SimpleType):
     @summary: signed int
                with Little endian representation in stream
     """
-    def __init__(self, value = 0, conditional = lambda:True, optional = False, constant = False):
+    def __init__(self, value = 0, conditional = _ALWAYS_TRUE, optional = False, constant = False):
         """
         @param value: python value wrap
         @param conditional :    Callable object
@@ -684,7 +695,7 @@ class SInt32Be(SimpleType):
     @summary: signed int
                with Big endian representation in stream
     """
-    def __init__(self, value = 0, conditional = lambda:True, optional = False, constant = False):
+    def __init__(self, value = 0, conditional = _ALWAYS_TRUE, optional = False, constant = False):
         """
         @param value: python value wrap
         @param conditional :    Callable object
@@ -700,7 +711,7 @@ class UInt24Be(SimpleType):
     @summary: unsigned 24 bit integer
                with Big endian representation in stream
     """
-    def __init__(self, value = 0, conditional = lambda:True, optional = False, constant = False):
+    def __init__(self, value = 0, conditional = _ALWAYS_TRUE, optional = False, constant = False):
         """
         @param value: python value wrap
         @param conditional :    Callable object
@@ -730,7 +741,7 @@ class UInt24Le(SimpleType):
     @summary: unsigned 24 bit integer
                with Little endian representation in stream
     """
-    def __init__(self, value = 0, conditional = lambda:True, optional = False, constant = False):
+    def __init__(self, value = 0, conditional = _ALWAYS_TRUE, optional = False, constant = False):
         """
         @param value: python value wrap
         @param conditional :    Callable object
@@ -760,7 +771,7 @@ class String(Type, CallableValue):
     @summary:  String type
                 Leaf in Type tree
     """
-    def __init__(self, value = b"", readLen = None, conditional = lambda:True, optional = False, constant = False, unicode = False, until = None):
+    def __init__(self, value = b"", readLen = None, conditional = _ALWAYS_TRUE, optional = False, constant = False, unicode = False, until = None):
         """
         @param value: python string use for inner value
         @param readLen: length use to read in stream (SimpleType) if 0 read entire stream
@@ -951,6 +962,27 @@ class Stream(BytesIO):
         """
         self.readType(t)
         self.pos -= sizeof(t)
+
+    # ---- Fast read methods: bypass Type object creation ----
+    def readUInt8(self):
+        """Read a single unsigned byte and return its int value."""
+        return _STRUCT_UINT8.unpack(self.read(1))[0]
+
+    def readUInt16Le(self):
+        """Read a little-endian unsigned 16-bit integer."""
+        return _STRUCT_UINT16LE.unpack(self.read(2))[0]
+
+    def readUInt16Be(self):
+        """Read a big-endian unsigned 16-bit integer."""
+        return _STRUCT_UINT16BE.unpack(self.read(2))[0]
+
+    def readUInt32Le(self):
+        """Read a little-endian unsigned 32-bit integer."""
+        return _STRUCT_UINT32LE.unpack(self.read(4))[0]
+
+    def readSInt16Le(self):
+        """Read a little-endian signed 16-bit integer."""
+        return _STRUCT_SINT16LE.unpack(self.read(2))[0]
     
     def writeType(self, value):
         """
@@ -970,7 +1002,7 @@ class ArrayType(Type):
     """
     @summary: Factory af n element
     """
-    def __init__(self, typeFactory, init = None, readLen = None, conditional = lambda:True, optional = False, constant = False):
+    def __init__(self, typeFactory, init = None, readLen = None, conditional = _ALWAYS_TRUE, optional = False, constant = False):
         """
         @param typeFactory: class use to init new element on read
         @param init: init array
@@ -1030,7 +1062,7 @@ class FactoryType(Type):
     @summary:  Call a factory callback at read or write time
                 Wrapp attribute access to inner type
     """
-    def __init__(self, factory, conditional = lambda:True, optional = False, constant = False):
+    def __init__(self, factory, conditional = _ALWAYS_TRUE, optional = False, constant = False):
         """
         @param factory: Call back call before read or write type
         @param conditional :    Callable object

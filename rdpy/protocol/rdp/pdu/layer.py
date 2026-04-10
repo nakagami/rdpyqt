@@ -342,7 +342,6 @@ class Client(PDULayer):
         @summary: Main receive function after connection sequence
         @param s: Stream from transport layer
         """
-        log.debug("PDULayer.recvPDU()")
         pdus = ArrayType(data.PDU)
         s.readType(pdus)
         for pdu in pdus:
@@ -366,8 +365,6 @@ class Client(PDULayer):
         @param secFlag: {SecFlags}
         """
         import struct
-        log.debug("PDULayer.recvFastPath()")
-
         rawData = fastPathS.getvalue()[fastPathS.pos:]
         offset = 0
 

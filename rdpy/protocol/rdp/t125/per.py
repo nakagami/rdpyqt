@@ -30,17 +30,10 @@ def readLength(s):
     @param s: Stream
     @return: int python
     """
-    byte = UInt8()
-    s.readType(byte)
-    size = 0
-    if byte.value & 0x80:
-        byte.value &= ~0x80
-        size = byte.value << 8
-        s.readType(byte)
-        size += byte.value
-    else:
-        size = byte.value
-    return size
+    byte = s.readUInt8()
+    if byte & 0x80:
+        return ((byte & 0x7f) << 8) + s.readUInt8()
+    return byte
 
 def writeLength(value):
     """
@@ -59,9 +52,7 @@ def readChoice(s):
     @param s: Stream
     @return: int that represent choice
     """
-    choice = UInt8()
-    s.readType(choice)
-    return choice.value
+    return s.readUInt8()
 
 def writeChoice(choice):
     """
@@ -77,9 +68,7 @@ def readSelection(s):
     @param s: Stream
     @return: int that represent selection
     """
-    choice = UInt8()
-    s.readType(choice)
-    return choice.value
+    return s.readUInt8()
 
 def writeSelection(selection):
     """
@@ -95,9 +84,7 @@ def readNumberOfSet(s):
     @param s: Stream
     @return: int that represent numberOfSet
     """
-    choice = UInt8()
-    s.readType(choice)
-    return choice.value
+    return s.readUInt8()
 
 def writeNumberOfSet(numberOfSet):
     """
@@ -113,9 +100,7 @@ def readEnumerates(s):
     @param s: Stream
     @return: int that represent enumerate
     """
-    choice = UInt8()
-    s.readType(choice)
-    return choice.value
+    return s.readUInt8()
 
 def writeEnumerates(enumer):
     """
@@ -132,18 +117,17 @@ def readInteger(s):
     @return: python int or long
     @raise InvalidValue: if size of integer is not correct
     """
-    result = None
     size = readLength(s)
     if size == 1:
-        result = UInt8()
+        return s.readUInt8()
     elif size == 2:
-        result = UInt16Be()
+        return s.readUInt16Be()
     elif size == 4:
         result = UInt32Be()
+        s.readType(result)
+        return result.value
     else:
         raise InvalidValue("invalid integer size %d"%size)
-    s.readType(result)
-    return result.value
 
 def writeInteger(value):
     """
@@ -165,9 +149,7 @@ def readInteger16(s, minimum = 0):
     @param minimum: minimum added to real value
     @return: int or long python value
     """
-    result = UInt16Be()
-    s.readType(result)
-    return result.value + minimum
+    return s.readUInt16Be() + minimum
 
 def writeInteger16(value, minimum = 0):
     """

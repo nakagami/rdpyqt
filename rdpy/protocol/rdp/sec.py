@@ -465,12 +465,11 @@ class SecLayer(LayerAutomata, IStreamSender, tpkt.IFastPathListener, tpkt.IFastP
             self._presentation.recv(data)
             return
         
-        securityFlag = UInt16Le()
-        securityFlagHi = UInt16Le()
-        data.readType((securityFlag, securityFlagHi))
+        securityFlag = data.readUInt16Le()
+        data.read(2)  # securityFlagHi (unused)
         
-        if securityFlag.value & SecurityFlag.SEC_ENCRYPT:
-            data = self.readEncryptedPayload(data, securityFlag.value & SecurityFlag.SEC_SECURE_CHECKSUM)
+        if securityFlag & SecurityFlag.SEC_ENCRYPT:
+            data = self.readEncryptedPayload(data, securityFlag & SecurityFlag.SEC_SECURE_CHECKSUM)
             
         self._presentation.recv(data)
         
