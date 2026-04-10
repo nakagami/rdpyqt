@@ -28,6 +28,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QCursor, QPixmap
 from rdpy.protocol.rdp.rdp import RDPClientObserver
 from rdpy.core.error import CallPureVirtualFuntion
+import collections
 import sys
 import traceback
 import numpy as np
@@ -693,7 +694,10 @@ class QRemoteDesktop(QtWidgets.QWidget):
     """
     @summary: Qt display widget
     """
-    _updateSignal = QtCore.pyqtSignal(int, int, QtGui.QImage, int, int)
+    # Lightweight wake-up signal (no data) for bitmap update batching.
+    # The actual image data is passed via a thread-safe deque; this signal
+    # just tells the Qt event loop to schedule a flush.
+    _updateSignal = QtCore.pyqtSignal()
     # Thread-safe cursor update: Twisted thread emits, Qt main thread applies
     _cursorSignal = QtCore.pyqtSignal(object)
 
@@ -710,7 +714,7 @@ class QRemoteDesktop(QtWidgets.QWidget):
         #bind mouse event
         self.setMouseTracking(True)
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
-        self._updateSignal.connect(self._doNotifyImage)
+        self._updateSignal.connect(self._scheduleFlush)
         self._cursorSignal.connect(self._applyCursor)
         #resize debounce
         self._programmaticResize = False
@@ -725,12 +729,26 @@ class QRemoteDesktop(QtWidgets.QWidget):
         self._mouseMoveTimer.setSingleShot(True)
         self._mouseMoveTimer.setInterval(16)  # ~60 fps
         self._mouseMoveTimer.timeout.connect(self._flushMouseMove)
+        # Bitmap update batching: accumulate updates from the Twisted thread
+        # in a deque and paint them in one batch on the Qt thread.  A 0ms
+        # single-shot timer ensures the flush runs *after* any already-queued
+        # events (mouse clicks/moves), preventing bitmap floods from starving
+        # input events.
+        self._pendingUpdates = collections.deque()
+        self._flushScheduled = False
+        self._updateFlushTimer = QtCore.QTimer()
+        self._updateFlushTimer.setSingleShot(True)
+        self._updateFlushTimer.setInterval(0)
+        self._updateFlushTimer.timeout.connect(self._flushUpdates)
         #set correct size; buffer is created in resizeEvent
         self.resize(width, height)
 
     def notifyImage(self, x, y, qimage, width, height):
         """
-        @summary: Function called from QAdaptor
+        @summary: Function called from Twisted thread to queue a bitmap update.
+                  Updates are accumulated in a deque and flushed in batch on
+                  the Qt main thread, so that rapid bitmap floods (e.g. video
+                  playback) do not starve mouse / keyboard events.
         @param x: x position of new image
         @param y: y position of new image
         @param qimage: new QImage
@@ -739,22 +757,47 @@ class QRemoteDesktop(QtWidgets.QWidget):
         """
         if not self._sessionReady:
             self._sessionReady = True
-        self._updateSignal.emit(x, y, qimage, width, height)
+        self._pendingUpdates.append((x, y, qimage, width, height))
+        # Emit the wake signal only once per batch to minimise Qt event-queue
+        # pressure.  The flag is reset in _flushUpdates after the deque is
+        # drained, so any update appended after that point will trigger a new
+        # signal.
+        if not self._flushScheduled:
+            self._flushScheduled = True
+            self._updateSignal.emit()
 
-    def _doNotifyImage(self, x, y, qimage, width, height):
-        """
-        @summary: Slot connected to _updateSignal, runs on the Qt main thread
-        @param x: x position of new image
-        @param y: y position of new image
-        @param qimage: new QImage
-        @param width: width of the image region
-        @param height: height of the image region
-        """
-        #fill buffer image
+    def _scheduleFlush(self):
+        """Slot on Qt main thread – start a 0 ms timer so the flush runs
+        after any already-queued events (mouse/keyboard) are processed."""
+        if not self._updateFlushTimer.isActive():
+            self._updateFlushTimer.start()
+
+    def _flushUpdates(self):
+        """Process all pending bitmap updates in one batch, then repaint
+        only the union of all dirty regions."""
+        # Drain the deque first, then reset the flag so that any update
+        # appended after this point correctly triggers a new wake signal.
+        updates = []
+        while self._pendingUpdates:
+            try:
+                updates.append(self._pendingUpdates.popleft())
+            except IndexError:
+                break
+        self._flushScheduled = False
+
+        if not updates:
+            return
+
+        dirty = QtCore.QRect()
         with QtGui.QPainter(self._buffer) as qp:
-            qp.drawImage(x, y, qimage, 0, 0, width, height)
-        #force update only the dirty region (avoids full-widget repaint)
-        self.update(x, y, width, height)
+            for x, y, qimage, w, h in updates:
+                qp.drawImage(x, y, qimage, 0, 0, w, h)
+                rect = QtCore.QRect(x, y, w, h)
+                if dirty.isEmpty():
+                    dirty = rect
+                else:
+                    dirty = dirty.united(rect)
+        self.update(dirty)
 
     def setAdaptor(self, adaptor):
         """
