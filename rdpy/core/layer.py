@@ -24,6 +24,7 @@ Join RDPY design with twisted design
 RDPY use Layer Protocol design (like twisted)
 """
 
+from collections import deque
 from rdpy.core.error import CallPureVirtualFuntion
 from rdpy.core import log
 
@@ -181,10 +182,10 @@ class RawLayer(protocol.Protocol, LayerAutomata, IStreamSender):
         """
         #call parent automata
         LayerAutomata.__init__(self, presentation)
-        #data buffer received from twisted network layer
-        self._buffer = bytearray()
-        #offset into _buffer where unconsumed data starts
-        self._bufferOffset = 0
+        # deque of incoming data chunks — O(1) append and popleft, no compaction needed
+        self._chunks = deque()
+        self._chunk_offset = 0      # offset into self._chunks[0]
+        self._total_available = 0   # total bytes across all chunks
         #len of next packet pass to next state function
         self._expectedLen = 0
         self._factory = None
@@ -196,26 +197,34 @@ class RawLayer(protocol.Protocol, LayerAutomata, IStreamSender):
         """
         self._factory = factory
         
+    def _consume(self, n):
+        """Consume exactly n bytes from the chunk deque and return them as bytes.
+        Uses O(1) popleft — no buffer compaction required."""
+        result = bytearray(n)
+        written = 0
+        while written < n:
+            chunk = self._chunks[0]
+            available = len(chunk) - self._chunk_offset
+            take = min(available, n - written)
+            result[written:written + take] = chunk[self._chunk_offset:self._chunk_offset + take]
+            written += take
+            self._chunk_offset += take
+            if self._chunk_offset >= len(chunk):
+                self._chunks.popleft()
+                self._chunk_offset = 0
+        self._total_available -= n
+        return bytes(result)
+
     def dataReceived(self, data):
         """
         @summary:  Inherit from twisted.protocol class
                     main event of received data
         @param data: string data receive from twisted
         """
-        #add in buffer (bytearray.extend avoids full-buffer copy)
-        self._buffer.extend(data)
-        #while buffer have expected size call local callback
-        while self._expectedLen > 0 and (len(self._buffer) - self._bufferOffset) >= self._expectedLen:
-            #expected data is first expected bytes
-            end = self._bufferOffset + self._expectedLen
-            expectedData = Stream(self._buffer[self._bufferOffset:end])
-            #advance offset instead of O(n) memmove
-            self._bufferOffset = end
-            #compact buffer when consumed portion exceeds remaining data
-            if self._bufferOffset > len(self._buffer) - self._bufferOffset:
-                del self._buffer[:self._bufferOffset]
-                self._bufferOffset = 0
-            #call recv function
+        self._chunks.append(bytes(data))
+        self._total_available += len(data)
+        while self._expectedLen > 0 and self._total_available >= self._expectedLen:
+            expectedData = Stream(self._consume(self._expectedLen))
             self.recv(expectedData)
             
     def connectionMade(self):

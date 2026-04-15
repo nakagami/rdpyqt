@@ -65,7 +65,7 @@ def sizeof(element):
         for i in element:
             size += sizeof(i)
         return size
-    elif isinstance(element, Type) and element._conditional():
+    elif isinstance(element, Type) and (element._conditional is _ALWAYS_TRUE or element._conditional()):
         return element.__sizeof__()
     return 0 
 
@@ -98,7 +98,7 @@ class Type(object):
                     before call __write__ function 
         @param s: Stream that will be written
         """
-        self._is_writed = self._conditional()
+        self._is_writed = self._conditional is _ALWAYS_TRUE or self._conditional()
         if not self._is_writed:
             return
         self.__write__(s)
@@ -111,7 +111,7 @@ class Type(object):
         @param s: Stream
         @raise InvalidExpectedDataException: if constness is not respected
         """
-        self._is_readed = self._conditional()
+        self._is_readed = self._conditional is _ALWAYS_TRUE or self._conditional()
         if not self._is_readed:
             return
         
