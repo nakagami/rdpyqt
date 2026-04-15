@@ -632,9 +632,22 @@ class Client(SecLayer):
         @param s: Stream
         """
         if not self._enableEncryption:
-            # NLA/TLS mode: no security header, server may skip license exchange.
-            # Restore default recv and signal PDU layer to proceed, then re-dispatch
-            # the current PDU (e.g. DeactivateAllPDU) through the presentation layer.
+            # NLA/TLS mode: server may still send license packets with a
+            # Basic Security Header (SEC_LICENSE_PKT flag set), or it may
+            # skip the license exchange entirely and send a PDU directly.
+            savedPos = s.tell()
+            securityFlag = UInt16Le()
+            securityFlagHi = UInt16Le()
+            s.readType((securityFlag, securityFlagHi))
+
+            if securityFlag.value & SecurityFlag.SEC_LICENSE_PKT:
+                if self._licenceManager.recv(s):
+                    self.setNextState()
+                    self._presentation.connect()
+                return
+
+            # Not a license packet — rewind and forward to the PDU layer.
+            s.seek(savedPos)
             self.setNextState()
             self._presentation.connect()
             self._presentation.recv(s)

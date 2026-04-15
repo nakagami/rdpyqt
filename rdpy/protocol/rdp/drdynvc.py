@@ -351,6 +351,10 @@ class DrdynvcLayer(LayerAutomata):
             "rdpsnd", "AUDIO_PLAYBACK_DVC",
             # AUDIO_PLAYBACK_LOSSY_DVC (AAC/Opus) is not supported; reject it so
             # gnome-remote-desktop falls back to lossless AUDIO_PLAYBACK_DVC (PCM).
+            # CoreInput and MouseCursor must be accepted (grdp accepts them);
+            # rejecting them may cause Windows Server to disconnect mid-session.
+            "Microsoft::Windows::RDS::CoreInput",
+            "Microsoft::Windows::RDS::MouseCursor",
         }
         accepted = channelName in _SUPPORTED_CHANNELS
 
@@ -620,6 +624,10 @@ class DrdynvcLayer(LayerAutomata):
         else:
             log.debug("RDPGFX: CAPS_CONFIRM (short payload)")
         self._gfxConfirmed = True
+        # Reset frame counter on CAPS_CONFIRM (matching FreeRDP behaviour).
+        # NOTE: do NOT reset on RESET_GRAPHICS — the server's frame IDs
+        # continue incrementing across resets, so totalFramesDecoded must too.
+        self._totalFramesDecoded = 0
         if self._capsConfirmCallback:
             self._capsConfirmCallback()
 
@@ -650,9 +658,11 @@ class DrdynvcLayer(LayerAutomata):
         # Reset AVC freeze-recovery timing (fresh start after graphics reset)
         self._avcLastSuccessTime = 0.0
         self._avcLastRefreshTime = 0.0
-        # Reset frame counter (matches grdp's framesDecoded.Store(0))
-        self._totalFramesDecoded = 0
-        log.debug("RDPGFX: RESET_GRAPHICS %dx%d monitors=%d" % (width, height, monitorCount))
+        # Do NOT reset _totalFramesDecoded here — the server's frame IDs
+        # continue across RESET_GRAPHICS, so our cumulative count must too.
+        # FreeRDP only resets on CAPS_CONFIRM, not RESET_GRAPHICS.
+        log.debug("RDPGFX: RESET_GRAPHICS %dx%d monitors=%d (totalFramesDecoded=%d)" %
+                  (width, height, monitorCount, self._totalFramesDecoded))
 
     def _onCreateSurface(self, payload):
         """CREATE_SURFACE: surfaceId(2) + width(2) + height(2) + pixelFormat(1)"""

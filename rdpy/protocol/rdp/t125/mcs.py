@@ -25,6 +25,7 @@ The main channel is the graphical channel.
 It exist channel for file system order, audio channel, clipboard etc...
 """
 import binascii
+import time as _time
 from rdpy.core.layer import LayerAutomata, IStreamSender, Layer
 from rdpy.core.type import sizeof, Stream, UInt8, UInt16Le, UInt32Le, String
 from rdpy.core.error import InvalidExpectedDataException, InvalidValue, InvalidSize, CallPureVirtualFuntion
@@ -179,6 +180,8 @@ class MCSLayer(LayerAutomata):
         self._receiveOpcode = receiveOpcode
         #message channel id for auto-detect / heartbeat (0 means not negotiated)
         self._messageChannelId = 0
+        # Timestamp (monotonic) of the last BW_START for timeDelta calculation
+        self._bwStartTime = 0.0
         
     def close(self):
         """
@@ -265,25 +268,24 @@ class MCSLayer(LayerAutomata):
     # Continuous auto-detect request types (used during active sessions)
     _RDP_RTT_REQUEST_CONTINUOUS = 0x0001   # standard continuous RTT probe
     _RDP_BW_START_CONTINUOUS = 0x0014      # continuous BW start (no response needed)
-    _RDP_BW_STOP_CONTINUOUS = 0x002B       # continuous BW stop (respond with BW results)
-    _RDP_RTT_REQUEST_GNOMERD = 0x0429      # gnome-remote-desktop continuous RTT probe
+    _RDP_BW_STOP_CONTINUOUS = 0x0429       # continuous BW stop / network characteristics sync
 
     # Response types
     _TYPE_ID_AUTODETECT_RESPONSE = 0x01
     _RDP_RTT_RESPONSE_TYPE = 0x0000
     _RDP_BW_RESULTS_CONNECTTIME = 0x0003
+    _RDP_BW_RESULTS_CONTINUOUS = 0x000B
 
     def _handleAutoDetect(self, data):
         """
-        @summary: Handle connect-time auto-detect requests from the server
-                  on message channel (channelId=0). Responds to RTT and BW requests
-                  so that FreeRDP/gnome-remote-desktop enables audio output redirection.
+        @summary: Handle auto-detect and other message-channel requests from the server.
         @param data: {Stream} remaining payload after MCS header
         """
         secFlag = data.readUInt16Le()
         data.read(2)  # secFlagHi (unused)
 
         if not (secFlag & self._SEC_AUTODETECT_REQ):
+            log.debug("message channel: secFlag=0x%04x (not auto-detect)" % secFlag)
             return
 
         data.read(2)  # headerLength + headerTypeId (unused)
@@ -291,14 +293,29 @@ class MCSLayer(LayerAutomata):
         req = data.readUInt16Le()
 
         if req in (self._RDP_RTT_REQUEST_CONNECTTIME,
-                   self._RDP_RTT_REQUEST_CONTINUOUS,
-                   self._RDP_RTT_REQUEST_GNOMERD):
+                   self._RDP_RTT_REQUEST_CONTINUOUS):
             # RTT Measure Response: headerLength=6, responseType=0x0000
             self._sendAutoDetectResponse(seq, self._RDP_RTT_RESPONSE_TYPE)
+        elif req in (self._RDP_BW_START_CONNECTTIME, self._RDP_BW_START_CONTINUOUS):
+            # Record start time for timeDelta calculation (like FreeRDP/grdp)
+            self._bwStartTime = _time.monotonic()
         elif req == self._RDP_BW_STOP_CONNECTTIME:
-            # BW Results (connect-time): headerLength=14, responseType=0x0003 + timeDelta + byteCount
-            self._sendAutoDetectResponse(seq, self._RDP_BW_RESULTS_CONNECTTIME, include_bw=True)
-        # BW_START (0x0014/0x1014) and BW_PAYLOAD (0x0002) require no response
+            # BW Results (connect-time): headerLength=14, responseType=0x0003
+            elapsed = self._bwElapsedMs()
+            self._sendAutoDetectResponse(seq, self._RDP_BW_RESULTS_CONNECTTIME,
+                                         timeDelta=elapsed, byteCount=0)
+        elif req == self._RDP_BW_STOP_CONTINUOUS:
+            # BW Results (continuous): headerLength=14, responseType=0x000B
+            elapsed = self._bwElapsedMs()
+            self._sendAutoDetectResponse(seq, self._RDP_BW_RESULTS_CONTINUOUS,
+                                         timeDelta=elapsed, byteCount=0)
+        # BW_PAYLOAD (0x0002) requires no response
+
+    def _bwElapsedMs(self):
+        """Return elapsed milliseconds since last BW_START, minimum 1."""
+        now = _time.monotonic()
+        ms = int((now - self._bwStartTime) * 1000)
+        return max(ms, 1)
 
     # Pre-built static portions of auto-detect responses
     import struct as _struct
@@ -306,13 +323,17 @@ class MCSLayer(LayerAutomata):
     _RTT_RESP_HEADER = _struct.pack('BB', 6, 0x01)  # headerLength=6, typeId=1
     _BW_RESP_HEADER = _struct.pack('BB', 14, 0x01)  # headerLength=14, typeId=1
 
-    def _sendAutoDetectResponse(self, sequenceNumber, responseType, include_bw=False):
+    def _sendAutoDetectResponse(self, sequenceNumber, responseType,
+                                timeDelta=0, byteCount=0):
         """
         @summary: Send an auto-detect response on message channel (channelId=0).
         @param sequenceNumber: {int} sequence number from the request
         @param responseType: {int} response type to send
-        @param include_bw: {bool} True to include timeDelta and byteCount fields (BW results)
+        @param timeDelta: {int} elapsed milliseconds (for BW results)
+        @param byteCount: {int} accumulated bytes (for BW results)
         """
+        include_bw = (responseType == self._RDP_BW_RESULTS_CONNECTTIME or
+                      responseType == self._RDP_BW_RESULTS_CONTINUOUS)
         headerLength = 14 if include_bw else 6
         respBody = (
             UInt8(headerLength),
@@ -321,8 +342,10 @@ class MCSLayer(LayerAutomata):
             UInt16Le(responseType),
         )
         if include_bw:
-            respBody += (UInt32Le(0), UInt32Le(0))
+            respBody += (UInt32Le(timeDelta), UInt32Le(byteCount))
 
+        log.debug("AutoDetect response: responseType=0x%04x seq=%d timeDelta=%d" %
+                  (responseType, sequenceNumber, timeDelta))
         payload = (UInt16Le(self._SEC_AUTODETECT_RSP), UInt16Le(0)) + respBody
         self.send(self._messageChannelId, payload)
 

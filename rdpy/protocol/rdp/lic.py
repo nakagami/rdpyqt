@@ -307,8 +307,9 @@ class LicenseManager(object):
         """
         #get server information
         serverRandom = licenseRequest.serverRandom.value
-        if self._transport.getGCCServerSettings().SC_SECURITY.serverCertificate._is_readed:
-            serverCertificate = self._transport.getGCCServerSettings().SC_SECURITY.serverCertificate
+        sc_sec = self._transport.getGCCServerSettings().SC_SECURITY
+        if hasattr(sc_sec, 'serverCertificate') and sc_sec.serverCertificate._is_readed:
+            serverCertificate = sc_sec.serverCertificate
         else:
             s = Stream(licenseRequest.serverCertificate.blobData.value)
             serverCertificate = gcc.ServerCertificate()
