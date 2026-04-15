@@ -80,6 +80,10 @@ def _decompress1(output, width, height, input_data):
     mask = 0
     mixmask = 0
     mix_table = _get_mix_table(mix)
+    # Pre-allocated zero/fill buffers to avoid per-op bytes() allocation
+    _zero_buf = b'\x00' * width
+    _white_buf = b'\xff' * width
+    _mix_buf = bytes([mix]) * width
 
     while pos < n:
         fom_mask = 0
@@ -97,6 +101,7 @@ def _decompress1(output, width, height, input_data):
         elif opcode == 6 or opcode == 7:  # SetMix/Mix or SetMix/FillOrMix
             mix = inp[pos]; pos += 1
             mix_table = _get_mix_table(mix)
+            _mix_buf = bytes([mix]) * width
             opcode -= 5
         elif opcode == 9:  # FillOrMix_1
             mask = 0x03
@@ -129,7 +134,7 @@ def _decompress1(output, width, height, input_data):
                     continue
                 n_pix = min(count, width - x)
                 if prevline == 0:
-                    output[line + x : line + x + n_pix] = bytes(n_pix)
+                    output[line + x : line + x + n_pix] = _zero_buf[:n_pix]
                 else:
                     output[line + x : line + x + n_pix] = output[prevline + x : prevline + x + n_pix]
                 count -= n_pix
@@ -138,7 +143,7 @@ def _decompress1(output, width, height, input_data):
             elif opcode == 1:  # Mix
                 n_pix = min(count, width - x)
                 if prevline == 0:
-                    output[line + x : line + x + n_pix] = bytes([mix]) * n_pix
+                    output[line + x : line + x + n_pix] = _mix_buf[:n_pix]
                 else:
                     src = bytes(output[prevline + x : prevline + x + n_pix])
                     output[line + x : line + x + n_pix] = src.translate(mix_table)
@@ -163,7 +168,9 @@ def _decompress1(output, width, height, input_data):
 
             elif opcode == 3:  # Colour
                 n_pix = min(count, width - x)
-                output[line + x : line + x + n_pix] = bytes([colour2]) * n_pix
+                # Reuse single-byte repeat via slice of pre-built buffer
+                _colour_buf = bytes([colour2]) * width
+                output[line + x : line + x + n_pix] = _colour_buf[:n_pix]
                 count -= n_pix
                 x += n_pix
 
@@ -188,13 +195,13 @@ def _decompress1(output, width, height, input_data):
 
             elif opcode == 0xd:  # White
                 n_pix = min(count, width - x)
-                output[line + x : line + x + n_pix] = b'\xff' * n_pix
+                output[line + x : line + x + n_pix] = _white_buf[:n_pix]
                 count -= n_pix
                 x += n_pix
 
             elif opcode == 0xe:  # Black
                 n_pix = min(count, width - x)
-                output[line + x : line + x + n_pix] = bytes(n_pix)
+                output[line + x : line + x + n_pix] = _zero_buf[:n_pix]
                 count -= n_pix
                 x += n_pix
 
@@ -388,6 +395,11 @@ def _decompress3(output, width, height, input_data):
     fom_mask = 0
     mask = 0
     mixmask = 0
+    # Pre-allocated fill buffers
+    _zero_buf3 = b'\x00' * (width * 3)
+    _white_buf3 = b'\xff' * (width * 3)
+    # Per-channel XOR translate tables for 3bpp Mix
+    _mix_tables = [_get_mix_table(mix[0]), _get_mix_table(mix[1]), _get_mix_table(mix[2])]
 
     def read_pixel():
         nonlocal pos
@@ -409,6 +421,7 @@ def _decompress3(output, width, height, input_data):
             colour2 = read_pixel()
         elif opcode == 6 or opcode == 7:  # SetMix/Mix or SetMix/FillOrMix
             mix = read_pixel()
+            _mix_tables = [_get_mix_table(mix[0]), _get_mix_table(mix[1]), _get_mix_table(mix[2])]
             opcode -= 5
         elif opcode == 9:  # FillOrMix_1
             mask = 0x03
@@ -448,7 +461,7 @@ def _decompress3(output, width, height, input_data):
                 n_pix = min(count, width - x)
                 off = line + 3 * x
                 if prevline == 0:
-                    output[off : off + 3 * n_pix] = bytes(3 * n_pix)
+                    output[off : off + 3 * n_pix] = _zero_buf3[:3 * n_pix]
                 else:
                     poff = prevline + 3 * x
                     output[off : off + 3 * n_pix] = output[poff : poff + 3 * n_pix]
@@ -464,11 +477,21 @@ def _decompress3(output, width, height, input_data):
                 else:
                     poff = prevline + 3 * x
                     nbytes = 3 * n_pix
-                    src = output[poff : poff + nbytes]
-                    pat = mix_bytes * n_pix
-                    output[off : off + nbytes] = bytes(src).translate(
-                        bytes(i ^ mix[0] for i in range(256))
-                    ) if len(mix_bytes) == 1 else bytes(a ^ b for a, b in zip(src, pat))
+                    src = bytes(output[poff : poff + nbytes])
+                    # Per-channel translate via cached XOR tables
+                    t0, t1, t2 = _mix_tables
+                    ch0 = src[0::3]
+                    ch1 = src[1::3]
+                    ch2 = src[2::3]
+                    r0 = ch0.translate(t0)
+                    r1 = ch1.translate(t1)
+                    r2 = ch2.translate(t2)
+                    # Interleave channels back
+                    result = bytearray(nbytes)
+                    result[0::3] = r0
+                    result[1::3] = r1
+                    result[2::3] = r2
+                    output[off : off + nbytes] = result
                 count -= n_pix
                 x += n_pix
 
@@ -530,14 +553,14 @@ def _decompress3(output, width, height, input_data):
             elif opcode == 0xd:  # White
                 n_pix = min(count, width - x)
                 off = line + 3 * x
-                output[off : off + 3 * n_pix] = b'\xff\xff\xff' * n_pix
+                output[off : off + 3 * n_pix] = _white_buf3[:3 * n_pix]
                 count -= n_pix
                 x += n_pix
 
             elif opcode == 0xe:  # Black
                 n_pix = min(count, width - x)
                 off = line + 3 * x
-                output[off : off + 3 * n_pix] = bytes(3 * n_pix)
+                output[off : off + 3 * n_pix] = _zero_buf3[:3 * n_pix]
                 count -= n_pix
                 x += n_pix
 

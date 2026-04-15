@@ -44,24 +44,37 @@ class _BitReader:
         return self._total - self._pos + self._accum_bits
 
     def _refill(self, need):
-        """Ensure at least `need` bits in the accumulator."""
+        """Ensure at least `need` bits in the accumulator.
+        Loads up to 8 bytes per call to minimize Python loop overhead."""
         data = self._data
         byte_pos = self._pos >> 3
-        # Load up to 4 bytes at a time
-        while self._accum_bits < need:
-            if byte_pos < len(data):
-                self._accum = (self._accum << 8) | data[byte_pos]
-                byte_pos += 1
-                self._accum_bits += 8
-                self._pos += 8
+        data_len = len(data)
+        accum = self._accum
+        accum_bits = self._accum_bits
+        pos = self._pos
+        # Load multiple bytes in a tight loop
+        while accum_bits < need:
+            if byte_pos < data_len:
+                # Load up to 8 bytes at once (limited by available data)
+                load = min(8, data_len - byte_pos, (64 - accum_bits) >> 3)
+                if load <= 0:
+                    load = 1
+                for i in range(load):
+                    accum = (accum << 8) | data[byte_pos]
+                    byte_pos += 1
+                accum_bits += load * 8
+                pos += load * 8
             else:
-                self._accum <<= 8
-                self._accum_bits += 8
-                self._pos += 8
+                accum <<= 8
+                accum_bits += 8
+                pos += 8
+        self._accum = accum
+        self._accum_bits = accum_bits
+        self._pos = pos
 
     def read_bit(self):
         if self._accum_bits < 1:
-            self._refill(1)
+            self._refill(8)
         self._accum_bits -= 1
         return (self._accum >> self._accum_bits) & 1
 
@@ -75,10 +88,34 @@ class _BitReader:
         return val
 
     def count_leading_bits(self, target):
+        """Count consecutive bits matching `target`. Scans multiple bits at
+        a time within the accumulator to avoid per-bit Python overhead."""
         count = 0
         while self.remaining() > 0:
-            if self._accum_bits < 1:
-                self._refill(8)  # refill in larger chunks
+            if self._accum_bits < 8:
+                self._refill(16)
+            # Scan available bits in chunks — check 8 bits at a time
+            while self._accum_bits >= 8:
+                top8 = (self._accum >> (self._accum_bits - 8)) & 0xFF
+                expected = 0xFF if target else 0x00
+                if top8 == expected:
+                    count += 8
+                    self._accum_bits -= 8
+                else:
+                    # Scan remaining bits in this byte individually
+                    for _ in range(8):
+                        self._accum_bits -= 1
+                        bit = (self._accum >> self._accum_bits) & 1
+                        if bit == target:
+                            count += 1
+                        else:
+                            return count
+                    break
+            else:
+                continue
+            break
+        # Handle leftover bits (< 8) at end of stream
+        while self.remaining() > 0 and self._accum_bits > 0:
             self._accum_bits -= 1
             bit = (self._accum >> self._accum_bits) & 1
             if bit == target:

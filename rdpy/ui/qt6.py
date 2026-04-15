@@ -123,12 +123,13 @@ def RDPBitmapToQtImage(width, height, bitsPerPixel, isCompress, data):
         data = bytes(data)
 
     # RDPGFX path: data is already top-down BGRA — no flip needed.
-    # Use .copy() so the QImage owns its pixel data, avoiding lifetime
-    # issues when the Python buffer is garbage collected before the
-    # queued signal is processed on the Qt main thread.
+    # Keep a reference to the Python buffer on the QImage so it stays alive
+    # until the QImage is garbage collected — avoids the expensive .copy().
     if isCompress == 'gfx' and bitsPerPixel == 32:
-        image = QtGui.QImage(data, width, height, width * 4,
-                             QtGui.QImage.Format.Format_RGB32).copy()
+        buf = bytes(data)
+        image = QtGui.QImage(buf, width, height, width * 4,
+                             QtGui.QImage.Format.Format_RGB32)
+        image._buffer_ref = buf
         return image
 
     # Compressed data is already in top-down order from the RLE decoder.

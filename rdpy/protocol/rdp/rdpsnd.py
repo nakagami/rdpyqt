@@ -61,6 +61,13 @@ def _build_fade_table(n):
     return np.linspace(0.0, 1.0, n, dtype=np.float32)
 
 
+def _build_fade_table_i32(n):
+    """Return int32 gain table scaled to 0..32768 for fixed-point multiply."""
+    if n <= 1:
+        return np.array([32768], dtype=np.int32)
+    return np.linspace(0, 32768, n, dtype=np.int32)
+
+
 # Per-frame fade curves (contiguous float32)
 _FADE_IN = _build_fade_table(_FADE_FRAMES)            # 0→1
 _FADE_OUT = np.ascontiguousarray(_FADE_IN[::-1])      # 1→0, contiguous copy
@@ -70,25 +77,31 @@ _FADE_OUT = np.ascontiguousarray(_FADE_IN[::-1])      # 1→0, contiguous copy
 _FADE_IN_STEREO = np.ascontiguousarray(np.repeat(_FADE_IN, 2))
 _FADE_OUT_STEREO = np.ascontiguousarray(np.repeat(_FADE_OUT, 2))
 
+# Fixed-point int32 versions (avoids float32 conversion per fade)
+_FADE_IN_I32 = _build_fade_table_i32(_FADE_FRAMES)
+_FADE_OUT_I32 = np.ascontiguousarray(_FADE_IN_I32[::-1])
+_FADE_IN_STEREO_I32 = np.ascontiguousarray(np.repeat(_FADE_IN_I32, 2))
+_FADE_OUT_STEREO_I32 = np.ascontiguousarray(np.repeat(_FADE_OUT_I32, 2))
 
-def _apply_fade(data, stereo_gains):
+
+def _apply_fade(data, stereo_gains_i32):
     """Apply a pre-interleaved stereo gain array to the leading samples of
     *data* (bytearray or writable memoryview), modified in-place.
 
-    *stereo_gains* must be a contiguous float32 array with shape (2*n_frames,)
-    where gains are interleaved as [g_L0, g_R0, g_L1, g_R1, ...].
+    Uses int32 fixed-point arithmetic (gains scaled to 0..32768) to avoid
+    the int16→float32→int16 conversion chain.
+    *stereo_gains_i32* must be a contiguous int32 array with shape (2*n_frames,).
     Assumes 16-bit signed LE stereo (4 bytes per frame).
     """
-    n_samples = min(len(stereo_gains), len(data) // 2)
-    # np.frombuffer with count= avoids creating a slice copy of data
+    n_samples = min(len(stereo_gains_i32), len(data) // 2)
     arr = np.frombuffer(data, dtype='<i2', count=n_samples)
-    work = arr.astype(np.float32)       # int16 → float32 working copy
-    work *= stereo_gains[:n_samples]    # in-place gain application
+    # int16 * int32 → int32, then shift right by 15 (divide by 32768)
+    work = arr.astype(np.int32)
+    work *= stereo_gains_i32[:n_samples]
+    work >>= 15
     np.clip(work, -32768, 32767, out=work)
     if arr.flags.writeable:
-        # arr is a writable view into data (bytearray / writable memoryview):
-        # write back without tobytes() – no extra allocation or copy.
-        arr[:] = work
+        arr[:] = work.astype(np.int16)
     else:
         data[:n_samples * 2] = work.astype('<i2').tobytes()
 
@@ -157,7 +170,7 @@ class _AudioRingBuffer:
                             self._read_pos = end    # O(1) – no memmove
 
                             if self._was_underrun:
-                                _apply_fade(chunk, _FADE_IN_STEREO)
+                                _apply_fade(chunk, _FADE_IN_STEREO_I32)
                                 self._was_underrun = False
 
                             if self._available() == 0:
@@ -165,7 +178,7 @@ class _AudioRingBuffer:
                                     # fade applies to the START of data,
                                     # so pass a view of the TAIL
                                     memoryview(chunk)[-_FADE_FRAMES * 4:],
-                                    _FADE_OUT_STEREO,
+                                    _FADE_OUT_STEREO_I32,
                                 )
                                 # Mark underrun so the NEXT read that has
                                 # data applies a fade-in.  Without this, new

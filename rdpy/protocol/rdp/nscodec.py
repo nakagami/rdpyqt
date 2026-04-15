@@ -44,7 +44,7 @@ def _nrle_decode(data, original_size):
             end = min(out_pos + run_len, original_size)
             fill_len = end - out_pos
             if fill_len > 0:
-                output[out_pos:end] = bytes([value]) * fill_len
+                output[out_pos:end] = bytes((value,)) * fill_len
             out_pos = end
             left -= run_len
         else:
@@ -131,12 +131,14 @@ def decode_nscodec(data, width, height):
     co_row_width = (temp_width >> 1) if chroma_sub > 0 else width
 
     if chroma_sub > 0:
+        # Pre-compute >>1 arrays once, avoid redundant per-pixel recomputation
+        py_half = np.arange(height, dtype=np.int32) >> 1
+        px_half = np.arange(width, dtype=np.int32) >> 1
         py_arr = np.arange(height, dtype=np.int32)
         px_arr = np.arange(width, dtype=np.int32)
 
-        # Use broadcasting instead of meshgrid for less memory/CPU
         y_flat_idx = (py_arr[:, np.newaxis] * y_row_width + px_arr[np.newaxis, :]).ravel()
-        co_flat_idx = ((py_arr[:, np.newaxis] >> 1) * co_row_width + (px_arr[np.newaxis, :] >> 1)).ravel()
+        co_flat_idx = (py_half[:, np.newaxis] * co_row_width + px_half[np.newaxis, :]).ravel()
 
         np.clip(y_flat_idx, 0, len(y_plane) - 1, out=y_flat_idx)
         np.clip(co_flat_idx, 0, len(co_plane) - 1, out=co_flat_idx)
@@ -149,22 +151,23 @@ def decode_nscodec(data, width, height):
         co_raw = co_np[:n_pixels].astype(np.int32)
         cg_raw = cg_np[:n_pixels].astype(np.int32)
 
-    # Shift and truncate to int8 (signed byte)
-    co_val = ((co_raw << shift) & 0xFF)
+    # YCoCg → RGB conversion in a single vectorized pass.
+    # Use int16 to avoid large int32 intermediates while handling the ±128 range.
+    co_val = ((co_raw << shift) & 0xFF).astype(np.int16)
     co_val[co_val >= 128] -= 256
-    cg_val = ((cg_raw << shift) & 0xFF)
+    cg_val = ((cg_raw << shift) & 0xFF).astype(np.int16)
     cg_val[cg_val >= 128] -= 256
 
-    rv = y_vals + co_val - cg_val
-    gv = y_vals + cg_val
-    bv = y_vals - co_val - cg_val
+    y16 = y_vals.astype(np.int16)
+    bv = y16 - co_val - cg_val
+    gv = y16 + cg_val
+    rv = y16 + co_val - cg_val
 
-    np.clip(rv, 0, 255, out=rv)
-    np.clip(gv, 0, 255, out=gv)
-    np.clip(bv, 0, 255, out=bv)
-
-    # Assemble BGRA output
+    # Assemble BGRA output — clip and assign in one pass per channel
     pixels = np.empty((n_pixels, 4), dtype=np.uint8)
+    np.clip(bv, 0, 255, out=bv)
+    np.clip(gv, 0, 255, out=gv)
+    np.clip(rv, 0, 255, out=rv)
     pixels[:, 0] = bv
     pixels[:, 1] = gv
     pixels[:, 2] = rv

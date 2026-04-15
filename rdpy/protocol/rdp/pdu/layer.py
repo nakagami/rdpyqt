@@ -702,11 +702,14 @@ class Client(PDULayer):
         """
         @summary: Parse surface commands from fast path, decode bitmaps (NSCodec),
         deliver them to the display, and acknowledge frame markers.
+        Heavy codec decodes (NSCodec) are offloaded to the Twisted thread
+        pool so the reactor stays responsive for audio and input.
         @param surfData: raw bytes of surface command data
         @see: MS-RDPBCGR 2.2.9.1.2.1.10
         """
         import struct
         from rdpy.protocol.rdp.nscodec import decode_nscodec
+        from twisted.internet import reactor, threads
 
         offset = 0
         while offset + 2 <= len(surfData):
@@ -756,41 +759,53 @@ class Client(PDULayer):
                 bitmapData = surfData[offset:offset + bitmapDataLength]
                 offset += bitmapDataLength
 
-                pixels = None
-                outBpp = bpp
                 if codecID == 0:
-                    # Uncompressed (top-down)
-                    pixels = bitmapData
-                    outBpp = bpp
+                    # Uncompressed (top-down) — lightweight, deliver inline
+                    if hasattr(self._listener, '_onGfxBitmap'):
+                        self._listener._onGfxBitmap(
+                            destLeft, destTop, destRight, destBottom,
+                            width, height, bpp, 'gfx', bitmapData)
+
                 elif codecID == 1:
-                    # NSCodec decodes to top-down BGRA, but empirically the
-                    # output needs to be flipped vertically before passing to Qt
-                    # (mirrors grdp's explicit vertical flip after decodeNSCodec).
-                    raw = decode_nscodec(bytes(bitmapData), width, height)
-                    outBpp = 32
-                    if raw is not None:
-                        import numpy as _np
-                        arr = _np.frombuffer(raw, dtype=_np.uint8).reshape(height, width, 4)
-                        pixels = arr[::-1].tobytes()
-                    else:
-                        pixels = None
+                    # NSCodec — heavy decode offloaded to thread pool
+                    self._decodeNSCodecAsync(
+                        bytes(bitmapData), width, height,
+                        destLeft, destTop, destRight, destBottom)
                 else:
                     log.warning("Unsupported surface codec: %d" % codecID)
                     continue
-
-                if pixels is None:
-                    continue
-
-                # Pass isCompress='gfx' so RDPBitmapToQtImage calls .copy() on the
-                # QImage, making Qt own the pixel buffer and avoiding cross-thread
-                # dangling-pointer issues with Python-managed buffers.
-                if hasattr(self._listener, '_onGfxBitmap'):
-                    self._listener._onGfxBitmap(
-                        destLeft, destTop, destRight, destBottom,
-                        width, height, outBpp, 'gfx', pixels)
             else:
                 log.debug("Unknown surface command type: %s" % hex(cmdType))
                 break
+
+    def _decodeNSCodecAsync(self, bitmapData, width, height,
+                            destLeft, destTop, destRight, destBottom):
+        """Decode NSCodec bitmap in thread pool and deliver result on reactor."""
+        from twisted.internet import threads
+        import numpy as _np
+        from rdpy.protocol.rdp.nscodec import decode_nscodec
+
+        def _decode():
+            raw = decode_nscodec(bitmapData, width, height)
+            if raw is None:
+                return None
+            arr = _np.frombuffer(raw, dtype=_np.uint8).reshape(height, width, 4)
+            return arr[::-1].tobytes()
+
+        def _onResult(pixels):
+            if pixels is None:
+                return
+            if hasattr(self._listener, '_onGfxBitmap'):
+                self._listener._onGfxBitmap(
+                    destLeft, destTop, destRight, destBottom,
+                    width, height, 32, 'gfx', pixels)
+
+        def _onError(failure):
+            log.warning("NSCodec decode error: %s" % failure.getErrorMessage())
+
+        d = threads.deferToThread(_decode)
+        d.addCallback(_onResult)
+        d.addErrback(_onError)
     
     def _sendFrameAcknowledge(self, frameId):
         """
