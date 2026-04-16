@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rdpyqt"
-version = "2.1.5"
+version = "2.1.6"
 description = "Remote Desktop Protocol client"
 readme = "README.md"
 license = { text = "GPL-3.0-or-later" }
