@@ -101,7 +101,8 @@ RDPGFX_CAPVERSION_104 = 0x000A0400
 # RDPGFX capability flags
 RDPGFX_CAPS_FLAG_THINCLIENT = 0x00000001
 RDPGFX_CAPS_FLAG_SMALL_CACHE = 0x00000002
-RDPGFX_CAPS_FLAG_AVC_DISABLED = 0x00000020
+RDPGFX_CAPS_FLAG_AVC420_ENABLED = 0x00000010  # v8.1: explicitly enable AVC420
+RDPGFX_CAPS_FLAG_AVC_DISABLED = 0x00000020    # v10+: disable AVC
 
 # Frame drop: skip heavy codec decode when frames arrive faster than decode.
 # If time since last END_FRAME exceeds this interval (seconds), skip heavy
@@ -1529,18 +1530,27 @@ class DrdynvcLayer(LayerAutomata):
     def _sendRdpgfxCapsAdvertise(self, channelId, cbId):
         """Send RDPGFX CAPS_ADVERTISE PDU (MS-RDPEGFX 2.2.3)
 
-        When PyAV is available, advertise v10 (AVC444) and v8.0 (AVC420)
-        capsets without THINCLIENT flag.
-        When PyAV is unavailable, advertise v8.0 only with THINCLIENT flag,
-        matching grdp's non-h264 advertisement.  This causes the server to
-        send Planar (codecId 0x0004) instead of ClearCodec (0x0008)."""
+        Following FreeRDP's approach: advertise multiple cap versions so the
+        server can pick the best one it supports.
+
+        When PyAV is available:
+          - v10  : AVC444 + AVC420 (AVC enabled by default unless AVC_DISABLED)
+          - v8.1 : AVC420 via explicit AVC420_ENABLED flag
+          - v8.0 : baseline fallback (no AVC)
+        When PyAV is unavailable:
+          - v8.0 only with AVC_DISABLED flag → server uses Planar codec."""
         capsSets = []
         if avc_module.is_available():
             # v10 capset — preferred; enables AVC444 + AVC420
             capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_10, 4,
                                         RDPGFX_CAPS_FLAG_THINCLIENT |
                                         RDPGFX_CAPS_FLAG_SMALL_CACHE))
-            # v8.0 capset — fallback
+            # v8.1 capset — H.264/AVC420 via explicit flag (FreeRDP approach)
+            capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_81, 4,
+                                        RDPGFX_CAPS_FLAG_THINCLIENT |
+                                        RDPGFX_CAPS_FLAG_SMALL_CACHE |
+                                        RDPGFX_CAPS_FLAG_AVC420_ENABLED))
+            # v8.0 capset — baseline fallback (no AVC support)
             capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_8, 4,
                                         RDPGFX_CAPS_FLAG_THINCLIENT |
                                         RDPGFX_CAPS_FLAG_SMALL_CACHE))
@@ -1562,7 +1572,7 @@ class DrdynvcLayer(LayerAutomata):
 
         self._sendDvcData(channelId, cbId, gfxPdu)
         if avc_module.is_available():
-            log.debug("RDPGFX: sent CAPS_ADVERTISE (v10+v8.0, AVC enabled)")
+            log.debug("RDPGFX: sent CAPS_ADVERTISE (v10+v8.1+v8.0, AVC enabled)")
         else:
             log.debug("RDPGFX: sent CAPS_ADVERTISE (v8.0 only, THINCLIENT, AVC disabled)")
 
