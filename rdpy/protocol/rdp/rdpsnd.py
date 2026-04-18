@@ -42,10 +42,12 @@ import rdpy.core.log as log
 # Prebuffer duration in seconds.  The sink is not started until this much
 # PCM data has accumulated.  This keeps the ring buffer ahead of the Qt
 # audio thread so that normal per-packet jitter (~±25 ms) never causes an
-# underrun.  500 ms ≈ 2–3 standard RDP wave packets at 44100 Hz stereo
-# 16-bit; it adds a one-time latency at the start of a stream but prevents
-# the periodic crackling that occurs when the buffer runs dry every packet.
-_AUDIO_PREBUF_SECONDS = 0.5
+# underrun.  Standard RDP wave packets are ~186 ms at 44100 Hz stereo
+# 16-bit (32768 bytes), so ~120 ms of prebuffer plus the in-flight chunk
+# absorbs the observed jitter while keeping audio close to the video
+# (each 100 ms of prebuffer adds 100 ms of A/V offset on streams such as
+# YouTube, where the server emits picture and sound in lockstep).
+_AUDIO_PREBUF_SECONDS = 0.12
 
 # Crossfade length in sample frames.  At 44100 Hz stereo 16-bit
 # (frame = 4 bytes), 128 frames ≈ 2.9 ms — short enough to be
@@ -679,7 +681,7 @@ class RdpsndLayer(LayerAutomata):
         # Accumulating ~500 ms ensures the ring buffer stays ahead of the
         # audio thread even when packet arrival jitter is ±25 ms.
         self._audioPrebufBytes = max(
-            32768,
+            8192,
             int(fmt.avg_bytes_per_sec * _AUDIO_PREBUF_SECONDS),
         )
         self._pendingSinkFmt = fmt
@@ -722,8 +724,12 @@ class RdpsndLayer(LayerAutomata):
         ringBuf.open(QIODevice.OpenModeFlag.ReadOnly)
 
         sink = QAudioSink(device, audioFmt)
-        # 2-second hardware buffer provides headroom for Qt event-loop jitter.
-        sink.setBufferSize(fmt.avg_bytes_per_sec * 2)
+        # Keep the hardware buffer small (~300 ms) so Qt does not pre-fill
+        # the device buffer with hundreds of milliseconds of audio, which
+        # on macOS Core Audio translates directly into A/V lag (audio
+        # arriving at the speaker noticeably later than the matching video
+        # frame).  300 ms is well above any observed Qt event-loop jitter.
+        sink.setBufferSize(max(8192, fmt.avg_bytes_per_sec * 3 // 10))
         sink.start(ringBuf)   # pull mode — Qt audio thread calls readData()
         self._audioSink = sink
         # Set _audioRingBuffer last: the Twisted thread polls this to decide
@@ -749,7 +755,10 @@ class RdpsndLayer(LayerAutomata):
         now = time.monotonic()
         if self._lastPlayTime > 0:
             gap = now - self._lastPlayTime
-            if gap > 0.050:
+            # Standard RDP wave packets arrive every ~186 ms (32768 bytes
+            # of PCM 44100 Hz stereo 16-bit), so only flag noticeably
+            # longer gaps as a real network/server stall.
+            if gap > 0.300:
                 log.debug("RDPSND: audio gap %.0fms" % (gap * 1000,))
         self._lastPlayTime = now
         if self._audioGain != 1.0:
