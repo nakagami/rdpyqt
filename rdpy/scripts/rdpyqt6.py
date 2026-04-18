@@ -22,10 +22,26 @@ example of use rdpy as rdp client
 
 import sys, getopt, socket
 import getpass
-import threading
 import traceback
 
 from PyQt6.QtWidgets import QApplication
+
+# IMPORTANT: order matters here.
+#
+# 1) Create the QApplication *before* installing qreactor so that qreactor
+#    binds to our GUI-capable QApplication instead of constructing its own
+#    headless QCoreApplication (which would prevent the GUI from running and
+#    cause the program to appear "blocked").
+#
+# 2) Install qreactor *before* importing any rdpy module: rdpy.ui.qt6 does
+#    ``from twisted.internet import reactor`` at module load time, which would
+#    otherwise install the default selector reactor and make qreactor.install()
+#    fail with ReactorAlreadyInstalledError.
+_app = QApplication(sys.argv)
+
+import qreactor
+qreactor.install()
+
 from rdpy.ui.qt6 import RDPClientQt, QRemoteDesktop, _get_qt_invoker
 from rdpy.protocol.rdp import rdp
 from rdpy.core.error import RDPSecurityNegoFail
@@ -277,8 +293,10 @@ def main():
     else:
         ip, port = args[0], "3389"
     
-    app = QApplication(sys.argv)
-    
+    # QApplication is already created at module load time (so qreactor could
+    # bind to it).  Reuse that instance here.
+    app = _app
+
     from twisted.internet import reactor
 
     log.info("keyboard type set to %s" % keyboardType)
@@ -300,16 +318,10 @@ def main():
 
     reactor.connectTCP(ip, int(port), factory)
 
-    # Run the Twisted reactor on a background thread so it never blocks Qt's
-    # event loop.  installSignalHandlers=False is required when the reactor
-    # is not on the main thread.
-    t = threading.Thread(
-        target=reactor.run,
-        kwargs={'installSignalHandlers': False},
-        daemon=True,
-        name='twisted-reactor',
-    )
-    t.start()
+    # Drive the Twisted reactor from the Qt event loop.  reactor.runReturn()
+    # returns immediately; the Qt main loop then services both Qt events and
+    # Twisted I/O on the same (main) thread.
+    reactor.runReturn()
 
     app.exec()
 
