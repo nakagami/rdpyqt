@@ -113,6 +113,7 @@ class AvcDecoder:
         self._hw_error_count = 0     # consecutive non-IDR decode errors
         self._hw_reset_count = 0     # total hard resets (for software fallback)
         self._prepend_sps_next_idr = False  # inject SPS+PPS before next IDR
+        self.on_hard_reset = None    # callback() invoked after each hard reset
         self._init_decoder()
 
     def _init_decoder(self):
@@ -164,15 +165,17 @@ class AvcDecoder:
         self._decode_count = 0
         self._null_count = 0
 
-    def _cache_sps_pps(self, h264_data):
-        """Extract and cache SPS/PPS NAL units from an Annex B bitstream.
+    def _parse_and_cache_nals(self, h264_data):
+        """Single-pass NAL unit scanner: return NAL type list and update SPS/PPS cache.
 
-        Called whenever the incoming bitstream contains NAL types 7 (SPS) or
-        8 (PPS).  The cached bytes are used by _hard_reset() to seed a freshly
-        created decoder so it can decode the server's subsequent bare IDRs.
+        Replaces the previous two-pass design (_parse_nal_types + _cache_sps_pps).
+        SPS (type 7) and PPS (type 8) are extracted and stored only when their
+        content changes, avoiding redundant cache updates when the server includes
+        an unchanged PPS in every P-frame.
         """
         data = bytes(h264_data) if not isinstance(h264_data, bytes) else h264_data
         n = len(data)
+        nal_types = []
         i = 0
         while i < n:
             if i + 4 <= n and data[i:i+4] == b'\x00\x00\x00\x01':
@@ -185,24 +188,28 @@ class AvcDecoder:
             if i + sc_len >= n:
                 break
             nal_type = data[i + sc_len] & 0x1F
-            if nal_type not in (7, 8):
-                i += sc_len + 1
-                continue
-            # Find end: next start code or end of data
-            j = i + sc_len + 1
-            while j < n:
-                if (j + 4 <= n and data[j:j+4] == b'\x00\x00\x00\x01') or \
-                   (j + 3 <= n and data[j:j+3] == b'\x00\x00\x01'):
-                    break
-                j += 1
-            nal_bytes = data[i:j]
-            if nal_type == 7:
-                self._sps_nal = nal_bytes
-                log.debug("AVC: cached SPS NAL (%d bytes)" % len(nal_bytes))
+            nal_types.append(nal_type)
+            if nal_type in (7, 8):
+                # Find end of this NAL: next start code or end of data
+                j = i + sc_len + 1
+                while j < n:
+                    if (j + 4 <= n and data[j:j+4] == b'\x00\x00\x00\x01') or \
+                       (j + 3 <= n and data[j:j+3] == b'\x00\x00\x01'):
+                        break
+                    j += 1
+                nal_bytes = data[i:j]
+                if nal_type == 7:
+                    if nal_bytes != self._sps_nal:
+                        self._sps_nal = nal_bytes
+                        log.debug("AVC: cached SPS NAL (%d bytes)" % len(nal_bytes))
+                else:
+                    if nal_bytes != self._pps_nal:
+                        self._pps_nal = nal_bytes
+                        log.debug("AVC: cached PPS NAL (%d bytes)" % len(nal_bytes))
+                i = j
             else:
-                self._pps_nal = nal_bytes
-                log.debug("AVC: cached PPS NAL (%d bytes)" % len(nal_bytes))
-            i = j
+                i += sc_len + 1
+        return nal_types
 
     def _hard_reset(self):
         """Destroy and recreate the decoder after a persistent hardware error.
@@ -245,6 +252,12 @@ class AvcDecoder:
             self._prepend_sps_next_idr = True
             log.debug("AVC: will inject cached SPS+PPS (%d+%d bytes) before next IDR"
                       % (len(self._sps_nal), len(self._pps_nal)))
+
+        # Notify the caller (e.g. RDPGFX layer) so it can immediately request
+        # a new IDR from the server.  The fresh decoder has no reference frames,
+        # so any arriving P-frames will fail until the server sends an IDR.
+        if self.on_hard_reset is not None:
+            self.on_hard_reset()
 
     # -----------------------------------------------------------------
     # AVC420 bitmap stream (MS-RDPEGFX 2.2.4.4)
@@ -364,23 +377,6 @@ class AvcDecoder:
 
     _NAL_NAMES = {1: 'P', 5: 'IDR', 6: 'SEI', 7: 'SPS', 8: 'PPS', 9: 'AUD'}
 
-    @staticmethod
-    def _parse_nal_types(h264_data):
-        """Extract NAL unit type numbers from an Annex-B bitstream."""
-        nal_types = []
-        i = 0
-        end = len(h264_data) - 4
-        while i < end:
-            if h264_data[i:i+3] == b'\x00\x00\x01':
-                nal_types.append(h264_data[i+3] & 0x1F)
-                i += 4
-            elif h264_data[i:i+4] == b'\x00\x00\x00\x01':
-                nal_types.append(h264_data[i+4] & 0x1F)
-                i += 5
-            else:
-                i += 1
-        return nal_types
-
     def _decode_h264(self, h264_data):
         """Decode H.264 bitstream and return the decoded frame (av.VideoFrame) or None.
 
@@ -409,12 +405,9 @@ class AvcDecoder:
 
         self._decode_count += 1
 
-        nal_types = self._parse_nal_types(h264_data)
+        # Single-pass: collect NAL types and update SPS/PPS cache if changed
+        nal_types = self._parse_and_cache_nals(h264_data)
         has_idr = 5 in nal_types
-
-        # Cache SPS/PPS whenever the server includes them (session start + key events)
-        if 7 in nal_types or 8 in nal_types:
-            self._cache_sps_pps(h264_data)
 
         # Log NAL types for early frames and every IDR
         if self._decode_count <= 5 or has_idr:
@@ -450,6 +443,14 @@ class AvcDecoder:
                 self._null_count += 1
                 log.debug("AVC: decode #%d returned no frame (null_count=%d, h264Len=%d)" %
                          (self._decode_count, self._null_count, len(h264_data)))
+                # NOTE: We deliberately do NOT call flush_buffers() here.
+                # On VideoToolbox, flush_buffers() while the decoder is silent
+                # pushes it into a hard error state where every subsequent
+                # avcodec_send_packet() raises AVERROR_UNKNOWN, triggering
+                # _hard_reset().  After hard reset, Windows RDPGFX never sends
+                # a new IDR (only P-frames), so the fresh decoder is stuck
+                # forever with InvalidDataError.  Better to wait silently for
+                # the server's next IDR (which arrives on scene changes).
             else:
                 self._null_count = 0
                 self._hw_error_count = 0
@@ -480,7 +481,7 @@ class AvcDecoder:
 
         return None
 
-    _HW_ERROR_THRESHOLD = 5  # consecutive non-IDR errors before hard reset
+    _HW_ERROR_THRESHOLD = 5   # consecutive non-IDR errors before hard reset
 
     def _flush_and_retry_idr(self, packet):
         """Flush decoder buffers and retry an IDR packet after an error.

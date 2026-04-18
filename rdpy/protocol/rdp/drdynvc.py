@@ -893,12 +893,27 @@ class DrdynvcLayer(LayerAutomata):
                 return None
             try:
                 self._avcDecoder = avc_module.AvcDecoder()
+                self._avcDecoder.on_hard_reset = self._onAvcHardReset
                 log.debug("RDPGFX: AVC decoder initialized (hardware=%s)" %
                          self._avcDecoder.is_hardware)
             except Exception as e:
                 log.warning("RDPGFX: failed to initialize AVC decoder: %s" % e)
                 return None
         return self._avcDecoder
+
+    def _onAvcHardReset(self):
+        """Called by AvcDecoder immediately after a hard reset.
+
+        A hard reset destroys the decoder's reference frames; the server must
+        send a new IDR before P-frames can be decoded.  We bypass the normal
+        freeze-detection threshold and request a full-screen refresh right away
+        so the server sends an IDR as soon as possible.
+        """
+        log.debug("RDPGFX: AVC hard reset — requesting immediate server refresh")
+        self._avcLastRefreshTime = 0.0  # clear cooldown so request goes through
+        if self._requestRefreshCallback is not None:
+            self._requestRefreshCallback()
+            self._avcLastRefreshTime = time.monotonic()
 
     # Seconds of no AVC output before requesting a full-screen refresh from
     # the server.  Raised from 1.5s to 30s: frequent requestFullRefresh calls
