@@ -14,6 +14,10 @@ else:
                     ["rdpy/protocol/rdp/rlgr1_decode.pyx"],
                     include_dirs=[__import__('numpy').get_include()],
                 ),
+                Extension(
+                    "rdpy.protocol.rdp.zgfx",
+                    ["rdpy/protocol/rdp/zgfx.pyx"],
+                ),
             ],
             compiler_directives={
                 "language_level": "3",
