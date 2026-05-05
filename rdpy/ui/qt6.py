@@ -606,7 +606,8 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
             xor_arr = np.frombuffer(xorMask, dtype=np.uint8)
             needed = height * xor_stride
             if len(xor_arr) < needed:
-                xor_arr = np.pad(xor_arr, (0, needed - len(xor_arr)))
+                xor_arr = np.concatenate(
+                    [xor_arr, np.zeros(needed - len(xor_arr), dtype=np.uint8)])
             xor_2d = xor_arr[:needed].reshape(height, xor_stride)[::-1]
             buf = xor_2d.reshape(-1).copy()
             # Reshape as (H, W, 4) for vectorized alpha processing

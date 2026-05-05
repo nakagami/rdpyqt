@@ -5,6 +5,7 @@
 #
 
 import struct
+import functools
 import numpy as np
 import rdpy.core.log as log
 
@@ -19,6 +20,9 @@ PROG_WBT_TILE_FIRST = 0xCCC6
 PROG_WBT_TILE_UPGRADE = 0xCCC7
 
 RFX_TILE_SIZE = 64
+
+# Pre-built index array for full 64×64 tiles — avoids np.arange() per tile call.
+_FULL_TILE_COEFF_IDX = np.arange(RFX_TILE_SIZE * RFX_TILE_SIZE, dtype=np.int32)
 
 # Sub-band sizes in RLGR decode order:
 # HL1(1024) LH1(1024) HH1(1024) HL2(256) LH2(256) HH2(256) HL3(64) LH3(64) HH3(64) LL3(64)
@@ -294,13 +298,26 @@ class ProgQuant:
         self.quality = data[15]
 
 
+@functools.lru_cache(maxsize=128)
+def _make_shift_arr(hl1, lh1, hh1, hl2, lh2, hh2, hl3, lh3, hh3, ll3):
+    """Build and cache the per-coefficient shift array for dequantization.
+
+    Called once per unique set of quantization values (typically constant within
+    a session) and then reused from the cache on every subsequent tile decode.
+    """
+    factors = np.array([hl1, lh1, hh1, hl2, lh2, hh2, hl3, lh3, hh3, ll3],
+                       dtype=np.int16)
+    shifts = np.maximum(factors - 1, 0)
+    if not np.any(shifts > 0):
+        return None
+    return np.repeat(shifts, _SUBBAND_SIZES)
+
+
 def _dequantize(coeffs, q):
     """Apply dequantization (left-shift by factor-1) per subband — vectorized."""
-    factors = np.array([q.HL1, q.LH1, q.HH1, q.HL2, q.LH2, q.HH2,
-                        q.HL3, q.LH3, q.HH3, q.LL3], dtype=np.int16)
-    shifts = np.maximum(factors - 1, 0)
-    if np.any(shifts > 0):
-        shift_arr = np.repeat(shifts, _SUBBAND_SIZES)
+    shift_arr = _make_shift_arr(q.HL1, q.LH1, q.HH1, q.HL2, q.LH2, q.HH2,
+                                q.HL3, q.LH3, q.HH3, q.LL3)
+    if shift_arr is not None:
         coeffs <<= shift_arr
 
 
@@ -421,16 +438,17 @@ def _place_tile_abs(y_coeffs, cb_coeffs, cr_coeffs, tile_x, tile_y, output, out_
 
     # Build flat index into 64-wide coefficient arrays
     if tile_w == RFX_TILE_SIZE and tile_h == RFX_TILE_SIZE:
-        # Full tile — use contiguous range (avoids meshgrid overhead)
-        coeff_idx = np.arange(RFX_TILE_SIZE * RFX_TILE_SIZE, dtype=np.int32)
+        # Full tile — direct contiguous astype() is faster than fancy indexing
+        y_arr = y_coeffs.astype(np.int32)
+        cb_arr = cb_coeffs.astype(np.int32)
+        cr_arr = cr_coeffs.astype(np.int32)
     else:
         rows = np.arange(tile_h, dtype=np.int32)
         cols = np.arange(tile_w, dtype=np.int32)
         coeff_idx = (rows[:, np.newaxis] * RFX_TILE_SIZE + cols[np.newaxis, :]).ravel()
-
-    y_arr = y_coeffs[coeff_idx].astype(np.int32)
-    cb_arr = cb_coeffs[coeff_idx].astype(np.int32)
-    cr_arr = cr_coeffs[coeff_idx].astype(np.int32)
+        y_arr = y_coeffs[coeff_idx].astype(np.int32)
+        cb_arr = cb_coeffs[coeff_idx].astype(np.int32)
+        cr_arr = cr_coeffs[coeff_idx].astype(np.int32)
 
     # ICT (BT.601) inverse colour transform
     y_scaled = (y_arr + 4096) << 16

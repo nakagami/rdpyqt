@@ -916,13 +916,23 @@ class DrdynvcLayer(LayerAutomata):
             self._avcLastRefreshTime = time.monotonic()
 
     # Seconds of no AVC output before requesting a full-screen refresh from
-    # the server.  Raised from 1.5s to 30s: frequent requestFullRefresh calls
-    # were causing the server to close the audio channel (RDPSND CLOSE) as a
-    # side effect.  Most servers send IDR frames naturally during video
-    # transitions; waiting longer avoids unnecessary disruption.
-    _AVC_FREEZE_THRESHOLD = 30.0
+    # the server.  Previous value was 1.5s (too aggressive: frequent
+    # requestFullRefresh calls were causing the server to close the RDPSND
+    # audio channel as a side effect).  Raised to 30s, but that is too slow
+    # for video playback: a YouTube freeze lasting ~2s never triggers recovery.
+    # Compromise at 5s: long enough to avoid false positives during startup and
+    # normal scene transitions, short enough to recover promptly.
+    _AVC_FREEZE_THRESHOLD = 5.0
     # Minimum seconds between consecutive refresh requests (cooldown).
-    _AVC_REFRESH_COOLDOWN = 60.0
+    # Reduced from 60s to 15s: allows faster re-attempt when the server
+    # does not respond to the first request with an IDR frame.
+    _AVC_REFRESH_COOLDOWN = 15.0
+    # Also trigger recovery when this many consecutive null frames accumulate
+    # and at least _AVC_FREEZE_MIN_SECS have passed (guards against fast
+    # streams where 5 s elapses before enough null frames pile up, *and*
+    # against startup noise where a few null frames are normal).
+    _AVC_NULL_FRAME_THRESHOLD = 30
+    _AVC_FREEZE_MIN_SECS = 1.0
 
     def _renderAvc420(self, surfaceId, left, top, width, height, data):
         """Decode and render AVC420 (H.264 YUV420) bitmap data."""
@@ -954,10 +964,11 @@ class DrdynvcLayer(LayerAutomata):
                 self._onAvcNoOutput()
                 return
             if not bgra_bytes:
-                # b"" sentinel: LC=2 chroma-only frame — codec is alive, no
-                # luma pixels to display.  Update the success timestamp so the
-                # freeze-detection timer is not advanced spuriously.
-                self._avcLastSuccessTime = time.monotonic()
+                # b"" sentinel: LC=2 chroma-only frame.  Do NOT update
+                # _avcLastSuccessTime here: chroma frames keep arriving even
+                # when the luma decoder is frozen (as seen with YouTube videos).
+                # Updating the timestamp would continuously reset frozen_for,
+                # preventing freeze detection from ever triggering.
                 return
             self._avcLastSuccessTime = time.monotonic()
             self._blitToSurface(surfaceId, left, top, width, height, bgra_bytes)
@@ -970,35 +981,40 @@ class DrdynvcLayer(LayerAutomata):
     def _onAvcNoOutput(self):
         """Called when an AVC frame produces no output.
 
-        If the decoder has been silent for longer than _AVC_FREEZE_THRESHOLD
-        seconds (and we have previously decoded at least one frame), the
-        decoder is stalled because the H.264 reference chain is broken.
-        We flush its buffers (preserving SPS/PPS context) and ask the server
-        for a refresh.  Some servers respond with a new IDR; others send bare
-        IDRs on their own schedule.  Either way, the flushed decoder (with
-        SPS intact) is ready to decode the next IDR immediately.
+        Triggers a decoder flush and server refresh request when either:
+          (a) the decoder has been silent for longer than _AVC_FREEZE_THRESHOLD
+              seconds, OR
+          (b) _AVC_NULL_FRAME_THRESHOLD consecutive null frames have accumulated
+              AND at least _AVC_FREEZE_MIN_SECS have elapsed since the last
+              successful decode (guards against normal startup noise).
+
+        Both checks are subject to _AVC_REFRESH_COOLDOWN to avoid spamming
+        the server, which can cause side-effects such as RDPSND channel closure.
         """
         if self._avcLastSuccessTime == 0.0:
             return  # No successful decode yet; normal during startup
 
         now = time.monotonic()
         frozen_for = now - self._avcLastSuccessTime
-        if frozen_for < self._AVC_FREEZE_THRESHOLD:
-            return  # Too soon; might just be normal codec buffering
+
+        null_count = self._avcDecoder.null_count if self._avcDecoder else 0
+        count_triggered = (null_count >= self._AVC_NULL_FRAME_THRESHOLD and
+                           frozen_for >= self._AVC_FREEZE_MIN_SECS)
+        time_triggered = frozen_for >= self._AVC_FREEZE_THRESHOLD
+
+        if not (count_triggered or time_triggered):
+            return
 
         if now - self._avcLastRefreshTime < self._AVC_REFRESH_COOLDOWN:
             return  # Cooldown: avoid spamming the server
 
-        log.debug("RDPGFX: AVC frozen for %.1fs, flushing decoder and requesting refresh"
-                  % frozen_for)
+        log.debug("RDPGFX: AVC frozen for %.1fs (null_count=%d), "
+                  "flushing decoder and requesting refresh"
+                  % (frozen_for, null_count))
         self._avcLastRefreshTime = now
 
-        # Flush (not destroy) the decoder: this clears buffered frames and the
-        # broken reference chain, but KEEPS the codec context (SPS/PPS intact).
-        # The server's next bare IDR (sent without SPS, since the client already
-        # received SPS at session start) can only be decoded if SPS is cached.
-        # Destroying the decoder here causes InvalidDataError on every subsequent
-        # frame because the new decoder has no SPS context.
+        # Flush (not destroy) the decoder: resets null-frame counters while
+        # keeping SPS/PPS context intact so the fresh IDR can be decoded.
         if self._avcDecoder is not None:
             self._avcDecoder.flush()
 

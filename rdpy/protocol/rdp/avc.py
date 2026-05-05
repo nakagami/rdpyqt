@@ -30,10 +30,316 @@ Wire formats per MS-RDPEGFX:
   AVC444v2 (2.2.4.6): same structure as AVC444, different chroma handling
 """
 
+import ctypes
+import os
 import struct
+import subprocess
 import sys
+import tempfile
 import numpy as np
 import rdpy.core.log as log
+
+# Pixel formats that carry full-range (0-255) luma/chroma (YUVJ* family).
+# For all other YUV formats we use limited-range BT.601 coefficients.
+_FULL_RANGE_FORMATS = frozenset({'yuvj420p', 'yuvj422p', 'yuvj444p', 'yuvj440p'})
+
+# ---------------------------------------------------------------------------
+# Native C extension for YUV → BGRA conversion.
+# Compiled on first use to a temp shared library; falls back to numpy if
+# compilation is unavailable.
+# ---------------------------------------------------------------------------
+_C_SRC = r"""
+#include <stdint.h>
+
+static inline uint8_t clamp8(int v) {
+    return v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v;
+}
+
+/* YUV420p limited-range BT.601 -> BGRA (inline 2x nearest-neighbor upsample).
+ * restrict allows Clang/GCC to auto-vectorise the inner loop (NEON/AVX). */
+void yuv420p_lr_to_bgra(
+    const uint8_t *restrict Y, int y_stride,
+    const uint8_t *restrict U, int uv_stride,
+    const uint8_t *restrict V,
+    uint8_t *restrict bgra, int width, int height)
+{
+    for (int row = 0; row < height; row++) {
+        const uint8_t *Yr = Y + row * y_stride;
+        const uint8_t *Ur = U + (row >> 1) * uv_stride;
+        const uint8_t *Vr = V + (row >> 1) * uv_stride;
+        uint8_t *dst = bgra + row * width * 4;
+        for (int col = 0; col < width; col++) {
+            int c = (int)Yr[col] - 16;
+            int d = (int)Ur[col >> 1] - 128;
+            int e = (int)Vr[col >> 1] - 128;
+            int R = (298*c + 409*e + 128) >> 8;
+            int G = (298*c - 100*d - 208*e + 128) >> 8;
+            int B = (298*c + 516*d + 128) >> 8;
+            dst[0] = clamp8(B); dst[1] = clamp8(G);
+            dst[2] = clamp8(R); dst[3] = 255;
+            dst += 4;
+        }
+    }
+}
+
+/* YUV420p full-range BT.601 -> BGRA */
+void yuv420p_fr_to_bgra(
+    const uint8_t *restrict Y, int y_stride,
+    const uint8_t *restrict U, int uv_stride,
+    const uint8_t *restrict V,
+    uint8_t *restrict bgra, int width, int height)
+{
+    for (int row = 0; row < height; row++) {
+        const uint8_t *Yr = Y + row * y_stride;
+        const uint8_t *Ur = U + (row >> 1) * uv_stride;
+        const uint8_t *Vr = V + (row >> 1) * uv_stride;
+        uint8_t *dst = bgra + row * width * 4;
+        for (int col = 0; col < width; col++) {
+            int c = (int)Yr[col];
+            int d = (int)Ur[col >> 1] - 128;
+            int e = (int)Vr[col >> 1] - 128;
+            int R = (256*c + 359*e + 128) >> 8;
+            int G = (256*c - 88*d - 183*e + 128) >> 8;
+            int B = (256*c + 454*d + 128) >> 8;
+            dst[0] = clamp8(B); dst[1] = clamp8(G);
+            dst[2] = clamp8(R); dst[3] = 255;
+            dst += 4;
+        }
+    }
+}
+
+/* NV12 limited-range BT.601 -> BGRA (UV interleaved: U at even, V at odd) */
+void nv12_lr_to_bgra(
+    const uint8_t *restrict Y,  int y_stride,
+    const uint8_t *restrict UV, int uv_stride,
+    uint8_t *restrict bgra, int width, int height)
+{
+    for (int row = 0; row < height; row++) {
+        const uint8_t *Yr  = Y  + row * y_stride;
+        const uint8_t *UVr = UV + (row >> 1) * uv_stride;
+        uint8_t *dst = bgra + row * width * 4;
+        for (int col = 0; col < width; col++) {
+            int c = (int)Yr[col] - 16;
+            int d = (int)UVr[col & ~1] - 128;
+            int e = (int)UVr[(col & ~1) + 1] - 128;
+            int R = (298*c + 409*e + 128) >> 8;
+            int G = (298*c - 100*d - 208*e + 128) >> 8;
+            int B = (298*c + 516*d + 128) >> 8;
+            dst[0] = clamp8(B); dst[1] = clamp8(G);
+            dst[2] = clamp8(R); dst[3] = 255;
+            dst += 4;
+        }
+    }
+}
+"""
+
+_c_lib = None        # cached ctypes library (None = not yet loaded or failed)
+_c_lib_loaded = False  # True once we have attempted loading
+
+
+def _get_c_lib():
+    """Compile and cache the native YUV→BGRA shared library.
+
+    Returns the ctypes library on success, None on failure (e.g. no compiler).
+    """
+    global _c_lib, _c_lib_loaded
+    if _c_lib_loaded:
+        return _c_lib
+    _c_lib_loaded = True
+    so_path = None
+    try:
+        src_fd, src_path = tempfile.mkstemp(suffix='.c', prefix='rdpyqt_yuv_')
+        so_fd,  so_path  = tempfile.mkstemp(suffix='.so', prefix='rdpyqt_yuv_')
+        os.close(so_fd)
+        with os.fdopen(src_fd, 'w') as f:
+            f.write(_C_SRC)
+        ret = subprocess.run(
+            ['cc', '-O3', '-march=native', '-ffast-math',
+             '-shared', '-fPIC', '-o', so_path, src_path],
+            capture_output=True, timeout=30)
+        os.unlink(src_path)
+        if ret.returncode != 0:
+            log.warning("AVC: native YUV->BGRA compile failed, using numpy: %s"
+                        % ret.stderr.decode(errors='replace'))
+            return None
+        lib = ctypes.CDLL(so_path)
+        ct_p = ctypes.c_void_p
+        ct_i = ctypes.c_int
+        lib.yuv420p_lr_to_bgra.argtypes = [ct_p, ct_i, ct_p, ct_i, ct_p, ct_p, ct_i, ct_i]
+        lib.yuv420p_fr_to_bgra.argtypes = [ct_p, ct_i, ct_p, ct_i, ct_p, ct_p, ct_i, ct_i]
+        lib.nv12_lr_to_bgra.argtypes    = [ct_p, ct_i, ct_p, ct_i, ct_p, ct_i, ct_i]
+        _c_lib = lib
+        log.debug("AVC: native YUV->BGRA extension loaded (%s)" % so_path)
+    except Exception as e:
+        log.warning("AVC: native YUV->BGRA load error: %s" % e)
+    return _c_lib
+
+
+def _arr_ptr(arr):
+    """Return a ctypes void pointer to the start of a numpy array's data."""
+    return arr.ctypes.data_as(ctypes.c_void_p)
+
+# BT.601 color matrices for the float32 matmul path.
+# Row order: R, G, B.  Applied to column vectors [Y', U', V'] where
+#   limited range: Y'=Y-16,   U'=U-128, V'=V-128
+#   full range:    Y'=Y,      U'=U-128, V'=V-128
+def _upsample_chroma_into(buf_2d, half_plane, h, w):
+    """2× nearest-neighbor upsample of *half_plane* directly into *buf_2d*.
+
+    Writes uint8 half_plane values as float32 directly into the pre-allocated
+    workspace buffer, avoiding the two temporary uint8 arrays that np.repeat
+    would create.  Works correctly for odd h or w.
+    """
+    hh, hw = half_plane.shape           # chroma half-dimensions
+    # Even positions get values from half_plane
+    np.copyto(buf_2d[::2, ::2], half_plane, casting='unsafe')
+    # Horizontal upsample: odd cols = adjacent even col (left).
+    # n_odd_cols may be less than hw when w is odd — only copy first n_odd_cols pairs.
+    n_odd_cols = w // 2
+    buf_2d[::2, 1::2] = buf_2d[::2, 0:2 * n_odd_cols:2]
+    # Vertical upsample: odd rows = row above.
+    # Same care for odd h.
+    n_odd_rows = h // 2
+    buf_2d[1::2] = buf_2d[0:2 * n_odd_rows:2]
+
+
+_BT601_LR_MAT = np.array([
+    [1.164,  0.000,  1.596],   # R = 1.164*(Y-16) + 1.596*(V-128)
+    [1.164, -0.392, -0.813],   # G = 1.164*(Y-16) - 0.392*(U-128) - 0.813*(V-128)
+    [1.164,  2.017,  0.000],   # B = 1.164*(Y-16) + 2.017*(U-128)
+], dtype=np.float32)
+
+_BT601_FR_MAT = np.array([
+    [1.000,  0.000,  1.402],   # R = Y + 1.402*(V-128)
+    [1.000, -0.344, -0.714],   # G = Y - 0.344*(U-128) - 0.714*(V-128)
+    [1.000,  1.772,  0.000],   # B = Y + 1.772*(U-128)
+], dtype=np.float32)
+
+# Per-resolution pre-allocated working buffers.
+# Keys: (h, w).  Values: {'yuv': (3,N) f32, 'rgb': (3,N) f32, 'bgra': (h,w,4) u8}
+# Eliminates per-frame heap allocation for the largest intermediate arrays.
+# Thread-unsafe; assumes single-threaded RDPGFX decode (normal operation).
+_yuv_buf_pool: dict = {}
+
+
+def _get_yuv_bufs(h: int, w: int) -> dict:
+    key = (h, w)
+    if key not in _yuv_buf_pool:
+        N = h * w
+        _yuv_buf_pool[key] = {
+            'yuv':  np.empty((3, N), dtype=np.float32),
+            'rgb':  np.empty((3, N), dtype=np.float32),
+            'bgra': np.empty((h, w, 4), dtype=np.uint8),
+        }
+    return _yuv_buf_pool[key]
+
+
+def _bt601_yuv420_to_bgra(y, u_half, v_half, full_range):
+    """Convert YUV420 planes to a pre-allocated (H, W, 4) BGRA uint8 array.
+
+    Bypasses swscale entirely — on ARM64 (Apple Silicon) swscale's
+    non-accelerated NV12/YUV420P → BGRA fallback ignores
+    sws_setColorspaceDetails, producing wrong colours.  This matches the
+    fix applied in grdp 0.7.7 (plugin/rdpgfx/h264_ffmpeg.go).
+
+    Fast path: uses a native C extension (compiled at startup) that performs
+    inline 2× chroma upsampling + BT.601 conversion + BGRA packing in a
+    single pass — roughly 10× faster than the numpy path.
+
+    Fallback: float32 BLAS SGEMM (numpy) when the C compiler is absent.
+
+    The returned array is the pool's bgra buffer — callers must copy
+    (e.g. via tobytes()) before the next decode call.
+    """
+    h, w = y.shape
+    bgra = _get_yuv_bufs(h, w)['bgra']
+    lib  = _get_c_lib()
+    if lib is not None:
+        fn = lib.yuv420p_fr_to_bgra if full_range else lib.yuv420p_lr_to_bgra
+        fn(_arr_ptr(y),      y.strides[0],
+           _arr_ptr(u_half), u_half.strides[0],
+           _arr_ptr(v_half),
+           _arr_ptr(bgra),
+           w, h)
+        return bgra
+
+    # --- numpy fallback (float32 BLAS path) ---
+    bufs = _get_yuv_bufs(h, w)
+    yuv  = bufs['yuv']
+    rgb  = bufs['rgb']
+    _upsample_chroma_into(yuv[1].reshape(h, w), u_half, h, w)
+    _upsample_chroma_into(yuv[2].reshape(h, w), v_half, h, w)
+    np.copyto(yuv[0], y.ravel(), casting='unsafe')
+    if full_range:
+        yuv[1] -= 128.0
+        yuv[2] -= 128.0
+        np.matmul(_BT601_FR_MAT, yuv, out=rgb)
+    else:
+        yuv[0] -= 16.0
+        yuv[1] -= 128.0
+        yuv[2] -= 128.0
+        np.matmul(_BT601_LR_MAT, yuv, out=rgb)
+    np.clip(rgb, 0.0, 255.0, out=rgb)
+    bgra[:, :, 0] = rgb[2].reshape(h, w)  # B
+    bgra[:, :, 1] = rgb[1].reshape(h, w)  # G
+    bgra[:, :, 2] = rgb[0].reshape(h, w)  # R
+    bgra[:, :, 3] = 255
+    return bgra
+
+
+def _plane_to_array(plane):
+    """Read a VideoPlane into a 2D uint8 numpy array, stripping line padding.
+
+    Uses the buffer protocol (bytes(plane)) which is available in all PyAV
+    versions.  plane.to_ndarray() is absent in older releases.
+    """
+    return (np.frombuffer(bytes(plane), dtype=np.uint8)
+            .reshape(plane.height, plane.line_size)[:, :plane.width])
+
+
+def _frame_yuv420p_to_bgra(frame, full_range):
+    """Extract YUV420P planes from *frame* and return a BGRA numpy array."""
+    y = _plane_to_array(frame.planes[0])
+    u = _plane_to_array(frame.planes[1])
+    v = _plane_to_array(frame.planes[2])
+    return _bt601_yuv420_to_bgra(y, u, v, full_range)
+
+
+def _frame_nv12_to_bgra(frame):
+    """Extract NV12 planes from *frame* and return a BGRA numpy array.
+
+    NV12 (VideoToolbox output on macOS) is always limited-range BT.601.
+
+    NV12 UV plane: plane.width = w//2 (UV pair count), but line_size = w
+    (bytes per row, U and V interleaved).  We must slice with frame.width,
+    not plane.width, to get all interleaved bytes.
+
+    The C path calls nv12_lr_to_bgra directly with the interleaved UV buffer,
+    avoiding the strided u_half/v_half views.  The numpy fallback extracts
+    u_half/v_half as views (no allocation) and delegates to _bt601_yuv420_to_bgra.
+    """
+    h, w = frame.height, frame.width
+    y_p  = frame.planes[0]
+    uv_p = frame.planes[1]
+    y  = (np.frombuffer(bytes(y_p),  dtype=np.uint8)
+          .reshape(y_p.height,  y_p.line_size)[:h, :w])
+    uv = (np.frombuffer(bytes(uv_p), dtype=np.uint8)
+          .reshape(uv_p.height, uv_p.line_size)[:(h + 1) // 2, :w])
+
+    lib = _get_c_lib()
+    if lib is not None:
+        bgra = _get_yuv_bufs(h, w)['bgra']
+        lib.nv12_lr_to_bgra(
+            _arr_ptr(y),  y.strides[0],
+            _arr_ptr(uv), uv.strides[0],
+            _arr_ptr(bgra),
+            w, h)
+        return bgra
+
+    # numpy fallback: u_half/v_half are strided views — no allocation
+    u_half = uv[:, 0::2]
+    v_half = uv[:, 1::2]
+    return _bt601_yuv420_to_bgra(y, u_half, v_half, False)
 
 try:
     import av
@@ -132,6 +438,11 @@ class AvcDecoder:
     def is_hardware(self):
         return self._hw_name is not None
 
+    @property
+    def null_count(self):
+        """Number of consecutive frames where the decoder produced no output."""
+        return self._null_count
+
     def close(self):
         if self._ctx is not None:
             self._ctx = None
@@ -168,36 +479,40 @@ class AvcDecoder:
     def _parse_and_cache_nals(self, h264_data):
         """Single-pass NAL unit scanner: return NAL type list and update SPS/PPS cache.
 
-        Replaces the previous two-pass design (_parse_nal_types + _cache_sps_pps).
-        SPS (type 7) and PPS (type 8) are extracted and stored only when their
-        content changes, avoiding redundant cache updates when the server includes
-        an unchanged PPS in every P-frame.
+        Uses bytes.find() to jump directly to start codes instead of a
+        byte-by-byte scan, which is O(n) in C rather than Python.
         """
         data = bytes(h264_data) if not isinstance(h264_data, bytes) else h264_data
         n = len(data)
         nal_types = []
-        i = 0
-        while i < n:
-            if i + 4 <= n and data[i:i+4] == b'\x00\x00\x00\x01':
-                sc_len = 4
-            elif i + 3 <= n and data[i:i+3] == b'\x00\x00\x01':
-                sc_len = 3
-            else:
-                i += 1
-                continue
-            if i + sc_len >= n:
+        search_from = 0
+        while search_from < n:
+            # Jump directly to the next \x00\x00\x01 pattern (C-speed search)
+            p = data.find(b'\x00\x00\x01', search_from)
+            if p == -1:
                 break
-            nal_type = data[i + sc_len] & 0x1F
+            # Distinguish 4-byte (\x00\x00\x00\x01) from 3-byte start code
+            if p > 0 and data[p - 1] == 0:
+                sc_start = p - 1
+                sc_len = 4
+            else:
+                sc_start = p
+                sc_len = 3
+            nal_start = sc_start + sc_len
+            if nal_start >= n:
+                break
+            nal_type = data[nal_start] & 0x1F
             nal_types.append(nal_type)
             if nal_type in (7, 8):
-                # Find end of this NAL: next start code or end of data
-                j = i + sc_len + 1
-                while j < n:
-                    if (j + 4 <= n and data[j:j+4] == b'\x00\x00\x00\x01') or \
-                       (j + 3 <= n and data[j:j+3] == b'\x00\x00\x01'):
-                        break
-                    j += 1
-                nal_bytes = data[i:j]
+                # Find end of this NAL: next start code (also via find())
+                p2 = data.find(b'\x00\x00\x01', nal_start + 1)
+                if p2 == -1:
+                    nal_end = n
+                elif p2 > 0 and data[p2 - 1] == 0:
+                    nal_end = p2 - 1  # 4-byte start code: end before leading \x00
+                else:
+                    nal_end = p2
+                nal_bytes = data[sc_start:nal_end]
                 if nal_type == 7:
                     if nal_bytes != self._sps_nal:
                         self._sps_nal = nal_bytes
@@ -206,9 +521,9 @@ class AvcDecoder:
                     if nal_bytes != self._pps_nal:
                         self._pps_nal = nal_bytes
                         log.debug("AVC: cached PPS NAL (%d bytes)" % len(nal_bytes))
-                i = j
+                search_from = nal_end
             else:
-                i += sc_len + 1
+                search_from = nal_start + 1
         return nal_types
 
     def _hard_reset(self):
@@ -525,34 +840,49 @@ class AvcDecoder:
     def _frame_to_bgra_bytes(self, frame, dest_width, dest_height):
         """Convert av.VideoFrame to BGRA bytes cropped/padded to dest_width x dest_height.
 
-        Matches grdp's convertFrame + cropBGRA: convert directly to BGRA via
-        sws_scale (PyAV reformat), then crop/pad to destination dimensions.
+        For yuv420p, yuvj420p and nv12 formats the conversion is performed
+        directly in numpy using BT.601 coefficients, bypassing swscale.  On
+        ARM64 (Apple Silicon) swscale's non-accelerated fallback ignores
+        sws_setColorspaceDetails and produces wrong colours; the manual path
+        fixes both correctness and performance.  This mirrors the optimisation
+        introduced in grdp 0.7.7 (plugin/rdpgfx/h264_ffmpeg.go).
+
+        VideoToolbox hardware frames (format='videotoolbox') are downloaded to
+        NV12 first (a zero-cost pixel-copy, no colour conversion), then the
+        NV12 fast path is taken.
         """
-        bgra_frame = frame.reformat(format='bgra')
-        bgra = bgra_frame.to_ndarray()  # shape (H, W, 4), BGRA order
+        fmt = frame.format.name
+
+        # Download hardware frame to CPU as NV12 (no colour conversion).
+        if fmt == 'videotoolbox':
+            frame = frame.reformat(format='nv12')
+            fmt = 'nv12'
+
+        if self._decode_count <= 3:
+            log.debug("AVC: frame_to_bgra #%d src=%dx%d dest=%dx%d fmt=%s" %
+                     (self._decode_count, frame.width, frame.height,
+                      dest_width, dest_height, fmt))
+
+        # Fast path: direct BT.601 YUV→BGRA without swscale.
+        if fmt in ('yuv420p', 'yuvj420p'):
+            bgra = _frame_yuv420p_to_bgra(frame, fmt in _FULL_RANGE_FORMATS)
+        elif fmt == 'nv12':
+            bgra = _frame_nv12_to_bgra(frame)
+        else:
+            # Fallback for any other format (e.g. yuv444p from some codecs).
+            bgra = frame.reformat(format='bgra').to_ndarray()
+
         src_h, src_w = bgra.shape[:2]
 
-        # Log stride info for first few frames to detect padding issues
-        if self._decode_count <= 3:
-            plane = bgra_frame.planes[0]
-            log.debug("AVC: frame_to_bgra #%d src=%dx%d dest=%dx%d linesize=%d expected=%d" %
-                     (self._decode_count, src_w, src_h, dest_width, dest_height,
-                      plane.line_size, dest_width * 4))
-
         if src_w == dest_width and src_h == dest_height:
-            raw = bgra.tobytes()
-            # Save first frame as PNG for visual diagnostic
             if self._decode_count <= 1:
                 self._save_debug_frame(bgra, dest_width, dest_height)
-            return raw
+            return bgra.tobytes()
 
         copy_w = min(src_w, dest_width)
         copy_h = min(src_h, dest_height)
-
         out = np.zeros((dest_height, dest_width, 4), dtype=np.uint8)
         out[:copy_h, :copy_w] = bgra[:copy_h, :copy_w]
-
-        # Save first frame as PNG for visual diagnostic
         if self._decode_count <= 1:
             self._save_debug_frame(out, dest_width, dest_height)
         return out.tobytes()
