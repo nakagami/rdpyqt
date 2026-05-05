@@ -171,7 +171,8 @@ class DrdynvcLayer(LayerAutomata):
         # AVC freeze recovery: track the last successful decode time so we
         # can request a full-screen refresh (IDR) after a prolonged freeze.
         self._avcLastSuccessTime = 0.0   # monotonic; 0 = no success yet this session
-        self._avcLastRefreshTime = 0.0   # monotonic; time of last refresh request
+        self._avcLastRefreshTime = 0.0   # monotonic; time of last full freeze refresh request
+        self._avcKeyframeRequestTime = 0.0  # monotonic; time of last keyframe-wait IDR request
         # Bitmap cache: cacheSlot -> (width, height, bytearray BGRA data)
         self._gfxCache = {}
         # ClearCodec VBAR caches (persistent across decode calls, matching grdp)
@@ -916,35 +917,27 @@ class DrdynvcLayer(LayerAutomata):
     def _onAvcHardReset(self):
         """Called by AvcDecoder immediately after a hard reset.
 
-        A hard reset destroys the decoder's reference frames; the server must
-        send a new IDR before P-frames can be decoded.  We bypass the normal
-        freeze-detection threshold and request a full-screen refresh right away
-        so the server sends an IDR as soon as possible.
+        Hard resets now only happen via the _KEYFRAME_WAIT_LIMIT path (after
+        waiting too long for an IDR following an InvalidDataError).  We request
+        a full-screen refresh to prompt the server for an IDR.
         """
         log.debug("RDPGFX: AVC hard reset — requesting immediate server refresh")
-        self._avcLastRefreshTime = 0.0  # clear cooldown so request goes through
+        self._avcLastRefreshTime = 0.0   # clear cooldown so request goes through
         if self._requestRefreshCallback is not None:
             self._requestRefreshCallback()
             self._avcLastRefreshTime = time.monotonic()
 
-    # Seconds of no AVC output before requesting a full-screen refresh from
-    # the server.  Previous value was 1.5s (too aggressive: frequent
-    # requestFullRefresh calls were causing the server to close the RDPSND
-    # audio channel as a side effect).  Raised to 30s, but that is too slow
-    # for video playback: a YouTube freeze lasting ~2s never triggers recovery.
-    # Compromise at 5s: long enough to avoid false positives during startup and
-    # normal scene transitions, short enough to recover promptly.
+    # Seconds of no AVC output before requesting an IDR from the server.
     _AVC_FREEZE_THRESHOLD = 5.0
-    # Minimum seconds between consecutive refresh requests (cooldown).
-    # Reduced from 60s to 15s: allows faster re-attempt when the server
-    # does not respond to the first request with an IDR frame.
+    # Minimum seconds between consecutive IDR refresh requests (cooldown).
     _AVC_REFRESH_COOLDOWN = 15.0
     # Also trigger recovery when this many consecutive null frames accumulate
-    # and at least _AVC_FREEZE_MIN_SECS have passed (guards against fast
-    # streams where 5 s elapses before enough null frames pile up, *and*
-    # against startup noise where a few null frames are normal).
+    # and at least _AVC_FREEZE_MIN_SECS have passed (guards against startup noise).
     _AVC_NULL_FRAME_THRESHOLD = 30
     _AVC_FREEZE_MIN_SECS = 1.0
+    # (Unused constant kept for reference; fast keyframe-request path was removed
+    # because repeated SupressOutputDataPDU calls disconnect some servers.)
+    _AVC_KEYFRAME_REQUEST_INTERVAL = 2.0
 
     def _renderAvc420(self, surfaceId, left, top, width, height, data):
         """Decode and render AVC420 (H.264 YUV420) bitmap data."""
@@ -1009,30 +1002,33 @@ class DrdynvcLayer(LayerAutomata):
     def _onAvcNoOutput(self):
         """Called when an AVC frame produces no output.
 
-        Triggers a hard decoder reset and server refresh request when either:
-          (a) the decoder has been silent for longer than _AVC_FREEZE_THRESHOLD
-              seconds, OR
-          (b) _AVC_NULL_FRAME_THRESHOLD consecutive null frames have accumulated
-              AND at least _AVC_FREEZE_MIN_SECS have elapsed since the last
-              successful decode (guards against normal startup noise).
+        Two cases:
 
-        Both checks are subject to _AVC_REFRESH_COOLDOWN to avoid spamming
-        the server, which can cause side-effects such as RDPSND channel closure.
+        1. **Keyframe-wait state** (needs_keyframe=True): the decoder is waiting
+           for an IDR after a decode error.  Non-IDR frames are silently dropped
+           by AvcDecoder._decode(); we simply return here.
 
-        On freeze, we call _hard_reset() (not just flush()) because:
-          - flush() only resets null-frame counters; the underlying VideoToolbox
-            decoder remains stuck and continues to return null for all subsequent
-            P-frames.
-          - requestFullRefresh() sends a legacy SupressOutputDataPDU, which the
-            RDPGFX server does NOT interpret as an IDR request — it keeps sending
-            P-frames, so the stuck decoder never recovers (confirmed in logs:
-            null_count reaches 95+ before the connection dies).
-          - _hard_reset() recreates the decoder, sets _prepend_sps_next_idr so
-            the cached SPS+PPS is injected before the next server IDR, and calls
-            on_hard_reset → _onAvcHardReset → _requestRefreshCallback().
-            When the server eventually sends an IDR on a scene change (YouTube
-            sends them frequently), decoding resumes immediately.
+        2. **VideoToolbox null-frame stall** (needs_keyframe=False): the decoder
+           is silently returning null for P-frames.  This happens on macOS when
+           VideoToolbox is temporarily overloaded or buffering.  We call
+           decoder.flush() to reset null-frame counters and send ONE IDR request
+           per _AVC_REFRESH_COOLDOWN seconds, then continue feeding frames.
+           We do NOT hard-reset the decoder because:
+             - Hard reset destroys VideoToolbox's reference-frame chain.
+             - This server never sends an IDR after the initial one (infinite
+               GOP), so a hard-reset decoder will NEVER recover.
+             - VideoToolbox null stalls are often transient and self-resolve
+               without intervention (confirmed in logs: frames 10–15 stalled
+               then resumed on their own).
+             - If an IDR request does cause the server to send an IDR, the
+               decoder — still holding its full codec context — processes it
+               naturally without needing recreation.
         """
+        # While waiting for IDR (after InvalidDataError), frames are silently
+        # dropped — this is not a freeze state, no action needed here.
+        if self._avcDecoder and self._avcDecoder.needs_keyframe:
+            return
+
         if self._avcLastSuccessTime == 0.0:
             return  # No successful decode yet; normal during startup
 
@@ -1052,16 +1048,19 @@ class DrdynvcLayer(LayerAutomata):
 
         trigger_reason = ('time(%.1fs)' % frozen_for if time_triggered
                           else 'count(%d)' % null_count)
-        log.debug("RDPGFX: AVC frozen [%s], hard-resetting decoder and requesting refresh"
+        log.debug("RDPGFX: AVC stall [%s], requesting IDR (decoder context preserved)"
                   % trigger_reason)
         self._avcLastRefreshTime = now
 
-        # Hard-reset the decoder: recreates VideoToolbox context, injects cached
-        # SPS+PPS before the next IDR, and calls on_hard_reset →
-        # _onAvcHardReset → _requestRefreshCallback() to request a server refresh.
+        # Reset null-frame counters so freeze detection does not re-fire
+        # immediately.  Intentionally NOT calling _hard_reset(): the decoder
+        # context (VideoToolbox state + reference frames) is preserved so it
+        # can resume decoding when the server eventually sends an IDR or when
+        # VideoToolbox self-recovers.
         if self._avcDecoder is not None:
-            self._avcDecoder._hard_reset(reason='freeze %s' % trigger_reason)
-        elif self._requestRefreshCallback is not None:
+            self._avcDecoder.flush()
+
+        if self._requestRefreshCallback is not None:
             self._requestRefreshCallback()
 
     def _renderUncompressed(self, surfaceId, left, top, width, height, pixelFormat, data):

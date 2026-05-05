@@ -470,8 +470,10 @@ class AvcDecoder:
         # SPS/PPS recovery state
         self._sps_nal = b''          # cached SPS NAL (Annex B, with start code)
         self._pps_nal = b''          # cached PPS NAL (Annex B, with start code)
-        self._hw_error_count = 0     # consecutive non-IDR decode errors
-        self._hw_reset_count = 0     # total hard resets (for software fallback)
+        self._hw_error_count = 0       # consecutive non-IDR generic errors (AVERROR_UNKNOWN etc.)
+        self._hw_reset_count = 0       # total hard resets
+        self._needs_keyframe = False   # True after reset/error; skips non-IDR frames until IDR
+        self._keyframe_wait_count = 0  # non-IDR frames dropped while waiting for IDR
         self._prepend_sps_next_idr = False  # inject SPS+PPS before next IDR
         self.on_hard_reset = None    # callback() invoked after each hard reset
         self._init_decoder()
@@ -606,18 +608,16 @@ class AvcDecoder:
         self._decode_count = 0
         self._null_count = 0
 
-        if self._hw_reset_count >= 3:
-            log.warning("AVC: too many hardware resets, falling back to software decoder")
+        # Always try hardware decoder; only fall back to software if unavailable.
+        self._needs_keyframe = True
+        self._keyframe_wait_count = 0
+        ctx, hw_name = _try_open_hw_decoder()
+        if ctx is not None:
+            self._ctx = ctx
+            self._hw_name = hw_name
+        else:
             self._ctx = _open_sw_decoder()
             self._hw_name = None
-        else:
-            ctx, hw_name = _try_open_hw_decoder()
-            if ctx is not None:
-                self._ctx = ctx
-                self._hw_name = hw_name
-            else:
-                self._ctx = _open_sw_decoder()
-                self._hw_name = None
 
         if self._sps_nal and self._pps_nal:
             self._prepend_sps_next_idr = True
@@ -783,12 +783,18 @@ class AvcDecoder:
         discards reference frames, but IDR slices are self-contained so the
         retry always succeeds.
 
+        When avcodec_send_packet() raises InvalidDataError (most P-frame errors),
+        flush_buffers() is called and _needs_keyframe is set True.  While
+        _needs_keyframe is True, all subsequent non-IDR frames are dropped without
+        decode attempts, preventing cascading errors.  IDR requests are sent to the
+        server every 2 s via the drdynvc keyframe-wait path.  When an IDR arrives,
+        _needs_keyframe is cleared and decoding resumes.
+
         When avcodec_send_packet() raises a generic error (e.g. VideoToolbox
-        AVERROR_UNKNOWN on macOS), flush_buffers() has no effect.  After
-        _HW_ERROR_THRESHOLD consecutive non-IDR failures we call _hard_reset()
-        to destroy and recreate the codec context.  Cached SPS/PPS are then
-        injected before the next IDR so the fresh decoder can decode the
-        server's bare IDRs without needing a new SPS from the server.
+        AVERROR_UNKNOWN on macOS), the same flush + _needs_keyframe handling
+        applies, plus _hw_error_count is incremented.  After _HW_ERROR_THRESHOLD
+        consecutive generic errors we call _hard_reset() to destroy and recreate
+        the codec context.  Cached SPS/PPS are then injected before the next IDR.
         """
         if self._ctx is None:
             return None
@@ -806,6 +812,19 @@ class AvcDecoder:
             names = [self._NAL_NAMES.get(t, str(t)) for t in nal_types]
             log.debug("AVC: decode #%d NAL types: %s (h264Len=%d)" %
                      (self._decode_count, ','.join(names), len(h264_data)))
+
+        # While waiting for an IDR (after reset or error), drop non-IDR frames
+        # without decode attempts.  This prevents cascading InvalidDataError
+        # from P-frames that the decoder cannot handle without a reference frame.
+        # Mirrors grdp's needsKeyFrame / keyframeWaitLimit pattern.
+        if self._needs_keyframe and not has_idr:
+            self._keyframe_wait_count += 1
+            if self._keyframe_wait_count == 1 or self._keyframe_wait_count % 30 == 0:
+                log.debug("AVC: decode #%d waiting for IDR (skipped %d non-IDR frames)" %
+                          (self._decode_count, self._keyframe_wait_count))
+            if self._keyframe_wait_count >= self._KEYFRAME_WAIT_LIMIT:
+                self._hard_reset(reason='keyframe wait limit (%d)' % self._KEYFRAME_WAIT_LIMIT)
+            return None
 
         # After a hard reset the fresh decoder has no SPS context.  Inject our
         # cached SPS+PPS before the next IDR so it can decode the server's bare IDR.
@@ -846,6 +865,8 @@ class AvcDecoder:
             else:
                 self._null_count = 0
                 self._hw_error_count = 0
+                self._needs_keyframe = False
+                self._keyframe_wait_count = 0
                 self._prepend_sps_next_idr = False
                 if self._decode_count <= 3:
                     log.debug("AVC: decode #%d OK frame=%dx%d fmt=%s h264Len=%d" %
@@ -859,21 +880,44 @@ class AvcDecoder:
                 # An IDR is self-contained, so flush and retry immediately
                 # rather than waiting for a future IDR to succeed on its own.
                 return self._flush_and_retry_idr(packet)
+            # Non-IDR invalid data: flush decoder buffers and wait for IDR.
+            # Attempting to decode subsequent P-frames with a corrupt decoder
+            # state would cause a cascade of InvalidDataError; flushing clears
+            # the state and _needs_keyframe drops all non-IDR frames until the
+            # server sends a fresh IDR.  Mirrors grdp's needsKeyFrame pattern.
+            self._ctx.flush_buffers()
+            self._needs_keyframe = True
+            self._keyframe_wait_count = 0
         except Exception as e:
             log.warning("AVC: H.264 decode error: %s" % e)
             if has_idr and packet is not None:
                 # IDR is self-contained; flush and retry may recover.
                 return self._flush_and_retry_idr(packet)
-            # Non-IDR hardware error: count consecutive failures.  After
-            # _HW_ERROR_THRESHOLD failures the hardware decoder is stuck in
-            # an unrecoverable error state; recreate it via _hard_reset().
+            # Non-IDR hardware error: flush and wait for IDR.  Also count
+            # consecutive failures; after _HW_ERROR_THRESHOLD AVERROR_UNKNOWN
+            # errors the hardware decoder is in an unrecoverable state so we
+            # hard-reset it.
+            self._ctx.flush_buffers()
+            self._needs_keyframe = True
+            self._keyframe_wait_count = 0
             self._hw_error_count += 1
             if self._hw_error_count >= self._HW_ERROR_THRESHOLD:
                 self._hard_reset()
 
         return None
 
-    _HW_ERROR_THRESHOLD = 5   # consecutive non-IDR errors before hard reset
+    _HW_ERROR_THRESHOLD = 5    # consecutive AVERROR_UNKNOWN errors before hard reset
+    _KEYFRAME_WAIT_LIMIT = 900  # non-IDR frames dropped before giving up and hard-resetting
+
+    @property
+    def needs_keyframe(self):
+        """True when the decoder is waiting for an IDR frame.
+
+        Set after a hard reset or a decode error.  While True, all non-IDR
+        frames are dropped silently.  Callers may poll this to request a
+        keyframe from the server more frequently.
+        """
+        return self._needs_keyframe
 
     def _flush_and_retry_idr(self, packet):
         """Flush decoder buffers and retry an IDR packet after an error.
@@ -895,6 +939,8 @@ class AvcDecoder:
             if result is not None:
                 self._null_count = 0
                 self._hw_error_count = 0
+                self._needs_keyframe = False
+                self._keyframe_wait_count = 0
                 self._prepend_sps_next_idr = False
                 log.debug("AVC: decode #%d IDR recovery after flush OK %dx%d" %
                           (self._decode_count, result.width, result.height))
