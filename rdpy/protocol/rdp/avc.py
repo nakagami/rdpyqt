@@ -55,7 +55,9 @@ static inline uint8_t clamp8(int v) {
     return v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v;
 }
 
-/* YUV420p limited-range BT.601 -> BGRA (inline 2x nearest-neighbor upsample).
+/* YUV420p limited-range BT.601 -> BGRA.
+ * Inner loop processes pixel pairs that share the same UV chroma sample,
+ * computing the UV-dependent terms (Rb/Gb/Bb) once per pair.
  * restrict allows Clang/GCC to auto-vectorise the inner loop (NEON/AVX). */
 void yuv420p_lr_to_bgra(
     const uint8_t *restrict Y, int y_stride,
@@ -68,21 +70,36 @@ void yuv420p_lr_to_bgra(
         const uint8_t *Ur = U + (row >> 1) * uv_stride;
         const uint8_t *Vr = V + (row >> 1) * uv_stride;
         uint8_t *dst = bgra + row * width * 4;
-        for (int col = 0; col < width; col++) {
+        int col = 0;
+        /* Process pairs: both pixels share the same UV chroma sample. */
+        for (; col + 1 < width; col += 2) {
+            int d = (int)Ur[col >> 1] - 128;
+            int e = (int)Vr[col >> 1] - 128;
+            int Rb = 409*e + 128;
+            int Gb = -100*d - 208*e + 128;
+            int Bb = 516*d + 128;
+            int c0 = ((int)Yr[col]     - 16) * 298;
+            int c1 = ((int)Yr[col + 1] - 16) * 298;
+            dst[0] = clamp8((c0 + Bb) >> 8); dst[1] = clamp8((c0 + Gb) >> 8);
+            dst[2] = clamp8((c0 + Rb) >> 8); dst[3] = 255;
+            dst[4] = clamp8((c1 + Bb) >> 8); dst[5] = clamp8((c1 + Gb) >> 8);
+            dst[6] = clamp8((c1 + Rb) >> 8); dst[7] = 255;
+            dst += 8;
+        }
+        /* Tail: odd width. */
+        if (col < width) {
             int c = (int)Yr[col] - 16;
             int d = (int)Ur[col >> 1] - 128;
             int e = (int)Vr[col >> 1] - 128;
-            int R = (298*c + 409*e + 128) >> 8;
-            int G = (298*c - 100*d - 208*e + 128) >> 8;
-            int B = (298*c + 516*d + 128) >> 8;
-            dst[0] = clamp8(B); dst[1] = clamp8(G);
-            dst[2] = clamp8(R); dst[3] = 255;
-            dst += 4;
+            dst[0] = clamp8((298*c + 516*d + 128) >> 8);
+            dst[1] = clamp8((298*c - 100*d - 208*e + 128) >> 8);
+            dst[2] = clamp8((298*c + 409*e + 128) >> 8);
+            dst[3] = 255;
         }
     }
 }
 
-/* YUV420p full-range BT.601 -> BGRA */
+/* YUV420p full-range BT.601 -> BGRA (2-pixel unrolled inner loop). */
 void yuv420p_fr_to_bgra(
     const uint8_t *restrict Y, int y_stride,
     const uint8_t *restrict U, int uv_stride,
@@ -94,21 +111,35 @@ void yuv420p_fr_to_bgra(
         const uint8_t *Ur = U + (row >> 1) * uv_stride;
         const uint8_t *Vr = V + (row >> 1) * uv_stride;
         uint8_t *dst = bgra + row * width * 4;
-        for (int col = 0; col < width; col++) {
+        int col = 0;
+        for (; col + 1 < width; col += 2) {
+            int d = (int)Ur[col >> 1] - 128;
+            int e = (int)Vr[col >> 1] - 128;
+            int Rb = 359*e + 128;
+            int Gb = -88*d - 183*e + 128;
+            int Bb = 454*d + 128;
+            int c0 = (int)Yr[col]     << 8;
+            int c1 = (int)Yr[col + 1] << 8;
+            dst[0] = clamp8((c0 + Bb) >> 8); dst[1] = clamp8((c0 + Gb) >> 8);
+            dst[2] = clamp8((c0 + Rb) >> 8); dst[3] = 255;
+            dst[4] = clamp8((c1 + Bb) >> 8); dst[5] = clamp8((c1 + Gb) >> 8);
+            dst[6] = clamp8((c1 + Rb) >> 8); dst[7] = 255;
+            dst += 8;
+        }
+        if (col < width) {
             int c = (int)Yr[col];
             int d = (int)Ur[col >> 1] - 128;
             int e = (int)Vr[col >> 1] - 128;
-            int R = (256*c + 359*e + 128) >> 8;
-            int G = (256*c - 88*d - 183*e + 128) >> 8;
-            int B = (256*c + 454*d + 128) >> 8;
-            dst[0] = clamp8(B); dst[1] = clamp8(G);
-            dst[2] = clamp8(R); dst[3] = 255;
-            dst += 4;
+            dst[0] = clamp8((256*c + 454*d + 128) >> 8);
+            dst[1] = clamp8((256*c - 88*d - 183*e + 128) >> 8);
+            dst[2] = clamp8((256*c + 359*e + 128) >> 8);
+            dst[3] = 255;
         }
     }
 }
 
-/* NV12 limited-range BT.601 -> BGRA (UV interleaved: U at even, V at odd) */
+/* NV12 limited-range BT.601 -> BGRA (UV interleaved: U at even, V at odd).
+ * 2-pixel unrolled: each UV pair naturally covers two horizontal pixels. */
 void nv12_lr_to_bgra(
     const uint8_t *restrict Y,  int y_stride,
     const uint8_t *restrict UV, int uv_stride,
@@ -118,16 +149,30 @@ void nv12_lr_to_bgra(
         const uint8_t *Yr  = Y  + row * y_stride;
         const uint8_t *UVr = UV + (row >> 1) * uv_stride;
         uint8_t *dst = bgra + row * width * 4;
-        for (int col = 0; col < width; col++) {
+        int col = 0;
+        for (; col + 1 < width; col += 2) {
+            /* UVr[col] = U, UVr[col+1] = V for this pixel pair. */
+            int d = (int)UVr[col] - 128;
+            int e = (int)UVr[col + 1] - 128;
+            int Rb = 409*e + 128;
+            int Gb = -100*d - 208*e + 128;
+            int Bb = 516*d + 128;
+            int c0 = ((int)Yr[col]     - 16) * 298;
+            int c1 = ((int)Yr[col + 1] - 16) * 298;
+            dst[0] = clamp8((c0 + Bb) >> 8); dst[1] = clamp8((c0 + Gb) >> 8);
+            dst[2] = clamp8((c0 + Rb) >> 8); dst[3] = 255;
+            dst[4] = clamp8((c1 + Bb) >> 8); dst[5] = clamp8((c1 + Gb) >> 8);
+            dst[6] = clamp8((c1 + Rb) >> 8); dst[7] = 255;
+            dst += 8;
+        }
+        if (col < width) {
             int c = (int)Yr[col] - 16;
-            int d = (int)UVr[col & ~1] - 128;
-            int e = (int)UVr[(col & ~1) + 1] - 128;
-            int R = (298*c + 409*e + 128) >> 8;
-            int G = (298*c - 100*d - 208*e + 128) >> 8;
-            int B = (298*c + 516*d + 128) >> 8;
-            dst[0] = clamp8(B); dst[1] = clamp8(G);
-            dst[2] = clamp8(R); dst[3] = 255;
-            dst += 4;
+            int d = (int)UVr[col] - 128;
+            int e = (int)UVr[col + 1] - 128;
+            dst[0] = clamp8((298*c + 516*d + 128) >> 8);
+            dst[1] = clamp8((298*c - 100*d - 208*e + 128) >> 8);
+            dst[2] = clamp8((298*c + 409*e + 128) >> 8);
+            dst[3] = 255;
         }
     }
 }
@@ -290,10 +335,12 @@ def _bt601_yuv420_to_bgra(y, u_half, v_half, full_range):
 def _plane_to_array(plane):
     """Read a VideoPlane into a 2D uint8 numpy array, stripping line padding.
 
-    Uses the buffer protocol (bytes(plane)) which is available in all PyAV
-    versions.  plane.to_ndarray() is absent in older releases.
+    Uses the buffer protocol directly (np.frombuffer(plane, ...)) to avoid
+    the extra allocation that bytes(plane) would cause.  The resulting array
+    is read-only (backed by the plane's internal buffer), which is fine since
+    callers only pass it to the C conversion function for reading.
     """
-    return (np.frombuffer(bytes(plane), dtype=np.uint8)
+    return (np.frombuffer(plane, dtype=np.uint8)
             .reshape(plane.height, plane.line_size)[:, :plane.width])
 
 
@@ -321,9 +368,9 @@ def _frame_nv12_to_bgra(frame):
     h, w = frame.height, frame.width
     y_p  = frame.planes[0]
     uv_p = frame.planes[1]
-    y  = (np.frombuffer(bytes(y_p),  dtype=np.uint8)
+    y  = (np.frombuffer(y_p,  dtype=np.uint8)
           .reshape(y_p.height,  y_p.line_size)[:h, :w])
-    uv = (np.frombuffer(bytes(uv_p), dtype=np.uint8)
+    uv = (np.frombuffer(uv_p, dtype=np.uint8)
           .reshape(uv_p.height, uv_p.line_size)[:(h + 1) // 2, :w])
 
     lib = _get_c_lib()
@@ -387,7 +434,12 @@ def _open_sw_decoder():
 
     Use FFmpeg's built-in h264 decoder with LOW_DELAY and FAST flags.
     LOW_DELAY minimises frame reordering, and FAST skips some post-
-    processing.  thread_count=1 avoids multi-threaded reorder buffering.
+    processing.
+
+    SLICE threading (thread_type=2) parallelises entropy coding and
+    residual reconstruction within a single frame — no reorder delay.
+    Verified: delay=0 with SLICE mode for any thread_count, so we can
+    safely use min(cpu_count, 4) threads for 2–4× decode speedup.
 
     libopenh264 was tried as an alternative (no reorder buffering at
     all) but it returns AVERROR_UNKNOWN on certain High-profile streams
@@ -395,10 +447,12 @@ def _open_sw_decoder():
     """
     codec = av.codec.Codec('h264', 'r')
     ctx = av.codec.CodecContext.create(codec)
-    ctx.thread_count = 1
+    ctx.thread_count = min(os.cpu_count() or 1, 4)
+    ctx.thread_type = 2  # SLICE — no reorder delay, parallelises within frame
     ctx.options = {'flags': '+low_delay', 'flags2': '+fast'}
     ctx.open()
-    log.debug("AVC: using software H.264 decoder (thread_count=1, low_delay)")
+    log.debug("AVC: using software H.264 decoder (thread_count=%d, SLICE, low_delay)" %
+              ctx.thread_count)
     return ctx
 
 
@@ -578,10 +632,11 @@ class AvcDecoder:
     # AVC420 bitmap stream (MS-RDPEGFX 2.2.4.4)
     # -----------------------------------------------------------------
 
-    def decode_avc420(self, data, dest_width, dest_height):
+    def decode_avc420_arr(self, data, dest_width, dest_height):
         """Decode AVC420 bitmap stream.
 
-        Returns BGRA bytes (dest_width * dest_height * 4) or None.
+        Returns BGRA numpy array (dest_height, dest_width, 4) or None.
+        No tobytes() copy — caller owns the returned array until done.
         """
         _regions, h264_data = self._parse_avc420_stream(data)
         if h264_data is None or len(h264_data) == 0:
@@ -591,7 +646,17 @@ class AvcDecoder:
         if frame is None:
             return None
 
-        return self._frame_to_bgra_bytes(frame, dest_width, dest_height)
+        return self._frame_to_bgra(frame, dest_width, dest_height)
+
+    def decode_avc420(self, data, dest_width, dest_height):
+        """Decode AVC420 bitmap stream.
+
+        Returns BGRA bytes (dest_width * dest_height * 4) or None.
+        """
+        arr = self.decode_avc420_arr(data, dest_width, dest_height)
+        if arr is None:
+            return None
+        return arr.tobytes()
 
     def _parse_avc420_stream(self, data):
         """Parse AVC420 bitmap stream per MS-RDPEGFX 2.2.4.4.
@@ -611,14 +676,11 @@ class AvcDecoder:
             log.warning("AVC420: insufficient data for %d region rects" % numRegionRects)
             return [], None
 
-        rects = []
-        for i in range(numRegionRects):
-            left = struct.unpack_from('<H', data, off)[0]
-            top = struct.unpack_from('<H', data, off + 2)[0]
-            right = struct.unpack_from('<H', data, off + 4)[0]
-            bottom = struct.unpack_from('<H', data, off + 6)[0]
-            rects.append((left, top, right, bottom))
-            off += 8
+        # Parse all rects in one struct call (4 uint16 per rect).
+        raw = struct.unpack_from('<%dH' % (numRegionRects * 4), data, off)
+        rects = [(raw[i*4], raw[i*4+1], raw[i*4+2], raw[i*4+3])
+                 for i in range(numRegionRects)]
+        off += rects_size
 
         # Quant quality vals: each 2 bytes (qpVal(1) + qualityMode flags(1))
         qvals_size = numRegionRects * 2
@@ -626,13 +688,10 @@ class AvcDecoder:
             log.warning("AVC420: insufficient data for quant quality values")
             return [], None
 
-        regions = []
-        for i in range(numRegionRects):
-            qp = data[off]
-            qualityMode = data[off + 1]
-            left, top, right, bottom = rects[i]
-            regions.append((left, top, right, bottom, qp, qualityMode))
-            off += 2
+        regions = [(rects[i][0], rects[i][1], rects[i][2], rects[i][3],
+                    data[off + i*2], data[off + i*2 + 1])
+                   for i in range(numRegionRects)]
+        off += qvals_size
 
         h264_data = data[off:]
         log.debug("AVC420: %d regions, %d bytes H.264 data" %
@@ -643,7 +702,7 @@ class AvcDecoder:
     # AVC444 / AVC444v2 bitmap stream (MS-RDPEGFX 2.2.4.5 / 2.2.4.6)
     # -----------------------------------------------------------------
 
-    def decode_avc444(self, data, dest_width, dest_height):
+    def decode_avc444_arr(self, data, dest_width, dest_height):
         """Decode AVC444/AVC444v2 bitmap stream.
 
         LC values:
@@ -651,7 +710,8 @@ class AvcDecoder:
           1 = luma stream only
           2 = chroma stream only (skipped)
 
-        Returns BGRA bytes (dest_width * dest_height * 4) or None.
+        Returns BGRA numpy array (dest_height, dest_width, 4), b"" sentinel
+        for LC=2 chroma-only, or None on failure.
         """
         if len(data) < 4:
             return None
@@ -669,22 +729,35 @@ class AvcDecoder:
                 log.warning("AVC444: stream1 size %d exceeds data %d" %
                             (cbAvc420Stream1, len(rest)))
                 return None
-            return self.decode_avc420(rest[:cbAvc420Stream1], dest_width, dest_height)
+            return self.decode_avc420_arr(rest[:cbAvc420Stream1], dest_width, dest_height)
         elif lc == 1:
-            # Main stream only; use cbAvc420Stream1 if valid, otherwise all of rest
             stream_data = rest
             if cbAvc420Stream1 > 0 and cbAvc420Stream1 <= len(rest):
                 stream_data = rest[:cbAvc420Stream1]
-            return self.decode_avc420(stream_data, dest_width, dest_height)
+            return self.decode_avc420_arr(stream_data, dest_width, dest_height)
         elif lc == 2:
-            # Chroma-only refinement stream — skip luma decode.
-            # Return empty bytes (not None) so callers can distinguish
-            # "no output but codec is alive" from a real decode failure.
             log.debug("AVC444: LC=2 chroma-only, skipping")
             return b""
         else:
             log.warning("AVC444: unexpected LC value %d" % lc)
             return None
+
+    def decode_avc444(self, data, dest_width, dest_height):
+        """Decode AVC444/AVC444v2 bitmap stream.
+
+        LC values:
+          0 = both luma (YUV420) and chroma streams present
+          1 = luma stream only
+          2 = chroma stream only (skipped)
+
+        Returns BGRA bytes (dest_width * dest_height * 4) or None.
+        """
+        arr = self.decode_avc444_arr(data, dest_width, dest_height)
+        if arr is None:
+            return None
+        if isinstance(arr, bytes):  # b"" LC=2 chroma-only sentinel
+            return b""
+        return arr.tobytes()
 
     # -----------------------------------------------------------------
     # H.264 decoding core
@@ -837,8 +910,10 @@ class AvcDecoder:
             result = frame
         return result
 
-    def _frame_to_bgra_bytes(self, frame, dest_width, dest_height):
-        """Convert av.VideoFrame to BGRA bytes cropped/padded to dest_width x dest_height.
+    def _frame_to_bgra(self, frame, dest_width, dest_height):
+        """Convert av.VideoFrame to a BGRA numpy array cropped/padded to dest_width x dest_height.
+
+        Returns numpy array shape (dest_height, dest_width, 4) dtype uint8.
 
         For yuv420p, yuvj420p and nv12 formats the conversion is performed
         directly in numpy using BT.601 coefficients, bypassing swscale.  On
@@ -877,7 +952,7 @@ class AvcDecoder:
         if src_w == dest_width and src_h == dest_height:
             if self._decode_count <= 1:
                 self._save_debug_frame(bgra, dest_width, dest_height)
-            return bgra.tobytes()
+            return bgra
 
         copy_w = min(src_w, dest_width)
         copy_h = min(src_h, dest_height)
@@ -885,7 +960,7 @@ class AvcDecoder:
         out[:copy_h, :copy_w] = bgra[:copy_h, :copy_w]
         if self._decode_count <= 1:
             self._save_debug_frame(out, dest_width, dest_height)
-        return out.tobytes()
+        return out
 
     def _save_debug_frame(self, bgra_array, width, height):
         """Save a BGRA numpy array as PNG for diagnostic inspection."""

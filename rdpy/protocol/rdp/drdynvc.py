@@ -183,6 +183,7 @@ class DrdynvcLayer(LayerAutomata):
         self._gfxVersion = 0
         # Callbacks
         self._gfxCallback = None       # bitmap delivery callback
+        self._gfxSurfaceCallback = None  # fast path: deliver surface buf region directly
         self._capsConfirmCallback = None  # called when CAPS_CONFIRM received
         self._requestRefreshCallback = None  # called to request IDR from server
         # RDPSND DVC routing
@@ -193,6 +194,17 @@ class DrdynvcLayer(LayerAutomata):
     def setGfxCallback(self, callback):
         """Set callback for RDPGFX bitmap delivery: callback(x, y, w, h, bpp, data)"""
         self._gfxCallback = callback
+
+    def setGfxSurfaceCallback(self, callback):
+        """Set fast-path callback for AVC surface delivery.
+
+        callback(dest_x, dest_y, width, height, surf_buf, surf_w, src_left, src_top)
+        where surf_buf is the surface bytearray and (src_left, src_top) is the
+        offset of the decoded region within it (row stride = surf_w * 4).
+        When set, _renderAvc420/444 skip tobytes() and deliver the surface
+        buffer directly.  Falls back to _gfxCallback with tobytes() if None.
+        """
+        self._gfxSurfaceCallback = callback
 
     def setCapsConfirmCallback(self, callback):
         """Set callback for RDPGFX CAPS_CONFIRM notification."""
@@ -940,14 +952,22 @@ class DrdynvcLayer(LayerAutomata):
         if decoder is None:
             return
         try:
-            bgra_bytes = decoder.decode_avc420(data, width, height)
-            if bgra_bytes is None:
+            bgra_arr = decoder.decode_avc420_arr(data, width, height)
+            if bgra_arr is None:
                 self._onAvcNoOutput()
                 return
             self._avcLastSuccessTime = time.monotonic()
-            self._blitToSurface(surfaceId, left, top, width, height, bgra_bytes)
+            self._blitToSurface(surfaceId, left, top, width, height, bgra_arr)
             ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
-            self._deliverBitmap(ox + left, oy + top, width, height, 32, bgra_bytes)
+            if self._gfxSurfaceCallback is not None:
+                surfInfo = self._surfaces.get(surfaceId)
+                surfBuf = self._surfaceData.get(surfaceId)
+                if surfInfo is not None and surfBuf is not None:
+                    self._gfxSurfaceCallback(ox + left, oy + top, width, height,
+                                             surfBuf, surfInfo[0], left, top)
+                    return
+            self._deliverBitmap(ox + left, oy + top, width, height, 32,
+                                bgra_arr.tobytes())
         except Exception as e:
             log.warning("RDPGFX: AVC420 decode error: %s" % e)
             self._onAvcNoOutput()
@@ -958,12 +978,12 @@ class DrdynvcLayer(LayerAutomata):
         if decoder is None:
             return
         try:
-            bgra_bytes = decoder.decode_avc444(data, width, height)
-            if bgra_bytes is None:
+            bgra_arr = decoder.decode_avc444_arr(data, width, height)
+            if bgra_arr is None:
                 # Real decode failure — H.264 reference chain may be broken.
                 self._onAvcNoOutput()
                 return
-            if not bgra_bytes:
+            if isinstance(bgra_arr, bytes):
                 # b"" sentinel: LC=2 chroma-only frame.  Do NOT update
                 # _avcLastSuccessTime here: chroma frames keep arriving even
                 # when the luma decoder is frozen (as seen with YouTube videos).
@@ -971,9 +991,17 @@ class DrdynvcLayer(LayerAutomata):
                 # preventing freeze detection from ever triggering.
                 return
             self._avcLastSuccessTime = time.monotonic()
-            self._blitToSurface(surfaceId, left, top, width, height, bgra_bytes)
+            self._blitToSurface(surfaceId, left, top, width, height, bgra_arr)
             ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
-            self._deliverBitmap(ox + left, oy + top, width, height, 32, bgra_bytes)
+            if self._gfxSurfaceCallback is not None:
+                surfInfo = self._surfaces.get(surfaceId)
+                surfBuf = self._surfaceData.get(surfaceId)
+                if surfInfo is not None and surfBuf is not None:
+                    self._gfxSurfaceCallback(ox + left, oy + top, width, height,
+                                             surfBuf, surfInfo[0], left, top)
+                    return
+            self._deliverBitmap(ox + left, oy + top, width, height, 32,
+                                bgra_arr.tobytes())
         except Exception as e:
             log.warning("RDPGFX: AVC444 decode error: %s" % e)
             self._onAvcNoOutput()
@@ -1089,15 +1117,12 @@ class DrdynvcLayer(LayerAutomata):
         self._applyDelta(green_plane, w, h)
         self._applyDelta(blue_plane, w, h)
 
-        for i in range(plane_size):
-            a = alpha_plane[i] if (alpha_plane and i < len(alpha_plane)) else 0xFF
-            r = red_plane[i] if (red_plane and i < len(red_plane)) else 0
-            g = green_plane[i] if (green_plane and i < len(green_plane)) else 0
-            b = blue_plane[i] if (blue_plane and i < len(blue_plane)) else 0
-            out[i * 4] = b
-            out[i * 4 + 1] = g
-            out[i * 4 + 2] = r
-            out[i * 4 + 3] = a
+        # Assemble BGRA interleaved using numpy (avoids Python per-pixel loop)
+        out_arr = np.frombuffer(out, dtype=np.uint8).reshape(plane_size, 4)
+        out_arr[:, 0] = np.frombuffer(blue_plane, dtype=np.uint8)[:plane_size] if blue_plane is not None else 0
+        out_arr[:, 1] = np.frombuffer(green_plane, dtype=np.uint8)[:plane_size] if green_plane is not None else 0
+        out_arr[:, 2] = np.frombuffer(red_plane, dtype=np.uint8)[:plane_size] if red_plane is not None else 0
+        out_arr[:, 3] = np.frombuffer(alpha_plane, dtype=np.uint8)[:plane_size] if alpha_plane is not None else 0xFF
         return out
 
     def _readRawPlane(self, data, offset, size):
@@ -1128,11 +1153,8 @@ class DrdynvcLayer(LayerAutomata):
                         break
                     run_len += struct.unpack_from('<H', data, offset)[0]
                     offset += 2
-            for _ in range(run_len):
-                if pos >= plane_size:
-                    break
-                out[pos] = 0
-                pos += 1
+            fill = min(run_len, plane_size - pos)
+            pos += fill  # out is already zero-initialized
 
             if raw_len == 15:
                 if offset >= len(data):
@@ -1145,21 +1167,19 @@ class DrdynvcLayer(LayerAutomata):
                         break
                     raw_len += struct.unpack_from('<H', data, offset)[0]
                     offset += 2
-            for _ in range(raw_len):
-                if pos >= plane_size or offset >= len(data):
-                    break
-                out[pos] = data[offset]
-                pos += 1
-                offset += 1
+            actual = min(raw_len, plane_size - pos, len(data) - offset)
+            if actual > 0:
+                out[pos:pos + actual] = data[offset:offset + actual]
+                pos += actual
+                offset += actual
         return out, offset
 
     def _applyDelta(self, plane, w, h):
-        """XOR each row with the previous row (delta decode)."""
+        """XOR each row with the previous row (delta decode) — vectorized."""
         if plane is None or len(plane) < w * h:
             return
-        for y in range(1, h):
-            for x in range(w):
-                plane[y * w + x] ^= plane[(y - 1) * w + x]
+        arr = np.frombuffer(plane, dtype=np.uint8).reshape(h, w)
+        np.bitwise_xor.accumulate(arr, axis=0, out=arr)
 
 
     def _renderClearCodec(self, surfaceId, left, top, width, height, pixelFormat, bitmapData):

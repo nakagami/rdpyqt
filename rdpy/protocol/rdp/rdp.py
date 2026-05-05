@@ -56,6 +56,7 @@ class RDPClientController(pdu.layer.PDUClientListener):
         #dynamic virtual channel layer
         self._drdynvcLayer = drdynvc.DrdynvcLayer()
         self._drdynvcLayer.setGfxCallback(self._onGfxBitmap)
+        self._drdynvcLayer.setGfxSurfaceCallback(self._onGfxSurface)
         self._drdynvcLayer.setCapsConfirmCallback(self._onGfxCapsConfirm)
         #audio output virtual channel layer
         self._rdpsndLayer = rdpsnd.RdpsndLayer()
@@ -265,6 +266,12 @@ class RDPClientController(pdu.layer.PDUClientListener):
         for observer in self._clientObserver:
             observer.onUpdate(destLeft, destTop, destRight, destBottom,
                               width, height, bpp, isCompress, data)
+
+    def _onGfxSurface(self, dest_x, dest_y, width, height, surf_buf, surf_w, src_left, src_top):
+        """Fast-path callback: deliver AVC surface buffer region to observers."""
+        for observer in self._clientObserver:
+            observer.onGfxSurface(dest_x, dest_y, width, height,
+                                  surf_buf, surf_w, src_left, src_top)
 
     def onPointerHide(self):
         """
@@ -833,6 +840,15 @@ class RDPClientObserver(object):
         @param data: bitmap data
         """
         raise CallPureVirtualFuntion("%s:%s defined by interface %s"%(self.__class__, "onUpdate", "RDPClientObserver"))
+
+    def onGfxSurface(self, dest_x, dest_y, width, height, surf_buf, surf_w, src_left, src_top):
+        """Fast-path AVC delivery: a region of *surf_buf* (bytearray) has been
+        updated.  The pixel at column *src_left*, row *src_top* is at byte
+        offset ``(src_top * surf_w + src_left) * 4``; row stride is
+        ``surf_w * 4`` bytes.  Override to create a QImage with stride instead
+        of calling onUpdate with bytes — avoids the tobytes() copy.
+        """
+        pass  # default: no-op; subclasses override for zero-copy delivery
 
     def onPointerHide(self):
         """

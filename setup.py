@@ -7,7 +7,14 @@ else:
     try:
         from Cython.Build import cythonize
         ext_modules = cythonize(
-            [Extension("rdpy.core.rle", ["rdpy/core/rle.pyx"])],
+            [
+                Extension("rdpy.core.rle", ["rdpy/core/rle.pyx"]),
+                Extension(
+                    "rdpy.protocol.rdp.rlgr1_decode",
+                    ["rdpy/protocol/rdp/rlgr1_decode.pyx"],
+                    include_dirs=[__import__('numpy').get_include()],
+                ),
+            ],
             compiler_directives={
                 "language_level": "3",
                 "boundscheck": False,

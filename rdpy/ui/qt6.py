@@ -542,6 +542,20 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
         image = RDPBitmapToQtImage(width, height, bitsPerPixel, isCompress, data)
         self._widget.notifyImage(destLeft, destTop, image, destRight - destLeft + 1, destBottom - destTop + 1)
 
+    def onGfxSurface(self, dest_x, dest_y, width, height, surf_buf, surf_w, src_left, src_top):
+        """Fast-path AVC delivery: create QImage from surface buffer region with stride.
+
+        Avoids tobytes() — wraps the persistent surface buffer directly using
+        Qt's bytes-per-line stride parameter so non-contiguous partial updates
+        work without any extra memory allocation.
+        """
+        offset = (src_top * surf_w + src_left) * 4
+        view = memoryview(surf_buf)[offset:]
+        image = QtGui.QImage(view, width, height, surf_w * 4,
+                             QtGui.QImage.Format.Format_RGB32)
+        image._buffer_ref = surf_buf
+        self._widget.notifyImage(dest_x, dest_y, image, width, height)
+
     def onReady(self):
         """
         @summary: Call when stack is ready

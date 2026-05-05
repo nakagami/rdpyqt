@@ -8,6 +8,7 @@ import struct
 import functools
 import numpy as np
 import rdpy.core.log as log
+from rdpy.protocol.rdp.rlgr1_decode import rlgr1_decode
 
 # Progressive block types
 PROG_WBT_SYNC = 0xCCC0
@@ -33,6 +34,8 @@ _SUBBAND_SIZES = [1024, 1024, 1024, 256, 256, 256, 64, 64, 64, 64]
 # RLGR1 Decoder
 # ---------------------------------------------------------------
 
+# _BitReader is kept here for use by _upgrade_component.
+# The same class also lives in rlgr1_decode.py for use by the Python rlgr1_decode.
 class _BitReader:
     __slots__ = ('_data', '_pos', '_total', '_accum', '_accum_bits')
 
@@ -127,124 +130,6 @@ class _BitReader:
             else:
                 return count
         return count
-
-
-# RLGR1 constants (matching FreeRDP/grdp)
-_LSGR = 3
-_KPMAX = 80
-_UPGR = 4
-_DNGR = 6
-_UQGR = 3
-_DQGR = 3
-
-
-def rlgr1_decode(data, output_size):
-    """Decode RLGR1 encoded data into signed 16-bit DWT coefficients."""
-    if data is None or len(data) == 0:
-        return np.zeros(output_size, dtype=np.int16)
-
-    br = _BitReader(data)
-    output = np.zeros(output_size, dtype=np.int16)
-    cnt = 0
-
-    k = 1
-    kp = 1 << _LSGR  # 8
-    kr = 1
-    krp = 1 << _LSGR  # 8
-
-    while br.remaining() > 0 and cnt < output_size:
-        if k > 0:
-            # RL (Run-Length) Mode
-            vk = br.count_leading_bits(0)
-            if br.remaining() < 0:
-                break
-
-            run = 0
-            for _ in range(vk):
-                run += 1 << k
-                kp += _UPGR
-                if kp > _KPMAX:
-                    kp = _KPMAX
-                k = kp >> _LSGR
-
-            if br.remaining() < k:
-                break
-            if k > 0:
-                run += br.read_bits(k)
-
-            if br.remaining() < 1:
-                break
-            sign = br.read_bits(1)
-
-            vk2 = br.count_leading_bits(1)
-            if br.remaining() < 0:
-                break
-
-            if br.remaining() < kr:
-                break
-            code = br.read_bits(kr) if kr > 0 else 0
-            code |= vk2 << kr
-
-            # Update kr/krp
-            if vk2 == 0:
-                krp = max(0, krp - 2)
-                kr = krp >> _LSGR
-            elif vk2 != 1:
-                krp = min(_KPMAX, krp + vk2)
-                kr = krp >> _LSGR
-
-            # Update k/kp (decrease after non-zero)
-            kp = max(0, kp - _DNGR)
-            k = kp >> _LSGR
-
-            mag = code + 1
-
-            # Output run zeros then the non-zero value
-            end = min(cnt + run, output_size)
-            # output[cnt:end] already 0
-            cnt = end
-            if cnt < output_size:
-                output[cnt] = -mag if sign else mag
-                cnt += 1
-
-        else:
-            # GR (Golomb-Rice) Mode
-            vk = br.count_leading_bits(1)
-            if br.remaining() < 0:
-                break
-
-            if br.remaining() < kr:
-                break
-            code = br.read_bits(kr) if kr > 0 else 0
-            code |= vk << kr
-
-            # Update kr/krp
-            if vk == 0:
-                krp = max(0, krp - 2)
-                kr = krp >> _LSGR
-            elif vk != 1:
-                krp = min(_KPMAX, krp + vk)
-                kr = krp >> _LSGR
-
-            if code == 0:
-                kp = min(_KPMAX, kp + _UQGR)
-                k = kp >> _LSGR
-                if cnt < output_size:
-                    output[cnt] = 0
-                    cnt += 1
-            else:
-                kp = max(0, kp - _DQGR)
-                k = kp >> _LSGR
-                # RLGR1: code = 2*magnitude - sign
-                if code & 1:
-                    mag = -((code + 1) >> 1)
-                else:
-                    mag = code >> 1
-                if cnt < output_size:
-                    output[cnt] = mag
-                    cnt += 1
-
-    return output
 
 
 # ---------------------------------------------------------------
