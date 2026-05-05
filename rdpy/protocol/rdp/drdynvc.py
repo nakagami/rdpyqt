@@ -1009,7 +1009,7 @@ class DrdynvcLayer(LayerAutomata):
     def _onAvcNoOutput(self):
         """Called when an AVC frame produces no output.
 
-        Triggers a decoder flush and server refresh request when either:
+        Triggers a hard decoder reset and server refresh request when either:
           (a) the decoder has been silent for longer than _AVC_FREEZE_THRESHOLD
               seconds, OR
           (b) _AVC_NULL_FRAME_THRESHOLD consecutive null frames have accumulated
@@ -1018,6 +1018,20 @@ class DrdynvcLayer(LayerAutomata):
 
         Both checks are subject to _AVC_REFRESH_COOLDOWN to avoid spamming
         the server, which can cause side-effects such as RDPSND channel closure.
+
+        On freeze, we call _hard_reset() (not just flush()) because:
+          - flush() only resets null-frame counters; the underlying VideoToolbox
+            decoder remains stuck and continues to return null for all subsequent
+            P-frames.
+          - requestFullRefresh() sends a legacy SupressOutputDataPDU, which the
+            RDPGFX server does NOT interpret as an IDR request — it keeps sending
+            P-frames, so the stuck decoder never recovers (confirmed in logs:
+            null_count reaches 95+ before the connection dies).
+          - _hard_reset() recreates the decoder, sets _prepend_sps_next_idr so
+            the cached SPS+PPS is injected before the next server IDR, and calls
+            on_hard_reset → _onAvcHardReset → _requestRefreshCallback().
+            When the server eventually sends an IDR on a scene change (YouTube
+            sends them frequently), decoding resumes immediately.
         """
         if self._avcLastSuccessTime == 0.0:
             return  # No successful decode yet; normal during startup
@@ -1036,17 +1050,18 @@ class DrdynvcLayer(LayerAutomata):
         if now - self._avcLastRefreshTime < self._AVC_REFRESH_COOLDOWN:
             return  # Cooldown: avoid spamming the server
 
-        log.debug("RDPGFX: AVC frozen for %.1fs (null_count=%d), "
-                  "flushing decoder and requesting refresh"
-                  % (frozen_for, null_count))
+        trigger_reason = ('time(%.1fs)' % frozen_for if time_triggered
+                          else 'count(%d)' % null_count)
+        log.debug("RDPGFX: AVC frozen [%s], hard-resetting decoder and requesting refresh"
+                  % trigger_reason)
         self._avcLastRefreshTime = now
 
-        # Flush (not destroy) the decoder: resets null-frame counters while
-        # keeping SPS/PPS context intact so the fresh IDR can be decoded.
+        # Hard-reset the decoder: recreates VideoToolbox context, injects cached
+        # SPS+PPS before the next IDR, and calls on_hard_reset →
+        # _onAvcHardReset → _requestRefreshCallback() to request a server refresh.
         if self._avcDecoder is not None:
-            self._avcDecoder.flush()
-
-        if self._requestRefreshCallback is not None:
+            self._avcDecoder._hard_reset(reason='freeze %s' % trigger_reason)
+        elif self._requestRefreshCallback is not None:
             self._requestRefreshCallback()
 
     def _renderUncompressed(self, surfaceId, left, top, width, height, pixelFormat, data):

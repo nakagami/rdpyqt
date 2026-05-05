@@ -580,13 +580,15 @@ class AvcDecoder:
                 search_from = nal_start + 1
         return nal_types
 
-    def _hard_reset(self):
-        """Destroy and recreate the decoder after a persistent hardware error.
+    def _hard_reset(self, reason='hardware error'):
+        """Destroy and recreate the decoder.
 
-        VideoToolbox (macOS hardware decoder) can enter an unrecoverable error
-        state where every avcodec_send_packet() returns AVERROR_UNKNOWN.
-        flush_buffers() has no effect on this state; the only fix is to destroy
-        and recreate the codec context.
+        Called either after a persistent hardware error (AVERROR_UNKNOWN cascade)
+        or when the RDPGFX layer detects a freeze (null output for too long).
+
+        VideoToolbox (macOS hardware decoder) can enter an unrecoverable state
+        where flush_buffers() has no effect; the only fix is to destroy and
+        recreate the codec context.
 
         After recreation the decoder has no SPS/PPS context.  If we have
         cached SPS/PPS from the original session we set _prepend_sps_next_idr
@@ -597,8 +599,8 @@ class AvcDecoder:
         to avoid an infinite reset loop if hardware acceleration is broken.
         """
         self._hw_reset_count += 1
-        log.warning("AVC: hard reset #%d (persistent hardware error, recreating decoder)"
-                    % self._hw_reset_count)
+        log.warning("AVC: hard reset #%d (%s, recreating decoder)"
+                    % (self._hw_reset_count, reason))
         self._ctx = None
         self._hw_error_count = 0
         self._decode_count = 0
@@ -797,8 +799,10 @@ class AvcDecoder:
         nal_types = self._parse_and_cache_nals(h264_data)
         has_idr = 5 in nal_types
 
-        # Log NAL types for early frames and every IDR
-        if self._decode_count <= 5 or has_idr:
+        # Log NAL types for early frames, every IDR, and during freeze
+        # (null_count > 0 means the decoder is not producing output — logging NAL
+        # types helps confirm whether the server is sending IDR frames during recovery)
+        if self._decode_count <= 5 or has_idr or self._null_count > 0:
             names = [self._NAL_NAMES.get(t, str(t)) for t in nal_types]
             log.debug("AVC: decode #%d NAL types: %s (h264Len=%d)" %
                      (self._decode_count, ','.join(names), len(h264_data)))
