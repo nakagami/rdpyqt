@@ -977,11 +977,10 @@ class DrdynvcLayer(LayerAutomata):
                 self._onAvcNoOutput()
                 return
             if isinstance(bgra_arr, bytes):
-                # b"" sentinel: LC=2 chroma-only frame.  Do NOT update
-                # _avcLastSuccessTime here: chroma frames keep arriving even
-                # when the luma decoder is frozen (as seen with YouTube videos).
-                # Updating the timestamp would continuously reset frozen_for,
-                # preventing freeze detection from ever triggering.
+                # b"" sentinel: LC=2 frame not yet decodable (aux decoder not
+                # primed or no cached luma).  Do NOT update _avcLastSuccessTime:
+                # the luma decoder may be the source of a freeze, and LC=2
+                # frames arriving independently should not mask it.
                 return
             self._avcLastSuccessTime = time.monotonic()
             self._blitToSurface(surfaceId, left, top, width, height, bgra_arr)

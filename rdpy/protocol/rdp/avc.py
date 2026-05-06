@@ -176,6 +176,56 @@ void nv12_lr_to_bgra(
         }
     }
 }
+
+/* YUV444 (full-res U/V) limited-range BT.601 -> BGRA.
+ * Used for AVC444 LC=2 chroma-upgrade combine output.
+ * U and V have the same stride as Y (all full-resolution). */
+void yuv444_lr_to_bgra(
+    const uint8_t *restrict Y, int y_stride,
+    const uint8_t *restrict U, int u_stride,
+    const uint8_t *restrict V, int v_stride,
+    uint8_t *restrict bgra, int width, int height)
+{
+    for (int row = 0; row < height; row++) {
+        const uint8_t *Yr = Y + row * y_stride;
+        const uint8_t *Ur = U + row * u_stride;
+        const uint8_t *Vr = V + row * v_stride;
+        uint8_t *dst = bgra + row * width * 4;
+        for (int col = 0; col < width; col++) {
+            int c = (int)Yr[col] - 16;
+            int d = (int)Ur[col] - 128;
+            int e = (int)Vr[col] - 128;
+            dst[col*4]   = clamp8((298*c + 516*d + 128) >> 8);
+            dst[col*4+1] = clamp8((298*c - 100*d - 208*e + 128) >> 8);
+            dst[col*4+2] = clamp8((298*c + 409*e + 128) >> 8);
+            dst[col*4+3] = 255;
+        }
+    }
+}
+
+/* YUV444 (full-res U/V) full-range BT.601 -> BGRA. */
+void yuv444_fr_to_bgra(
+    const uint8_t *restrict Y, int y_stride,
+    const uint8_t *restrict U, int u_stride,
+    const uint8_t *restrict V, int v_stride,
+    uint8_t *restrict bgra, int width, int height)
+{
+    for (int row = 0; row < height; row++) {
+        const uint8_t *Yr = Y + row * y_stride;
+        const uint8_t *Ur = U + row * u_stride;
+        const uint8_t *Vr = V + row * v_stride;
+        uint8_t *dst = bgra + row * width * 4;
+        for (int col = 0; col < width; col++) {
+            int y = (int)Yr[col];
+            int d = (int)Ur[col] - 128;
+            int e = (int)Vr[col] - 128;
+            dst[col*4]   = clamp8((256*y + 454*d + 128) >> 8);
+            dst[col*4+1] = clamp8((256*y -  88*d - 183*e + 128) >> 8);
+            dst[col*4+2] = clamp8((256*y + 359*e + 128) >> 8);
+            dst[col*4+3] = 255;
+        }
+    }
+}
 """
 
 _c_lib = None        # cached ctypes library (None = not yet loaded or failed)
@@ -213,6 +263,8 @@ def _get_c_lib():
         lib.yuv420p_lr_to_bgra.argtypes = [ct_p, ct_i, ct_p, ct_i, ct_p, ct_p, ct_i, ct_i]
         lib.yuv420p_fr_to_bgra.argtypes = [ct_p, ct_i, ct_p, ct_i, ct_p, ct_p, ct_i, ct_i]
         lib.nv12_lr_to_bgra.argtypes    = [ct_p, ct_i, ct_p, ct_i, ct_p, ct_i, ct_i]
+        lib.yuv444_lr_to_bgra.argtypes  = [ct_p, ct_i, ct_p, ct_i, ct_p, ct_i, ct_p, ct_i, ct_i]
+        lib.yuv444_fr_to_bgra.argtypes  = [ct_p, ct_i, ct_p, ct_i, ct_p, ct_i, ct_p, ct_i, ct_i]
         _c_lib = lib
         log.debug("AVC: native YUV->BGRA extension loaded (%s)" % so_path)
     except Exception as e:
@@ -388,6 +440,105 @@ def _frame_nv12_to_bgra(frame):
     v_half = uv[:, 1::2]
     return _bt601_yuv420_to_bgra(y, u_half, v_half, False)
 
+
+def _bt601_yuv444_to_bgra(y, u_full, v_full, full_range):
+    """Convert YUV444 (full-resolution U/V planes) to a BGRA numpy array.
+
+    Used for AVC444 LC=2 combine output where U/V have already been
+    reconstructed to full resolution by _combine_avc444v2_bgra.
+
+    Fast path: C extension (yuv444_lr/fr_to_bgra).
+    Fallback: float32 numpy arithmetic.
+    """
+    h, w = y.shape
+    bgra = _get_yuv_bufs(h, w)['bgra']
+    lib = _get_c_lib()
+    if lib is not None:
+        fn = lib.yuv444_fr_to_bgra if full_range else lib.yuv444_lr_to_bgra
+        fn(_arr_ptr(y),      y.strides[0],
+           _arr_ptr(u_full), u_full.strides[0],
+           _arr_ptr(v_full), v_full.strides[0],
+           _arr_ptr(bgra), w, h)
+        return bgra
+
+    # numpy fallback (float32 path)
+    Y = y.astype(np.float32)
+    U = u_full.astype(np.float32) - 128.0
+    V = v_full.astype(np.float32) - 128.0
+    if full_range:
+        R = np.clip(Y + 1.402 * V, 0, 255)
+        G = np.clip(Y - 0.344 * U - 0.714 * V, 0, 255)
+        B = np.clip(Y + 1.772 * U, 0, 255)
+    else:
+        Y -= 16.0
+        R = np.clip(1.164 * Y + 1.596 * V, 0, 255)
+        G = np.clip(1.164 * Y - 0.392 * U - 0.813 * V, 0, 255)
+        B = np.clip(1.164 * Y + 2.017 * U, 0, 255)
+    bgra[:, :, 0] = B
+    bgra[:, :, 1] = G
+    bgra[:, :, 2] = R
+    bgra[:, :, 3] = 255
+    return bgra
+
+
+def _combine_avc444v2_bgra(y_plane, u_half, v_half, aux_frame, full_range, w, h):
+    """Combine stream1 luma with stream2 chroma per MS-RDPEGFX 3.3.8.3.3.
+
+    Reconstructs full-resolution U444/V444 planes from two sources:
+      - stream1 cached half-res chroma (u_half, v_half) for B2/B3 positions
+      - stream2 auxiliary I420 planes (aux_frame) for B4/B5/B6/B7/B8/B9
+
+    Channel mapping (AVC444v2, codecId=0x000F):
+      B4/B5 — aux_y row [col=2k+1]:
+        bytes [0, w/2)    = Cb at all odd-x columns
+        bytes [w/2, w)    = Cr at all odd-x columns
+      B6/B7 — aux_u half-height row (row=2j+1, col=4k):
+        bytes [0, w/4)    = Cb, bytes [w/4, w/2) = Cr
+      B8/B9 — aux_v half-height row (row=2j+1, col=4k+2):
+        bytes [0, w/4)    = Cb, bytes [w/4, w/2) = Cr
+      B2/B3 — even col/even row: from stream1 half-res u_half/v_half
+
+    Parameters:
+      y_plane:   (h, w)         uint8 — luma from stream1
+      u_half:    (h//2, w//2)   uint8 — Cb from stream1 (half-res)
+      v_half:    (h//2, w//2)   uint8 — Cr from stream1 (half-res)
+      aux_frame: av.VideoFrame  yuv420p — decoded from stream2
+      full_range: bool
+      w, h: target frame dimensions
+
+    Returns BGRA numpy array (h, w, 4) uint8 from the shared pool.
+    Caller must copy before next decode if retaining.
+    """
+    half_w = w // 2
+    quarter_w = w // 4
+    half_h = (h + 1) // 2
+
+    aux_y = _plane_to_array(aux_frame.planes[0])  # (h, w) logical
+    aux_u = _plane_to_array(aux_frame.planes[1])  # (half_h, half_w) logical
+    aux_v = _plane_to_array(aux_frame.planes[2])  # (half_h, half_w) logical
+
+    U444 = np.empty((h, w), dtype=np.uint8)
+    V444 = np.empty((h, w), dtype=np.uint8)
+
+    # B4/B5: odd columns, all rows — from aux_y
+    U444[:h, 1::2] = aux_y[:h, :half_w]
+    V444[:h, 1::2] = aux_y[:h, half_w:half_w + (w - half_w)]
+
+    # B2/B3: even columns, even rows — from stream1 half-res chroma
+    U444[0::2, 0::2] = u_half[:half_h, :half_w]
+    V444[0::2, 0::2] = v_half[:half_h, :half_w]
+
+    # B6/B7: col % 4 == 0, odd rows — from aux_u
+    U444[1::2, 0::4] = aux_u[:half_h, :quarter_w]
+    V444[1::2, 0::4] = aux_u[:half_h, quarter_w:quarter_w * 2]
+
+    # B8/B9: col % 4 == 2, odd rows — from aux_v
+    U444[1::2, 2::4] = aux_v[:half_h, :quarter_w]
+    V444[1::2, 2::4] = aux_v[:half_h, quarter_w:quarter_w * 2]
+
+    return _bt601_yuv444_to_bgra(y_plane, U444, V444, full_range)
+
+
 try:
     import av
     _HAS_AV = True
@@ -476,6 +627,14 @@ class AvcDecoder:
         self._keyframe_wait_count = 0  # non-IDR frames dropped while waiting for IDR
         self._prepend_sps_next_idr = False  # inject SPS+PPS before next IDR
         self.on_hard_reset = None    # callback() invoked after each hard reset
+        # AVC444 LC=2 chroma-upgrade support
+        self._dec2 = None            # auxiliary decoder for stream2 (LC=2 P-frames)
+        self._avc444_y = None        # cached luma (h, w) uint8 from last LC=0/1 decode
+        self._avc444_u = None        # cached Cb (h//2, w//2) uint8 from last LC=0/1 decode
+        self._avc444_v = None        # cached Cr (h//2, w//2) uint8 from last LC=0/1 decode
+        self._avc444_full_range = False
+        self._avc444_w = 0
+        self._avc444_h = 0
         self._init_decoder()
 
     def _init_decoder(self):
@@ -502,6 +661,9 @@ class AvcDecoder:
     def close(self):
         if self._ctx is not None:
             self._ctx = None
+        if self._dec2 is not None:
+            self._dec2.close()
+            self._dec2 = None
 
     def flush(self):
         """Flush decoder buffers while preserving the codec context.
@@ -531,6 +693,8 @@ class AvcDecoder:
         """
         self._decode_count = 0
         self._null_count = 0
+        if self._dec2 is not None:
+            self._dec2.flush()
 
     def _parse_and_cache_nals(self, h264_data):
         """Single-pass NAL unit scanner: return NAL type list and update SPS/PPS cache.
@@ -708,12 +872,13 @@ class AvcDecoder:
         """Decode AVC444/AVC444v2 bitmap stream.
 
         LC values:
-          0 = both luma (YUV420) and chroma streams present
+          0 = both luma (YUV420) and chroma streams present; primes aux decoder
           1 = luma stream only
-          2 = chroma stream only (skipped)
+          2 = chroma-upgrade only; combined with cached luma via aux decoder
 
         Returns BGRA numpy array (dest_height, dest_width, 4), b"" sentinel
-        for LC=2 chroma-only, or None on failure.
+        when LC=2 cannot be decoded (aux decoder not yet primed), or None on
+        failure.
         """
         if len(data) < 4:
             return None
@@ -726,23 +891,47 @@ class AvcDecoder:
         log.debug("AVC444: LC=%d cbStream1=%d restLen=%d" %
                   (lc, cbAvc420Stream1, len(rest)))
 
+        if lc == 2:
+            return self._decode_avc444_lc2(rest, dest_width, dest_height)
+
+        # LC=0 or LC=1: decode stream1 and cache YUV planes for future LC=2.
         if lc == 0:
             if cbAvc420Stream1 > len(rest):
                 log.warning("AVC444: stream1 size %d exceeds data %d" %
                             (cbAvc420Stream1, len(rest)))
                 return None
-            return self.decode_avc420_arr(rest[:cbAvc420Stream1], dest_width, dest_height)
+            stream1_data = rest[:cbAvc420Stream1]
         elif lc == 1:
-            stream_data = rest
+            stream1_data = rest
             if cbAvc420Stream1 > 0 and cbAvc420Stream1 <= len(rest):
-                stream_data = rest[:cbAvc420Stream1]
-            return self.decode_avc420_arr(stream_data, dest_width, dest_height)
-        elif lc == 2:
-            log.debug("AVC444: LC=2 chroma-only, skipping")
-            return b""
+                stream1_data = rest[:cbAvc420Stream1]
         else:
             log.warning("AVC444: unexpected LC value %d" % lc)
             return None
+
+        _regions, h264_data = self._parse_avc420_stream(stream1_data)
+        if h264_data is None or len(h264_data) == 0:
+            return None
+
+        frame = self._decode_h264(h264_data)
+        if frame is None:
+            return None
+
+        # Cache YUV planes for future LC=2 chroma-upgrade combine.
+        self._cache_stream1_yuv(frame)
+
+        result = self._frame_to_bgra(frame, dest_width, dest_height)
+
+        # LC=0: prime the auxiliary decoder with stream2 so it has the IDR
+        # for subsequent standalone LC=2 P-frames.
+        if lc == 0 and cbAvc420Stream1 < len(rest):
+            stream2_data = rest[cbAvc420Stream1:]
+            if stream2_data:
+                _r2, h264_data2 = self._parse_avc420_stream(stream2_data)
+                if h264_data2 and len(h264_data2) > 0:
+                    self._prime_aux_decoder(h264_data2)
+
+        return result
 
     def decode_avc444(self, data, dest_width, dest_height):
         """Decode AVC444/AVC444v2 bitmap stream.
@@ -750,20 +939,112 @@ class AvcDecoder:
         LC values:
           0 = both luma (YUV420) and chroma streams present
           1 = luma stream only
-          2 = chroma stream only (skipped)
+          2 = chroma-upgrade; combined with cached luma when aux decoder is ready
 
-        Returns BGRA bytes (dest_width * dest_height * 4) or None.
+        Returns BGRA bytes (dest_width * dest_height * 4), b"" sentinel when
+        LC=2 cannot yet be decoded, or None on failure.
         """
         arr = self.decode_avc444_arr(data, dest_width, dest_height)
         if arr is None:
             return None
-        if isinstance(arr, bytes):  # b"" LC=2 chroma-only sentinel
+        if isinstance(arr, bytes):  # b"" sentinel: LC=2 not yet decodable
             return b""
         return arr.tobytes()
 
-    # -----------------------------------------------------------------
-    # H.264 decoding core
-    # -----------------------------------------------------------------
+    def _cache_stream1_yuv(self, frame):
+        """Extract and cache YUV planes from stream1 frame for LC=2 combine.
+
+        Normalises the frame to yuv420p so plane access is uniform regardless
+        of whether the decoder is hardware (VideoToolbox/VAAPI) or software.
+        Copies the planes to avoid holding references to the frame buffer.
+        """
+        fmt = frame.format.name
+        if fmt not in ('yuv420p', 'yuvj420p'):
+            frame = frame.reformat(format='yuv420p')
+        self._avc444_full_range = frame.format.name in _FULL_RANGE_FORMATS
+        self._avc444_y = _plane_to_array(frame.planes[0]).copy()
+        self._avc444_u = _plane_to_array(frame.planes[1]).copy()
+        self._avc444_v = _plane_to_array(frame.planes[2]).copy()
+        self._avc444_w = frame.width
+        self._avc444_h = frame.height
+
+    def _prime_aux_decoder(self, h264_data):
+        """Feed stream2 data to the auxiliary decoder to advance past its IDR.
+
+        The IDR for the auxiliary H.264 sequence is always carried inside the
+        LC=0 stream2.  Subsequent LC=2 packets are P-frames in that same
+        sequence.  By decoding (and discarding) the IDR here, h264dec2 is
+        primed with the codec state needed to decode the later P-frames.
+        """
+        dec2 = self._get_aux_decoder()
+        try:
+            dec2._decode_h264(h264_data)
+        except Exception as e:
+            log.debug("AVC444: aux decoder prime error: %s" % e)
+            if dec2._hw_error_count >= dec2._HW_ERROR_THRESHOLD:
+                dec2.close()
+                self._dec2 = None
+
+    def _get_aux_decoder(self):
+        """Lazy-initialize the auxiliary H.264 decoder for stream2."""
+        if self._dec2 is None:
+            self._dec2 = AvcDecoder()
+            log.debug("AVC444: auxiliary decoder initialized")
+        return self._dec2
+
+    def _decode_avc444_lc2(self, data, dest_width, dest_height):
+        """Decode AVC444 LC=2 (chroma-upgrade) frame and combine with cached luma.
+
+        Returns a BGRA numpy array on success, or b"" when the auxiliary
+        decoder is not yet primed or the luma cache is empty.
+        """
+        if self._dec2 is None:
+            log.debug("AVC444: LC=2 skipped (aux decoder not yet initialized)")
+            return b""
+        if self._avc444_y is None:
+            log.debug("AVC444: LC=2 skipped (no cached luma)")
+            return b""
+
+        _regions, h264_data = self._parse_avc420_stream(data)
+        if h264_data is None or len(h264_data) == 0:
+            log.debug("AVC444: LC=2 skipped (empty stream2 H.264 data)")
+            return b""
+
+        try:
+            aux_frame = self._dec2._decode_h264(h264_data)
+        except Exception as e:
+            log.debug("AVC444: LC=2 aux decode error: %s" % e)
+            return b""
+
+        if aux_frame is None:
+            log.debug("AVC444: LC=2 aux decode buffering")
+            return b""
+
+        # Normalise to yuv420p for uniform plane access.
+        fmt = aux_frame.format.name
+        if fmt not in ('yuv420p', 'yuvj420p'):
+            aux_frame = aux_frame.reformat(format='yuv420p')
+
+        w, h = self._avc444_w, self._avc444_h
+        bgra = _combine_avc444v2_bgra(
+            self._avc444_y, self._avc444_u, self._avc444_v,
+            aux_frame, self._avc444_full_range, w, h)
+
+        log.debug("AVC444: LC=2 decoded and combined (%dx%d dest=%dx%d)" %
+                  (w, h, dest_width, dest_height))
+
+        # Crop/pad to dest size (mirrors _frame_to_bgra behaviour).
+        src_h, src_w = bgra.shape[:2]
+        if src_w == dest_width and src_h == dest_height:
+            return bgra
+
+        copy_w = min(src_w, dest_width)
+        copy_h = min(src_h, dest_height)
+        out = np.zeros((dest_height, dest_width, 4), dtype=np.uint8)
+        out[:copy_h, :copy_w] = bgra[:copy_h, :copy_w]
+        return out
+
+
 
     _NAL_NAMES = {1: 'P', 5: 'IDR', 6: 'SEI', 7: 'SPS', 8: 'PPS', 9: 'AUD'}
 
