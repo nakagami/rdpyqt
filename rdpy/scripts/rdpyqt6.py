@@ -104,7 +104,7 @@ class RDPClientQtFactory(rdp.ClientFactory):
     """
     @summary: Factory create a RDP GUI client
     """
-    def __init__(self, app, width, height, username, password, domain, keyboardType, keyboardLayout, security, swap_alt_meta=False, disable_avc444=False):
+    def __init__(self, app, width, height, username, password, domain, keyboardType, keyboardLayout, security, swap_alt_meta=False, disable_avc444=False, drives=None):
         """
         @param app: {QApplication} Qt application instance
         @param width: {integer} width of client
@@ -117,6 +117,7 @@ class RDPClientQtFactory(rdp.ClientFactory):
         @param security: {str} (ssl | rdp | nego)
         @param swap_alt_meta: {bool} swap Alt and Meta (Windows) keys
         @param disable_avc444: {bool} disable AVC444/AVC444v2 and use AVC420 only
+        @param drives: {list} [(name, path)] local directories redirected as drives (rdpdr)
         """
         self._app = app
         self._width = width
@@ -136,6 +137,7 @@ class RDPClientQtFactory(rdp.ClientFactory):
             self._security = security
         self._swap_alt_meta = swap_alt_meta
         self._disable_avc444 = disable_avc444
+        self._drives = drives or []
         self._w = None
         self._resizing = False
         self._decoderBroken = False
@@ -169,6 +171,11 @@ class RDPClientQtFactory(rdp.ClientFactory):
         controller.setHostname(socket.gethostname())
         controller.setSecurityLevel(self._security)
         controller.setAVC444Disabled(self._disable_avc444)
+
+        # Device redirection: a new controller is built for every
+        # (re)connection, so drives are registered each time
+        for name, path in self._drives:
+            controller.addDrive(name, path)
 
         # Wire up H.264 decoder-broken callback for auto-reconnect
         controller.setDecoderBrokenCallback(self._onDecoderBroken)
@@ -263,7 +270,28 @@ def help():
     \t-kl: keyboard layout (e.g. US, FRENCH) [default : US]
     \t--swap-alt-meta: swap Alt and Meta (Windows/Super/Command) keys [default : False]
     \t--disable-avc444: disable AVC444/AVC444v2 and use AVC420 only [default : False]
+    \t--drive [NAME=]PATH: redirect a local directory as a drive, can be repeated
     """)
+
+
+def parse_drive(arg):
+    """
+    @summary: Parse a --drive argument: "NAME=PATH" or "PATH" (name = directory name)
+    @param arg: {str}
+    @return: {tuple} (name, absolute path)
+    @raise ValueError: invalid argument or path is not a directory
+    """
+    import os
+    name, sep, path = arg.partition("=")
+    if not sep:
+        name, path = "", arg
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isdir(path):
+        raise ValueError("--drive: not a directory: %s" % path)
+    if not name:
+        from rdpy.protocol.rdp.rdpdr_drive import defaultDriveName
+        name = defaultDriveName(path)
+    return name, path
 
 
 def main():
@@ -276,6 +304,7 @@ def main():
     keyboardLayout = "US"
     swap_alt_meta = False
     disable_avc444 = False
+    drives = []
     
     argv = []
     for a in sys.argv[1:]:
@@ -287,11 +316,13 @@ def main():
             argv.append("--disable-avc444")
         elif a == "-swap-alt-meta":
             argv.append("--swap-alt-meta")
+        elif a == "-drive" or a.startswith("-drive="):
+            argv.append("-" + a)
         else:
             argv.append(a)
 
     try:
-        opts, args = getopt.getopt(argv, "fou:p:d:w:h:r:", ["kt=", "kl=", "swap-alt-meta", "disable-avc444"])
+        opts, args = getopt.getopt(argv, "fou:p:d:w:h:r:", ["kt=", "kl=", "swap-alt-meta", "disable-avc444", "drive="])
     except getopt.GetoptError:
         help()
         sys.exit(1)
@@ -314,6 +345,12 @@ def main():
             swap_alt_meta = True
         elif opt == "--disable-avc444":
             disable_avc444 = True
+        elif opt == "--drive":
+            try:
+                drives.append(parse_drive(arg))
+            except ValueError as e:
+                print(e)
+                sys.exit(1)
 
     if not username:
         username = input("User: ")
@@ -333,8 +370,10 @@ def main():
 
     log.info("keyboard type set to %s" % keyboardType)
     log.info("keyboard layout set to %s" % keyboardLayout)
+    for name, path in drives:
+        log.info("redirecting drive '%s' -> %s" % (name, path))
 
-    factory = RDPClientQtFactory(app, width, height, username, password, domain, keyboardType, keyboardLayout, "nego", swap_alt_meta, disable_avc444)
+    factory = RDPClientQtFactory(app, width, height, username, password, domain, keyboardType, keyboardLayout, "nego", swap_alt_meta, disable_avc444, drives)
 
     # Pre-create the Qt invoker on the Qt main thread so the _QtInvoker QObject
     # lives on the Qt main thread.  If created lazily from the Twisted thread it

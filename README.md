@@ -36,6 +36,7 @@ rdpyqt6 [options] ip[:port]
 | `-kl`   | Keyboard layout (see values below)            | `US`                 |
 | `--swap-alt-meta` | Swap Alt and Meta (Windows/Super/Command) keys | (disabled)     |
 | `--disable-avc444` | Disable AVC444/AVC444v2 and use AVC420 only   | (disabled)     |
+| `--drive [NAME=]PATH` | Redirect a local directory to the server as a drive (can be repeated) | (none) |
 
 #### `-kt` Keyboard Type values
 
@@ -78,3 +79,17 @@ Example:
 ```sh
 rdpyqt6 -u user -p password -w 1920 -h 1080 rdp_server:3389
 ```
+
+### Drive redirection
+
+The `rdpdr` device redirection channel ([MS-RDPEFS]) is supported for drives.
+Each `--drive` option shares a local directory with the remote session, where it
+appears in Explorer as *NAME on HOSTNAME* (`\\tsclient\NAME`).
+When `NAME` is omitted the directory name is used.
+
+```sh
+rdpyqt6 -u user -p password --drive docs=~/Documents --drive /mnt/usb rdp_server
+```
+
+Printer, serial/parallel port and smart card redirection are not implemented.
+

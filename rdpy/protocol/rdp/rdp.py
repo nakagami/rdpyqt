@@ -25,18 +25,9 @@ from rdpy.core import layer
 from rdpy.core.error import CallPureVirtualFuntion, InvalidValue
 from . import pdu
 import rdpy.core.log as log
-from . import tpkt, x224, sec, drdynvc, rdpsnd, cliprdr
+from . import tpkt, x224, sec, drdynvc, rdpsnd, cliprdr, rdpdr
 from .t125 import mcs, gcc
 from .nla import cssp, ntlm
-
-class _StubVChannel(layer.LayerAutomata):
-    """Stub virtual channel layer that accepts and discards all data."""
-    def __init__(self):
-        layer.LayerAutomata.__init__(self, None)
-    def connect(self):
-        pass
-    def recv(self, s):
-        pass
 
 class SecurityLevel(object):
     """
@@ -63,6 +54,8 @@ class RDPClientController(pdu.layer.PDUClientListener):
         self._drdynvcLayer.setRdpsndLayer(self._rdpsndLayer)
         #clipboard virtual channel layer
         self._cliprdrLayer = cliprdr.CliprdrLayer()
+        #device redirection (drives...) virtual channel layer
+        self._rdpdrLayer = rdpdr.RdpdrLayer()
         #PDU layer
         self._pduLayer = pdu.layer.Client(self)
         # AVC freeze recovery: when H.264 output stalls for too long, request
@@ -72,7 +65,7 @@ class RDPClientController(pdu.layer.PDUClientListener):
         self._secLayer = sec.Client(self._pduLayer)
         #multi channel service with drdynvc, rdpsnd, cliprdr, and rdpdr virtual channels
         self._mcsLayer = mcs.Client(self._secLayer, [
-            (gcc.ChannelDef(b"rdpdr", gcc.ChannelOptions.CHANNEL_OPTION_INITIALIZED | gcc.ChannelOptions.CHANNEL_OPTION_ENCRYPT_RDP | gcc.ChannelOptions.CHANNEL_OPTION_COMPRESS_RDP), _StubVChannel()),
+            (gcc.ChannelDef(b"rdpdr", gcc.ChannelOptions.CHANNEL_OPTION_INITIALIZED | gcc.ChannelOptions.CHANNEL_OPTION_ENCRYPT_RDP | gcc.ChannelOptions.CHANNEL_OPTION_COMPRESS_RDP), self._rdpdrLayer),
             (gcc.ChannelDef(b"rdpsnd", gcc.ChannelOptions.CHANNEL_OPTION_INITIALIZED | gcc.ChannelOptions.CHANNEL_OPTION_ENCRYPT_RDP), self._rdpsndLayer),
             (gcc.ChannelDef(b"cliprdr", gcc.ChannelOptions.CHANNEL_OPTION_INITIALIZED | gcc.ChannelOptions.CHANNEL_OPTION_ENCRYPT_RDP | gcc.ChannelOptions.CHANNEL_OPTION_COMPRESS_RDP | gcc.ChannelOptions.CHANNEL_OPTION_SHOW_PROTOCOL), self._cliprdrLayer),
             (gcc.ChannelDef(b"drdynvc", gcc.ChannelOptions.CHANNEL_OPTION_INITIALIZED | gcc.ChannelOptions.CHANNEL_OPTION_ENCRYPT_RDP), self._drdynvcLayer),
@@ -106,6 +99,25 @@ class RDPClientController(pdu.layer.PDUClientListener):
         @summary: Notify the server that the local clipboard has changed
         """
         self._cliprdrLayer.onLocalClipboardChanged()
+
+    def addDrive(self, name, path):
+        """
+        @summary: Redirect a local directory to the server as a drive (RDPDR)
+        must be called before the connection is established
+        @param name: {str} drive name shown on the server (e.g. "home")
+        @param path: {str} local directory to share
+        @return: {int} RDPDR device id
+        @raise ValueError: path is not a directory
+        """
+        return self._rdpdrLayer.addDrive(name, path)
+
+    def addRdpdrDevice(self, device):
+        """
+        @summary: Register a custom RDPDR device (rdpdr.RdpdrDevice subclass)
+        @param device: {rdpdr.RdpdrDevice}
+        @return: {int} RDPDR device id
+        """
+        return self._rdpdrLayer.addDevice(device)
 
     def getProtocol(self):
         """
@@ -214,6 +226,8 @@ class RDPClientController(pdu.layer.PDUClientListener):
         """
 #        self._mcsLayer._clientSettings.CS_CORE.clientName.value = hostname[:15] + "\x00" * (15 - len(hostname))
         self._secLayer._licenceManager._hostname = hostname
+        #name shown by the server for redirected devices ("<drive> on <hostname>")
+        self._rdpdrLayer.setComputerName(hostname)
 
     def setRoutingToken(self, token):
         """
@@ -379,6 +393,7 @@ class RDPClientController(pdu.layer.PDUClientListener):
             self._gfxTimer.cancel()
             self._gfxTimer = None
         self._rdpsndLayer._stopAudio()
+        self._rdpdrLayer.shutdown()
         for observer in self._clientObserver:
             observer.onClose()
     
