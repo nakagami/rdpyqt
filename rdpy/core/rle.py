@@ -582,8 +582,8 @@ def bitmap_decompress(input_data, width, height, bpp):
                stored in top-down scan-line order (first row in buffer
                is the top row of the image).
     """
-    if not input_data or width == 0 or height == 0:
-        return bytes(width * height * bpp)
+    if not input_data or width <= 0 or height <= 0 or bpp <= 0:
+        return bytes(max(0, width * height * bpp))
     size = width * height * bpp
     output = bytearray(size)
     if bpp == 1:
@@ -665,6 +665,8 @@ def process_plane(input_data, width, height, output, j):
 
 def bitmap_decompress4(input_data, width, height):
     BPP = 4
+    if not input_data or width <= 0 or height <= 0:
+        return bytes(max(0, width * height * BPP))
     size = width * height * BPP
     output = bytearray(size)
 
