@@ -109,12 +109,19 @@ def qtImageFormatFromRFBPixelFormat(pixelFormat):
 def _flip_rows_inplace(buf, width, height, bytes_per_pixel):
     """Flip bottom-up bitmap data to top-down order in-place."""
     stride = width * bytes_per_pixel
-    arr = np.frombuffer(buf, dtype=np.uint8).reshape(height, stride)
+    needed = height * stride
+    if len(buf) < needed:
+        return False
+    arr = np.frombuffer(buf, dtype=np.uint8)[:needed].reshape(height, stride)
     arr[:] = arr[::-1]
+    return True
 
 
 def RDPBitmapToQtImage(width, height, bitsPerPixel, isCompress, data):
     image = None
+
+    if width <= 0 or height <= 0:
+        return None
 
     # Ensure data is bytes for QImage compatibility
     if isinstance(data, str):
@@ -126,7 +133,11 @@ def RDPBitmapToQtImage(width, height, bitsPerPixel, isCompress, data):
     # Keep a reference to the Python buffer on the QImage so it stays alive
     # until the QImage is garbage collected — avoids the expensive .copy().
     if isCompress == 'gfx' and bitsPerPixel == 32:
-        buf = bytes(data)
+        needed = width * height * 4
+        if len(data) < needed:
+            log.warning("RDPGFX bitmap truncated: len=%d need=%d" % (len(data), needed))
+            return None
+        buf = bytes(data[:needed])
         image = QtGui.QImage(buf, width, height, width * 4,
                              QtGui.QImage.Format.Format_RGB32)
         image._buffer_ref = buf
@@ -143,59 +154,86 @@ def RDPBitmapToQtImage(width, height, bitsPerPixel, isCompress, data):
     if bitsPerPixel == 15:
         bpp = 2
         fmt = QtGui.QImage.Format.Format_RGB555
+        needed = width * height * bpp
         if isCompress:
             buf = rle.bitmap_decompress(data, width, height, bpp)
+            if len(buf) < needed:
+                return None
             image = QtGui.QImage(buf, width, height, width * bpp, fmt)
             image._buffer_ref = buf
         else:
-            raw = bytearray(data)
-            _flip_rows_inplace(raw, width, height, bpp)
+            if len(data) < needed:
+                log.warning("Uncompressed 15bpp bitmap truncated: len=%d need=%d" % (len(data), needed))
+                return None
+            raw = bytearray(data[:needed])
+            if not _flip_rows_inplace(raw, width, height, bpp):
+                return None
             image = QtGui.QImage(raw, width, height, width * bpp, fmt)
             image._buffer_ref = raw
 
     elif bitsPerPixel == 16:
         bpp = 2
         fmt = QtGui.QImage.Format.Format_RGB16
+        needed = width * height * bpp
         if isCompress:
             buf = rle.bitmap_decompress(data, width, height, bpp)
+            if len(buf) < needed:
+                return None
             image = QtGui.QImage(buf, width, height, width * bpp, fmt)
             image._buffer_ref = buf
         else:
-            raw = bytearray(data)
-            _flip_rows_inplace(raw, width, height, bpp)
+            if len(data) < needed:
+                log.warning("Uncompressed 16bpp bitmap truncated: len=%d need=%d" % (len(data), needed))
+                return None
+            raw = bytearray(data[:needed])
+            if not _flip_rows_inplace(raw, width, height, bpp):
+                return None
             image = QtGui.QImage(raw, width, height, width * bpp, fmt)
             image._buffer_ref = raw
 
     elif bitsPerPixel == 24:
         bpp = 3
         fmt = QtGui.QImage.Format.Format_BGR888
+        needed = width * height * bpp
         if isCompress:
             buf = rle.bitmap_decompress(data, width, height, bpp)
+            if len(buf) < needed:
+                return None
             image = QtGui.QImage(buf, width, height, width * bpp, fmt)
             image._buffer_ref = buf
         else:
-            raw = bytearray(data)
-            _flip_rows_inplace(raw, width, height, bpp)
+            if len(data) < needed:
+                log.warning("Uncompressed 24bpp bitmap truncated: len=%d need=%d" % (len(data), needed))
+                return None
+            raw = bytearray(data[:needed])
+            if not _flip_rows_inplace(raw, width, height, bpp):
+                return None
             image = QtGui.QImage(raw, width, height, width * bpp, fmt)
             image._buffer_ref = raw
 
     elif bitsPerPixel == 32:
         bpp = 4
         fmt = QtGui.QImage.Format.Format_RGB32
+        needed = width * height * bpp
         if isCompress:
             buf = rle.bitmap_decompress4(data, width, height)
+            if len(buf) < needed:
+                return None
             image = QtGui.QImage(buf, width, height, width * bpp, fmt)
             image._buffer_ref = buf
         else:
+            if len(data) < needed:
+                log.warning("Uncompressed 32bpp bitmap truncated: len=%d need=%d" % (len(data), needed))
+                return None
             # Flip rows and set alpha in one numpy pass — avoids the
             # intermediate  b'\xff' * N  allocation from the old slice-assign.
-            arr = np.frombuffer(data, dtype=np.uint8).reshape(height, width, 4)[::-1].copy()
+            arr = np.frombuffer(data[:needed], dtype=np.uint8).reshape(height, width, 4)[::-1].copy()
             arr[:, :, 3] = 0xff
             image = QtGui.QImage(arr.data, width, height, width * bpp, fmt)
             image._buffer_ref = arr
     else:
-        log.error("Receive image in bad format")
-        image = QtGui.QImage(width, height, QtGui.QImage.Format.Format_RGB32)
+        log.warning("skipping bitmap with unsupported bit depth: %d" % bitsPerPixel)
+        return None
     return image
 
 
@@ -540,7 +578,13 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
         @param data: {str} bitmap data
         """
         image = RDPBitmapToQtImage(width, height, bitsPerPixel, isCompress, data)
-        self._widget.notifyImage(destLeft, destTop, image, destRight - destLeft + 1, destBottom - destTop + 1)
+        if image is None or image.isNull():
+            return
+        w = min(destRight - destLeft + 1, width)
+        h = min(destBottom - destTop + 1, height)
+        if w <= 0 or h <= 0:
+            return
+        self._widget.notifyImage(destLeft, destTop, image, w, h)
 
     def onGfxSurface(self, dest_x, dest_y, width, height, surf_buf, surf_w, src_left, src_top):
         """Fast-path AVC delivery: create QImage from surface buffer region with stride.
@@ -549,7 +593,13 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
         Qt's bytes-per-line stride parameter so non-contiguous partial updates
         work without any extra memory allocation.
         """
+        if width <= 0 or height <= 0:
+            return
         offset = (src_top * surf_w + src_left) * 4
+        needed_bytes = offset + (height - 1) * surf_w * 4 + width * 4
+        if offset < 0 or needed_bytes > len(surf_buf):
+            log.warning("RDPGFX: surface region out of bounds")
+            return
         view = memoryview(surf_buf)[offset:]
         image = QtGui.QImage(view, width, height, surf_w * 4,
                              QtGui.QImage.Format.Format_RGB32)
@@ -608,8 +658,10 @@ class RDPClientQt(RDPClientObserver, QAdaptor):
         @summary: Called when the server sends a new pointer shape
         @see: rdp.RDPClientObserver.onPointerUpdate
         """
-        if width == 0 or height == 0:
+        if width <= 0 or height <= 0:
             return
+        hotSpotX = max(0, min(hotSpotX, width - 1))
+        hotSpotY = max(0, min(hotSpotY, height - 1))
 
         # AND mask rows are padded to 2-byte (word) boundaries
         and_stride = ((width + 15) // 16) * 2
@@ -771,6 +823,8 @@ class QRemoteDesktop(QtWidgets.QWidget):
         @param width: width of the image region
         @param height: height of the image region
         """
+        if qimage is None or qimage.isNull() or width <= 0 or height <= 0:
+            return
         if not self._sessionReady:
             self._sessionReady = True
         self._pendingUpdates.append((x, y, qimage, width, height))
@@ -801,19 +855,22 @@ class QRemoteDesktop(QtWidgets.QWidget):
                 break
         self._flushScheduled = False
 
-        if not updates:
+        if not updates or self._buffer is None or self._buffer.isNull():
             return
 
         dirty = QtCore.QRect()
         with QtGui.QPainter(self._buffer) as qp:
             for x, y, qimage, w, h in updates:
+                if qimage is None or qimage.isNull() or w <= 0 or h <= 0:
+                    continue
                 qp.drawImage(x, y, qimage, 0, 0, w, h)
                 rect = QtCore.QRect(x, y, w, h)
                 if dirty.isEmpty():
                     dirty = rect
                 else:
                     dirty = dirty.united(rect)
-        self.update(dirty)
+        if not dirty.isEmpty():
+            self.update(dirty)
 
     def setAdaptor(self, adaptor):
         """
@@ -821,6 +878,9 @@ class QRemoteDesktop(QtWidgets.QWidget):
         @param adaptor: {QAdaptor}
         """
         self._adaptor = adaptor
+        # Drain queued bitmap updates from previous session on reconnect
+        self._pendingUpdates.clear()
+        self._flushScheduled = False
 
     def resize(self, width, height):
         """

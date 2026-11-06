@@ -240,7 +240,12 @@ cdef class ZgfxDecompressor:
                     distance = vbase
 
                 if distance != 0:
+                    if distance <= 0 or distance > hist_size:
+                        log.warning("ZGFX: invalid distance %d" % distance)
+                        break
                     # Decode match length
+                    if bits_remaining < 1:
+                        break
                     while n_bits_current < 1:
                         bits_current = (bits_current << 8)
                         if input_pos < num_data_bytes:
@@ -260,6 +265,8 @@ cdef class ZgfxDecompressor:
                     else:
                         count = 4
                         extra = 2
+                        if bits_remaining < 1:
+                            break
                         while True:
                             while n_bits_current < 1:
                                 bits_current = (bits_current << 8)
@@ -278,6 +285,10 @@ cdef class ZgfxDecompressor:
                                 break
                             count *= 2
                             extra += 1
+                            if extra >= 32 or bits_remaining < 1:
+                                break
+                        if extra >= 32 or bits_remaining < extra:
+                            break
                         while n_bits_current < extra:
                             bits_current = (bits_current << 8)
                             if input_pos < num_data_bytes:
@@ -291,6 +302,9 @@ cdef class ZgfxDecompressor:
                             bits_current &= (1 << n_bits_current) - 1
                         else:
                             bits_current = 0
+
+                    if count <= 0:
+                        continue
 
                     # Copy from history
                     src_idx = (hist_idx + hist_size - distance) % hist_size
@@ -315,6 +329,8 @@ cdef class ZgfxDecompressor:
 
                 else:
                     # Unencoded: 15-bit count + flush + raw bytes
+                    if bits_remaining < 15:
+                        break
                     while n_bits_current < 15:
                         bits_current = (bits_current << 8)
                         if input_pos < num_data_bytes:
@@ -331,6 +347,8 @@ cdef class ZgfxDecompressor:
                     bits_remaining -= n_bits_current
                     n_bits_current = 0
                     bits_current = 0
+                    if count <= 0:
+                        continue
                     # Bulk copy raw bytes (avoid bytes intermediate — causes
                     # "an integer is required" when assigning bytes to unsigned char[:])
                     actual = min(count, num_data_bytes - input_pos)
